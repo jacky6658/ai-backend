@@ -379,7 +379,7 @@ def generate_content():
         user_level = 'beginner'
 
     try:
-        model = genai.GenerativeModel('gemini-pro')
+        model = genai.GenerativeModel('gemini-2.5-flash')
         
         # 根據用戶歷史生成個性化提示詞
         prompt = get_personalized_prompt(user_id, user_level, action, topic)
