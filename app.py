@@ -7,7 +7,7 @@ app = Flask(__name__)
 CORS(app)
 
 # 設定 Gemini API
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', 'your-api-key-here')
+GEMINI_API_KEY = AIzaSyCNmsgpPxo6acx3TVlVrvMLWOvqqj38TR4
 genai.configure(api_key=GEMINI_API_KEY)
 
 @app.route('/')
