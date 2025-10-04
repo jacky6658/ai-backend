@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-from flask import Flask, request, jsonify, session, Response
+from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 import google.generativeai as genai
 import os, uuid, sqlite3
@@ -12,14 +12,16 @@ app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "your-secret-key")
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
-# ✅ 設定 Gemini
+# ── Gemini 設定 ────────────────────────────────────────────────────────────────
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
     raise ValueError("⚠️ 請設定 GEMINI_API_KEY")
 genai.configure(api_key=api_key)
+
+# 可用環境變數切換；預設你要的 2.5 flash
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# ✅ SQLite 初始化
+# ── SQLite 初始化 ─────────────────────────────────────────────────────────────
 DB_PATH = "ai_assistant.db"
 
 def init_db():
@@ -56,22 +58,38 @@ def save_conversation(user_id, topic, action, user_level, prompt, response):
                   (user_id, topic, action, user_level, prompt, response))
         conn.commit()
 
-# ✅ Gemini 產文
+# ── 產文 API ──────────────────────────────────────────────────────────────────
 @app.post("/generate")
 def generate_content():
     try:
-        data = request.get_json(force=True)
-        topic = data.get("topic", "").strip()
-        action = data.get("action", "copywriting")
-        user_level = data.get("user_level", "beginner")
-        user_id = session.get("user_id") or str(uuid.uuid4())
+        data = request.get_json(force=True) or {}
+        topic = (data.get("topic") or "").strip()
+        action = (data.get("action") or "copywriting").strip()
+        user_level = (data.get("user_level") or "beginner").strip()
+
+        if not topic:
+            return jsonify({"error": "請提供 topic"}), 400
+        if len(topic) > 300:
+            return jsonify({"error": "topic 過長，請精簡至 300 字內"}), 400
+
+        # 維持相容的 session user_id
+        user_id = session.get("user_id") or ("u_" + uuid.uuid4().hex[:10])
         session["user_id"] = user_id
 
+        # 準備 prompt
+        prompt = (
+            f"以短影音文案教練身分，針對主題「{topic}」與行為「{action}」，"
+            f"用{user_level}等級的風格生成內容。回覆請使用繁體中文。"
+        )
+
+        # 呼叫 Gemini
         model = genai.GenerativeModel(GEMINI_MODEL)
         chat = model.start_chat(history=[])
-        prompt = f"以短影音文案教練身分，針對主題「{topic}」與行為「{action}」，用{user_level}等級的風格生成內容。"
         resp = chat.send_message(prompt)
-        result = getattr(resp, "text", "")
+
+        result = getattr(resp, "text", None) or ""
+        if not result:
+            return jsonify({"error": "模型沒有回覆內容"}), 502
 
         save_conversation(user_id, topic, action, user_level, prompt, result)
 
@@ -82,16 +100,16 @@ def generate_content():
             "timestamp": datetime.now().isoformat()
         })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"server_error: {str(e)}"}), 500
 
-# ✅ 匯出 Word
+# ── 匯出 Word（RTF 或 DOCX 均可；保留 DOCX） ───────────────────────────────
 @app.post("/export-docx")
 def export_docx():
     try:
         from docx import Document
         from io import BytesIO
 
-        data = request.get_json(force=True)
+        data = request.get_json(force=True) or {}
         content = data.get("content", "")
         title = data.get("title", "AI文案")
 
@@ -110,9 +128,9 @@ def export_docx():
             headers={"Content-Disposition": f"attachment; filename={title}.docx"}
         )
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"export_error: {str(e)}"}), 500
 
-# ✅ 健康檢查
+# ── 健康檢查 ─────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health_check():
     return jsonify({"status": "ok", "model": GEMINI_MODEL, "time": datetime.now().isoformat()})
@@ -122,3 +140,4 @@ init_db()
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
