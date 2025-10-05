@@ -1,494 +1,849 @@
 #!/usr/bin/env python
 # coding: utf-8
+"""
+FastAPI 後端服務
+- POST /generate_script
+- 使用 Gemini 生成短影片腳本（片頭/場景/片尾）
+- 分段生成（根據 previous_segments 決定補哪些段落）
+- 自動重試（429/502/timeout/網路錯誤）
+- SQLite 永久化每次生成結果
+"""
 
-from flask import Flask, request, jsonify, session
-from flask_cors import CORS
-import google.generativeai as genai
 import os
 import json
-from datetime import datetime, timedelta
-import uuid
+import time
 import sqlite3
-from contextlib import contextmanager
+import uuid
+from datetime import datetime
+from typing import List, Optional, Literal, Any, Dict, Tuple
 
-app = Flask(__name__)
-app.secret_key = os.getenv('SECRET_KEY', 'your-secret-key-here')
-CORS(app, supports_credentials=True)  # 啟用 CORS 並支援 credentials
+import google.generativeai as genai
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from starlette.responses import JSONResponse
 
-# 從環境變數讀取 API 金鑰
-api_key = os.getenv("GEMINI_API_KEY")
-if not api_key:
-    raise ValueError("GEMINI_API_KEY is not set in the environment variables")
-genai.configure(api_key=api_key)
+# ----------------------------
+# 環境變數與 Gemini 設定
+# ----------------------------
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+# 若你想使用你提到的 "gemini-2.5-flash"，只要設定環境變數 GEMINI_MODEL="gemini-2.5-flash"
 
-# 用戶等級定義
-USER_LEVELS = {
-    "beginner": "初學者",
-    "intermediate": "中級用戶", 
-    "advanced": "進階用戶"
-}
+if not GEMINI_API_KEY:
+    raise RuntimeError("環境變數 GEMINI_API_KEY 未設定。請先 export GEMINI_API_KEY=...")
 
-# 資料庫初始化
+genai.configure(api_key=GEMINI_API_KEY)
+
+# ----------------------------
+# FastAPI 初始化 & CORS
+# ----------------------------
+app = FastAPI(title="Script Generator API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # 視情況鎖定網域
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ----------------------------
+# SQLite 初始化
+# ----------------------------
+DB_PATH = os.getenv("DB_PATH", "script_generation.db")
+
+
 def init_db():
-    """初始化資料庫"""
-    with sqlite3.connect('ai_assistant.db') as conn:
-        cursor = conn.cursor()
-        
-        # 用戶表
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id TEXT PRIMARY KEY,
-                level TEXT DEFAULT 'beginner',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # 對話歷史表
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS conversations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT,
-                topic TEXT,
-                action TEXT,
-                user_level TEXT,
-                prompt TEXT,
-                response TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (id)
-            )
-        ''')
-        
-        # 用戶偏好表
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_preferences (
-                user_id TEXT PRIMARY KEY,
-                preferred_structures TEXT,
-                feedback_data TEXT,
-                learning_progress TEXT,
-                FOREIGN KEY (user_id) REFERENCES users (id)
-            )
-        ''')
-        
-        # 訓練數據表
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS training_data (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT,
-                input_topic TEXT,
-                generated_content TEXT,
-                user_feedback INTEGER,
-                feedback_text TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (id)
-            )
-        ''')
-        
-        conn.commit()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    # 儲存每次請求與回應
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS generations (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            user_input TEXT,
+            previous_segments_json TEXT,
+            response_json TEXT,
+            error TEXT,
+            model TEXT,
+            request_id TEXT
+        )
+        """
+    )
+    # 可選：把 segments 正規化到子表（若將來要查詢更方便）
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS segments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            generation_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            camera TEXT,
+            dialog TEXT,
+            visual TEXT,
+            FOREIGN KEY (generation_id) REFERENCES generations(id)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
 
-@contextmanager
-def get_db():
-    """資料庫連接上下文管理器"""
-    conn = sqlite3.connect('ai_assistant.db')
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    finally:
-        conn.close()
 
-def get_or_create_user(user_id=None):
-    """獲取或創建用戶"""
-    if not user_id:
-        user_id = str(uuid.uuid4())
-    
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM users WHERE id = ?', (user_id,))
-        user = cursor.fetchone()
-        
-        if not user:
-            cursor.execute(
-                'INSERT INTO users (id, level) VALUES (?, ?)',
-                (user_id, 'beginner')
-            )
-            conn.commit()
-            return {'id': user_id, 'level': 'beginner'}
-        else:
-            # 更新最後活動時間
-            cursor.execute(
-                'UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE id = ?',
-                (user_id,)
-            )
-            conn.commit()
-            return dict(user)
-
-def save_conversation(user_id, topic, action, user_level, prompt, response):
-    """保存對話記錄"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO conversations (user_id, topic, action, user_level, prompt, response)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (user_id, topic, action, user_level, prompt, response))
-        conn.commit()
-
-def get_user_history(user_id, limit=10):
-    """獲取用戶歷史對話"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT * FROM conversations 
-            WHERE user_id = ? 
-            ORDER BY created_at DESC 
-            LIMIT ?
-        ''', (user_id, limit))
-        return [dict(row) for row in cursor.fetchall()]
-
-def analyze_user_patterns(user_id):
-    """分析用戶使用模式"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        
-        # 獲取用戶最常用的功能
-        cursor.execute('''
-            SELECT action, COUNT(*) as count 
-            FROM conversations 
-            WHERE user_id = ? 
-            GROUP BY action 
-            ORDER BY count DESC
-        ''', (user_id,))
-        actions = cursor.fetchall()
-        
-        # 獲取用戶最常用的主題類型
-        cursor.execute('''
-            SELECT topic, COUNT(*) as count 
-            FROM conversations 
-            WHERE user_id = ? 
-            GROUP BY topic 
-            ORDER BY count DESC 
-            LIMIT 5
-        ''', (user_id,))
-        topics = cursor.fetchall()
-        
-        return {
-            'preferred_actions': [dict(row) for row in actions],
-            'common_topics': [dict(row) for row in topics]
-        }
-
-def get_personalized_prompt(user_id, level, action, topic):
-    """根據用戶歷史生成個性化提示詞"""
-    
-    # 獲取用戶歷史
-    history = get_user_history(user_id, 5)
-    patterns = analyze_user_patterns(user_id)
-    
-    # 基礎知識庫
-    base_knowledge = """
-    # 短影音文案結構知識庫
-
-    ## 結構一：總分總結構
-    這是一種經典的論述結構，邏輯清晰，容易讓觀眾快速抓住重點。
-    - 節奏: 開頭 -> 總結 -> 分述 -> 總結
-    - 開頭 (金句/問句/懸念): 用一句話抓住用戶注意力
-    - 中間 (分述): 條列式說明，通常用數字引導，如 1, 2, 3
-    - 結尾 (變現關鍵): 總結金句，並給出明確的行動指令
-
-    ## 結構二：解題式結構
-    直接拋出用戶痛點，並給出解決方案，信任感強，適合知識型、技能型內容。
-    - 節奏: 拋出痛點 -> 給出方案 -> 實操演練 -> 輸出價值觀
-
-    ## 結構三：對比式結構
-    透過前後的巨大反差來製造衝擊力，適用於美業、改造、技能提升等領域。
-    - 節奏: 黃金開場 -> 溝通細節 -> 大改變
-
-    ## 結構四：敘事式結構 (故事結構)
-    透過講故事的方式引發情感共鳴，是黏性最強的文案結構。
-    - 節奏: 事件 -> 阻礙 -> 轉折意外 -> 感悟升華
-    """
-    
-    # 個性化元素
-    personalization = ""
-    if history:
-        recent_topics = [h['topic'] for h in history[:3]]
-        personalization += f"\n\n# 個性化建議\n根據您最近的創作主題：{', '.join(recent_topics)}，"
-        
-        if patterns['preferred_actions']:
-            most_used = patterns['preferred_actions'][0]['action']
-            if most_used == 'copywriting':
-                personalization += "您似乎更偏好文案創作，建議融入更多情感元素。"
-            elif most_used == 'scriptwriting':
-                personalization += "您經常創作腳本，建議注重視覺呈現和節奏控制。"
-    
-    # 根據等級和動作生成提示詞
-    if action == 'copywriting':
-        if level == 'beginner':
-            return f"""
-            你是一個專業的文案創作助手。請根據以下主題為初學者用戶生成一段簡單易懂、吸引人的行銷文案。
-
-            主題：{topic}
-
-            請使用「總分總結構」來創作：
-            1. 開頭：用一句吸引人的話或問句開始
-            2. 中間：用3個要點來說明
-            3. 結尾：用一句總結並呼籲行動
-
-            要求：
-            - 語言簡潔明瞭，避免過於複雜的詞彙
-            - 內容要有吸引力但不誇大
-            - 適合社群媒體分享
-            - 字數控制在150-200字之間
-
-            {base_knowledge}
-            {personalization}
-            """
-        elif level == 'intermediate':
-            return f"""
-            你是一個專業的文案創作助手。請根據以下主題為中級用戶生成一段專業的行銷文案。
-
-            主題：{topic}
-
-            請從以下結構中選擇最適合的一種來創作：
-            1. 總分總結構：適合邏輯性強的內容
-            2. 解題式結構：適合解決問題的內容
-            3. 對比式結構：適合展示變化的內容
-
-            要求：
-            - 內容要有深度和說服力
-            - 包含情感元素和理性分析
-            - 適合多平台使用
-            - 字數控制在200-300字之間
-            - 請在文案後說明使用了哪種結構及原因
-
-            {base_knowledge}
-            {personalization}
-            """
-        else:  # advanced
-            return f"""
-            你是一個頂級的文案創作專家。請根據以下主題為進階用戶生成一段高水準的行銷文案。
-
-            主題：{topic}
-
-            請綜合運用所有四種結構的精華，創作一段具有以下特質的文案：
-            1. 強烈的情感共鳴
-            2. 清晰的邏輯脈絡
-            3. 獨特的創意角度
-            4. 精準的目標受眾定位
-            5. 有效的行動呼籲
-
-            要求：
-            - 展現專業的文案技巧和創意思維
-            - 考慮不同平台的特性和受眾
-            - 包含心理學和行銷學原理的運用
-            - 字數控制在300-400字之間
-            - 請詳細說明創作思路、使用的技巧和預期效果
-
-            {base_knowledge}
-            {personalization}
-            """
-    
-    elif action == 'scriptwriting':
-        if level == 'beginner':
-            return f"""
-            你是一個專業的短影音腳本創作助手。請根據以下主題為初學者用戶生成一個簡單易拍的短影音腳本。
-
-            主題：{topic}
-
-            請創作一個30-60秒的短影音腳本，包含：
-            1. 場景設定（簡單易實現）
-            2. 開場白（3-5秒抓住注意力）
-            3. 主要內容（20-40秒）
-            4. 結尾呼籲（5-10秒）
-
-            要求：
-            - 拍攝難度低，適合新手
-            - 道具需求簡單
-            - 語言自然流暢
-            - 包含具體的拍攝提示
-
-            {base_knowledge}
-            {personalization}
-            """
-        elif level == 'intermediate':
-            return f"""
-            你是一個專業的短影音腳本創作助手。請根據以下主題為中級用戶生成一個專業的短影音腳本。
-
-            主題：{topic}
-
-            請創作一個60-90秒的短影音腳本，包含：
-            1. 詳細場景設定和道具清單
-            2. 分鏡頭設計（至少3-5個鏡頭）
-            3. 對白和旁白
-            4. 音效和配樂建議
-            5. 剪輯要點
-
-            要求：
-            - 運用專業的影片製作技巧
-            - 考慮視覺效果和節奏感
-            - 適合中等製作預算
-            - 包含拍攝和後製建議
-
-            {base_knowledge}
-            {personalization}
-            """
-        else:  # advanced
-            return f"""
-            你是一個頂級的短影音腳本創作專家。請根據以下主題為進階用戶生成一個高品質的短影音腳本。
-
-            主題：{topic}
-
-            請創作一個90-120秒的專業級短影音腳本，包含：
-            1. 完整的創意概念和故事架構
-            2. 詳細的分鏡頭腳本（包含鏡頭語言）
-            3. 角色設定和表演指導
-            4. 專業的視聽設計
-            5. 後製特效和調色建議
-            6. 平台優化策略
-
-            要求：
-            - 展現電影級的製作思維
-            - 融合最新的短影音趨勢
-            - 考慮商業價值和藝術性
-            - 提供完整的製作流程指南
-            - 包含數據分析和優化建議
-
-            {base_knowledge}
-            {personalization}
-            """
-
-@app.route('/generate', methods=['POST'])
-def generate_content():
-    data = request.get_json()
-    if not data or 'topic' not in data or 'action' not in data:
-        return jsonify({"error": "請提供主題和操作類型"}), 400
-
-    topic = data['topic']
-    action = data['action']
-    user_level = data.get('user_level', 'beginner')
-    user_id = data.get('user_id') or session.get('user_id')
-    
-    # 獲取或創建用戶
-    if not user_id:
-        user = get_or_create_user()
-        user_id = user['id']
-        session['user_id'] = user_id
-    else:
-        user = get_or_create_user(user_id)
-    
-    # 驗證用戶等級
-    if user_level not in USER_LEVELS:
-        user_level = 'beginner'
-
-    try:
-        model = genai.GenerativeModel('gemini-pro')
-        
-        # 根據用戶歷史生成個性化提示詞
-        prompt = get_personalized_prompt(user_id, user_level, action, topic)
-        
-        response = model.generate_content(prompt)
-        result = response.text
-        
-        # 保存對話記錄
-        save_conversation(user_id, topic, action, user_level, prompt, result)
-
-        return jsonify({
-            "result": result,
-            "user_id": user_id,
-            "user_level": user_level,
-            "user_level_name": USER_LEVELS[user_level],
-            "timestamp": datetime.now().isoformat()
-        })
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/feedback', methods=['POST'])
-def submit_feedback():
-    """提交用戶反饋"""
-    data = request.get_json()
-    user_id = data.get('user_id') or session.get('user_id')
-    
-    if not user_id:
-        return jsonify({"error": "用戶ID不存在"}), 400
-    
-    rating = data.get('rating')  # 1-5 星評分
-    feedback_text = data.get('feedback_text', '')
-    topic = data.get('topic')
-    generated_content = data.get('generated_content')
-    
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO training_data (user_id, input_topic, generated_content, user_feedback, feedback_text)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (user_id, topic, generated_content, rating, feedback_text))
-        conn.commit()
-    
-    return jsonify({"message": "感謝您的反饋！"})
-
-@app.route('/history', methods=['GET'])
-def get_history():
-    """獲取用戶歷史"""
-    user_id = request.args.get('user_id') or session.get('user_id')
-    
-    if not user_id:
-        return jsonify({"error": "用戶ID不存在"}), 400
-    
-    limit = int(request.args.get('limit', 10))
-    history = get_user_history(user_id, limit)
-    patterns = analyze_user_patterns(user_id)
-    
-    return jsonify({
-        "history": history,
-        "patterns": patterns
-    })
-
-@app.route('/user-levels', methods=['GET'])
-def get_user_levels():
-    """獲取所有用戶等級"""
-    return jsonify(USER_LEVELS)
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """健康檢查端點"""
-    return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "version": "3.0.0",
-        "features": ["user_levels", "conversation_memory", "personalization", "feedback_system"]
-    })
-
-@app.route('/analytics', methods=['GET'])
-def get_analytics():
-    """獲取系統分析數據"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        
-        # 總用戶數
-        cursor.execute('SELECT COUNT(*) as total_users FROM users')
-        total_users = cursor.fetchone()['total_users']
-        
-        # 總對話數
-        cursor.execute('SELECT COUNT(*) as total_conversations FROM conversations')
-        total_conversations = cursor.fetchone()['total_conversations']
-        
-        # 用戶等級分布
-        cursor.execute('SELECT level, COUNT(*) as count FROM users GROUP BY level')
-        level_distribution = [dict(row) for row in cursor.fetchall()]
-        
-        # 最受歡迎的功能
-        cursor.execute('SELECT action, COUNT(*) as count FROM conversations GROUP BY action ORDER BY count DESC')
-        popular_actions = [dict(row) for row in cursor.fetchall()]
-        
-        return jsonify({
-            "total_users": total_users,
-            "total_conversations": total_conversations,
-            "level_distribution": level_distribution,
-            "popular_actions": popular_actions
-        })
-
-# 初始化資料庫
 init_db()
 
-if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+# ----------------------------
+# Pydantic Schema
+# ----------------------------
+SegmentType = Literal["片頭", "場景", "片尾"]
+
+
+class Segment(BaseModel):
+    type: SegmentType
+    camera: str
+    dialog: str
+    visual: str
+
+
+class GenerateRequest(BaseModel):
+    user_input: str = Field(..., description="使用者對影片主題或需求的描述")
+    previous_segments: Optional[List[Segment]] = Field(
+        default=None, description="已有的段落（用於分段生成）"
+    )
+
+
+class GenerateResponse(BaseModel):
+    segments: List[Segment]
+    error: Optional[str] = None
+
+
+# ----------------------------
+# 工具：決定需要生成的段落
+# ----------------------------
+ALL_TYPES: List[SegmentType] = ["片頭", "場景", "片尾"]
+
+
+def segments_missing(previous: Optional[List[Segment]]) -> List[SegmentType]:
+    if not previous:
+        return ALL_TYPES[:]  # 全部生成
+    have = {s.type for s in previous}
+    return [t for t in ALL_TYPES if t not in have]
+
+
+# ----------------------------
+# Gemini 呼叫與重試
+# ----------------------------
+class GeminiError(Exception):
+    pass
+
+
+RetryableStatus = {429, 502, 503, 504}
+
+
+def build_prompt(user_input: str, need_types: List[SegmentType], previous_segments: Optional[List[Segment]]) -> str:
+    """
+    為 Gemini 構造提示，要求嚴格輸出 JSON（僅含 segments 陣列）
+    """
+    prev_text = json.dumps([s.dict() for s in (previous_segments or [])], ensure_ascii=False, indent=2)
+    need_text = ", ".join(need_types) if need_types else "(無)"
+    return f"""
+你是資深短影音腳本編劇。請根據使用者需求生成「短影片腳本」的分段內容。
+要求：
+1) 僅輸出 JSON（不要任何說明文字），格式：
+{{
+  "segments": [
+    {{"type":"片頭","camera":"...","dialog":"...","visual":"..."}},
+    {{"type":"場景","camera":"...","dialog":"...","visual":"..."}},
+    {{"type":"片尾","camera":"...","dialog":"...","visual":"..."}}
+  ]
+}}
+2) 你「只生成」以下缺少的段落：{need_text}
+3) 每個欄位務必是字串，不可為空；dialog 要口語且符合短影音節奏（5-12秒/段）。
+4) camera：鏡位與運鏡；visual：畫面元素與轉場。
+5) 請確保 JSON 合法可 parse。
+
+使用者需求：
+{user_input}
+
+已存在的段落（請勿重複生成）：
+{prev_text}
+    """.strip()
+
+
+def parse_model_json(txt: str) -> Dict[str, Any]:
+    """
+    嘗試從模型輸出解析 JSON；若包裹在程式碼區塊或前後雜訊，試著抽離。
+    """
+    # 直接嘗試
+    try:
+        return json.loads(txt)
+    except Exception:
+        pass
+
+    # 嘗試抽取第一個 { ... } 區塊
+    start = txt.find("{")
+    end = txt.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = txt[start : end + 1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    # 最後嘗試移除 Markdown code fence
+    if "```" in txt:
+        parts = txt.split("```")
+        for p in parts:
+            p = p.strip()
+            if p.startswith("{") and p.endswith("}"):
+                try:
+                    return json.loads(p)
+                except Exception:
+                    continue
+
+    raise GeminiError("模型輸出非合法 JSON")
+
+
+def call_gemini_with_retry(
+    prompt: str,
+    model_name: str,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    request_timeout_sec: float = 60.0,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """
+    呼叫 Gemini，具退避重試。
+    回傳 (parsed_json, request_id)
+    """
+    last_err: Optional[Exception] = None
+    request_id: Optional[str] = None
+
+    # 設定回應為純 JSON（較新 SDK 支援 response_mime_type）
+    generation_config = {
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "response_mime_type": "application/json",
+    }
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            model = genai.GenerativeModel(model_name)
+            start_ts = time.time()
+            response = model.generate_content(
+                prompt,
+                generation_config=generation_config,
+                # safety_settings 可依需求調整
+            )
+            elapsed = time.time() - start_ts
+            if elapsed > request_timeout_sec:
+                raise GeminiError(f"Timeout > {request_timeout_sec}s")
+
+            # 有些版本把 request_id 放在 response 的 meta 裡；不同 SDK 可能差異
+            try:
+                request_id = getattr(response, "request_id", None)
+            except Exception:
+                request_id = None
+
+            # 取得文字並解析 JSON
+            text = response.text or ""
+            parsed = parse_model_json(text)
+            return parsed, request_id
+
+        except Exception as e:
+            last_err = e
+
+            # 嘗試辨識是否需要重試（簡化處理）
+            msg = str(e).lower()
+            is_retryable = (
+                "429" in msg
+                or "502" in msg
+                or "503" in msg
+                or "504" in msg
+                or "timeout" in msg
+                or "temporarily" in msg
+                or "unavailable" in msg
+                or "rate" in msg
+            )
+            if attempt < max_retries and is_retryable:
+                time.sleep(base_delay * (2 ** (attempt - 1)))  # 指數退避
+                continue
+            break
+
+    raise GeminiError(f"Gemini 呼叫失敗：{last_err}")
+
+
+# ----------------------------
+# 永久化：寫入 DB
+# ----------------------------
+def persist_generation(
+    user_input: str,
+    previous_segments: Optional[List[Segment]],
+    response_json: Optional[Dict[str, Any]],
+    error: Optional[str],
+    model: str,
+    request_id: Optional[str],
+) -> str:
+    """將一次請求/回應紀錄到 SQLite，並把 segments 寫入子表。"""
+    generation_id = str(uuid.uuid4())
+    created_at = datetime.utcnow().isoformat()
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO generations (id, created_at, user_input, previous_segments_json, response_json, error, model, request_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            generation_id,
+            created_at,
+            user_input,
+            json.dumps([s.dict() for s in (previous_segments or [])], ensure_ascii=False),
+            json.dumps(response_json, ensure_ascii=False) if response_json else None,
+            error,
+            model,
+            request_id,
+        ),
+    )
+
+    if response_json and "segments" in response_json:
+        for seg in response_json["segments"]:
+            cur.execute(
+                """
+                INSERT INTO segments (generation_id, type, camera, dialog, visual)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    generation_id,
+                    seg.get("type", ""),
+                    seg.get("camera", ""),
+                    seg.get("dialog", ""),
+                    seg.get("visual", ""),
+                ),
+            )
+
+    conn.commit()
+    conn.close()
+    return generation_id
+
+
+# ----------------------------
+# API：POST /generate_script
+# ----------------------------
+@app.post("/generate_script", response_model=GenerateResponse)
+def generate_script(payload: GenerateRequest):
+    need = segments_missing(payload.previous_segments)
+    if not need:
+        # 都有了，直接回傳既有內容即可
+        return GenerateResponse(segments=payload.previous_segments or [], error=None)
+
+    prompt = build_prompt(payload.user_input, need, payload.previous_segments)
+
+    try:
+        parsed_json, request_id = call_gemini_with_retry(
+            prompt=prompt,
+            model_name=GEMINI_MODEL,
+            max_retries=3,
+            base_delay=1.0,
+            request_timeout_sec=90.0,
+        )
+        # 基本結構/欄位驗證
+        if "segments" not in parsed_json or not isinstance(parsed_json["segments"], list):
+            raise GeminiError("模型回應缺少 'segments' 陣列")
+
+        # 合併 previous + 新生成
+        merged = list(payload.previous_segments or [])
+        for item in parsed_json["segments"]:
+            # 轉成 Pydantic Segment（同時做欄位校驗/補預設）
+            seg = Segment(
+                type=item.get("type"),  # 若模型不小心產出英文，會在此處報錯
+                camera=item.get("camera", ""),
+                dialog=item.get("dialog", ""),
+                visual=item.get("visual", ""),
+            )
+            # 僅加入缺少類型（避免重複）
+            if seg.type in need:
+                merged.append(seg)
+
+        # 檢查是否真的補齊
+        merged_types = {s.type for s in merged}
+        missing_after_merge = [t for t in ALL_TYPES if t not in merged_types]
+        error_msg = None
+        if missing_after_merge:
+            error_msg = f"仍缺少段落：{', '.join(missing_after_merge)}"
+
+        # 落庫
+        persisted_id = persist_generation(
+            user_input=payload.user_input,
+            previous_segments=payload.previous_segments,
+            response_json={"segments": [s.dict() for s in merged]},
+            error=error_msg,
+            model=GEMINI_MODEL,
+            request_id=request_id,
+        )
+
+        # 回傳
+        return GenerateResponse(segments=merged, error=error_msg)
+
+    except GeminiError as ge:
+        # 落庫錯誤案例
+        persist_generation(
+            user_input=payload.user_input,
+            previous_segments=payload.previous_segments,
+            response_json=None,
+            error=str(ge),
+            model=GEMINI_MODEL,
+            request_id=None,
+        )
+        # 維持固定回應格式
+        return JSONResponse(
+            status_code=502,
+            content=GenerateResponse(segments=[], error=str(ge)).dict(),
+        )
+    except Exception as e:
+        persist_generation(
+            user_input=payload.user_input,
+            previous_segments=payload.previous_segments,
+            response_json=None,
+            error=f"Unhandled: {e}",
+            model=GEMINI_MODEL,
+            request_id=None,
+        )
+        return JSONResponse(
+            status_code=500,
+            content=GenerateResponse(segments=[], error=f"Unhandled: {e}").dict(),
+        )
+
+
+# ----------------------------
+# Health Check
+# ----------------------------
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "model": GEMINI_MODEL, "db": DB_PATH}
+#!/usr/bin/env python
+# coding: utf-8
+"""
+FastAPI 後端服務
+- POST /generate_script
+- 使用 Gemini 生成短影片腳本（片頭/場景/片尾）
+- 分段生成（根據 previous_segments 決定補哪些段落）
+- 自動重試（429/502/timeout/網路錯誤）
+- SQLite 永久化每次生成結果
+"""
+
+import os
+import json
+import time
+import sqlite3
+import uuid
+from datetime import datetime
+from typing import List, Optional, Literal, Any, Dict, Tuple
+
+import google.generativeai as genai
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from starlette.responses import JSONResponse
+
+# ----------------------------
+# 環境變數與 Gemini 設定
+# ----------------------------
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+# 若你想使用你提到的 "gemini-2.5-flash"，只要設定環境變數 GEMINI_MODEL="gemini-2.5-flash"
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("環境變數 GEMINI_API_KEY 未設定。請先 export GEMINI_API_KEY=...")
+
+genai.configure(api_key=GEMINI_API_KEY)
+
+# ----------------------------
+# FastAPI 初始化 & CORS
+# ----------------------------
+app = FastAPI(title="Script Generator API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # 視情況鎖定網域
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ----------------------------
+# SQLite 初始化
+# ----------------------------
+DB_PATH = os.getenv("DB_PATH", "script_generation.db")
+
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    # 儲存每次請求與回應
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS generations (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            user_input TEXT,
+            previous_segments_json TEXT,
+            response_json TEXT,
+            error TEXT,
+            model TEXT,
+            request_id TEXT
+        )
+        """
+    )
+    # 可選：把 segments 正規化到子表（若將來要查詢更方便）
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS segments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            generation_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            camera TEXT,
+            dialog TEXT,
+            visual TEXT,
+            FOREIGN KEY (generation_id) REFERENCES generations(id)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+# ----------------------------
+# Pydantic Schema
+# ----------------------------
+SegmentType = Literal["片頭", "場景", "片尾"]
+
+
+class Segment(BaseModel):
+    type: SegmentType
+    camera: str
+    dialog: str
+    visual: str
+
+
+class GenerateRequest(BaseModel):
+    user_input: str = Field(..., description="使用者對影片主題或需求的描述")
+    previous_segments: Optional[List[Segment]] = Field(
+        default=None, description="已有的段落（用於分段生成）"
+    )
+
+
+class GenerateResponse(BaseModel):
+    segments: List[Segment]
+    error: Optional[str] = None
+
+
+# ----------------------------
+# 工具：決定需要生成的段落
+# ----------------------------
+ALL_TYPES: List[SegmentType] = ["片頭", "場景", "片尾"]
+
+
+def segments_missing(previous: Optional[List[Segment]]) -> List[SegmentType]:
+    if not previous:
+        return ALL_TYPES[:]  # 全部生成
+    have = {s.type for s in previous}
+    return [t for t in ALL_TYPES if t not in have]
+
+
+# ----------------------------
+# Gemini 呼叫與重試
+# ----------------------------
+class GeminiError(Exception):
+    pass
+
+
+RetryableStatus = {429, 502, 503, 504}
+
+
+def build_prompt(user_input: str, need_types: List[SegmentType], previous_segments: Optional[List[Segment]]) -> str:
+    """
+    為 Gemini 構造提示，要求嚴格輸出 JSON（僅含 segments 陣列）
+    """
+    prev_text = json.dumps([s.dict() for s in (previous_segments or [])], ensure_ascii=False, indent=2)
+    need_text = ", ".join(need_types) if need_types else "(無)"
+    return f"""
+你是資深短影音腳本編劇。請根據使用者需求生成「短影片腳本」的分段內容。
+要求：
+1) 僅輸出 JSON（不要任何說明文字），格式：
+{{
+  "segments": [
+    {{"type":"片頭","camera":"...","dialog":"...","visual":"..."}},
+    {{"type":"場景","camera":"...","dialog":"...","visual":"..."}},
+    {{"type":"片尾","camera":"...","dialog":"...","visual":"..."}}
+  ]
+}}
+2) 你「只生成」以下缺少的段落：{need_text}
+3) 每個欄位務必是字串，不可為空；dialog 要口語且符合短影音節奏（5-12秒/段）。
+4) camera：鏡位與運鏡；visual：畫面元素與轉場。
+5) 請確保 JSON 合法可 parse。
+
+使用者需求：
+{user_input}
+
+已存在的段落（請勿重複生成）：
+{prev_text}
+    """.strip()
+
+
+def parse_model_json(txt: str) -> Dict[str, Any]:
+    """
+    嘗試從模型輸出解析 JSON；若包裹在程式碼區塊或前後雜訊，試著抽離。
+    """
+    # 直接嘗試
+    try:
+        return json.loads(txt)
+    except Exception:
+        pass
+
+    # 嘗試抽取第一個 { ... } 區塊
+    start = txt.find("{")
+    end = txt.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = txt[start : end + 1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    # 最後嘗試移除 Markdown code fence
+    if "```" in txt:
+        parts = txt.split("```")
+        for p in parts:
+            p = p.strip()
+            if p.startswith("{") and p.endswith("}"):
+                try:
+                    return json.loads(p)
+                except Exception:
+                    continue
+
+    raise GeminiError("模型輸出非合法 JSON")
+
+
+def call_gemini_with_retry(
+    prompt: str,
+    model_name: str,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    request_timeout_sec: float = 60.0,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """
+    呼叫 Gemini，具退避重試。
+    回傳 (parsed_json, request_id)
+    """
+    last_err: Optional[Exception] = None
+    request_id: Optional[str] = None
+
+    # 設定回應為純 JSON（較新 SDK 支援 response_mime_type）
+    generation_config = {
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "response_mime_type": "application/json",
+    }
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            model = genai.GenerativeModel(model_name)
+            start_ts = time.time()
+            response = model.generate_content(
+                prompt,
+                generation_config=generation_config,
+                # safety_settings 可依需求調整
+            )
+            elapsed = time.time() - start_ts
+            if elapsed > request_timeout_sec:
+                raise GeminiError(f"Timeout > {request_timeout_sec}s")
+
+            # 有些版本把 request_id 放在 response 的 meta 裡；不同 SDK 可能差異
+            try:
+                request_id = getattr(response, "request_id", None)
+            except Exception:
+                request_id = None
+
+            # 取得文字並解析 JSON
+            text = response.text or ""
+            parsed = parse_model_json(text)
+            return parsed, request_id
+
+        except Exception as e:
+            last_err = e
+
+            # 嘗試辨識是否需要重試（簡化處理）
+            msg = str(e).lower()
+            is_retryable = (
+                "429" in msg
+                or "502" in msg
+                or "503" in msg
+                or "504" in msg
+                or "timeout" in msg
+                or "temporarily" in msg
+                or "unavailable" in msg
+                or "rate" in msg
+            )
+            if attempt < max_retries and is_retryable:
+                time.sleep(base_delay * (2 ** (attempt - 1)))  # 指數退避
+                continue
+            break
+
+    raise GeminiError(f"Gemini 呼叫失敗：{last_err}")
+
+
+# ----------------------------
+# 永久化：寫入 DB
+# ----------------------------
+def persist_generation(
+    user_input: str,
+    previous_segments: Optional[List[Segment]],
+    response_json: Optional[Dict[str, Any]],
+    error: Optional[str],
+    model: str,
+    request_id: Optional[str],
+) -> str:
+    """將一次請求/回應紀錄到 SQLite，並把 segments 寫入子表。"""
+    generation_id = str(uuid.uuid4())
+    created_at = datetime.utcnow().isoformat()
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO generations (id, created_at, user_input, previous_segments_json, response_json, error, model, request_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            generation_id,
+            created_at,
+            user_input,
+            json.dumps([s.dict() for s in (previous_segments or [])], ensure_ascii=False),
+            json.dumps(response_json, ensure_ascii=False) if response_json else None,
+            error,
+            model,
+            request_id,
+        ),
+    )
+
+    if response_json and "segments" in response_json:
+        for seg in response_json["segments"]:
+            cur.execute(
+                """
+                INSERT INTO segments (generation_id, type, camera, dialog, visual)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    generation_id,
+                    seg.get("type", ""),
+                    seg.get("camera", ""),
+                    seg.get("dialog", ""),
+                    seg.get("visual", ""),
+                ),
+            )
+
+    conn.commit()
+    conn.close()
+    return generation_id
+
+
+# ----------------------------
+# API：POST /generate_script
+# ----------------------------
+@app.post("/generate_script", response_model=GenerateResponse)
+def generate_script(payload: GenerateRequest):
+    need = segments_missing(payload.previous_segments)
+    if not need:
+        # 都有了，直接回傳既有內容即可
+        return GenerateResponse(segments=payload.previous_segments or [], error=None)
+
+    prompt = build_prompt(payload.user_input, need, payload.previous_segments)
+
+    try:
+        parsed_json, request_id = call_gemini_with_retry(
+            prompt=prompt,
+            model_name=GEMINI_MODEL,
+            max_retries=3,
+            base_delay=1.0,
+            request_timeout_sec=90.0,
+        )
+        # 基本結構/欄位驗證
+        if "segments" not in parsed_json or not isinstance(parsed_json["segments"], list):
+            raise GeminiError("模型回應缺少 'segments' 陣列")
+
+        # 合併 previous + 新生成
+        merged = list(payload.previous_segments or [])
+        for item in parsed_json["segments"]:
+            # 轉成 Pydantic Segment（同時做欄位校驗/補預設）
+            seg = Segment(
+                type=item.get("type"),  # 若模型不小心產出英文，會在此處報錯
+                camera=item.get("camera", ""),
+                dialog=item.get("dialog", ""),
+                visual=item.get("visual", ""),
+            )
+            # 僅加入缺少類型（避免重複）
+            if seg.type in need:
+                merged.append(seg)
+
+        # 檢查是否真的補齊
+        merged_types = {s.type for s in merged}
+        missing_after_merge = [t for t in ALL_TYPES if t not in merged_types]
+        error_msg = None
+        if missing_after_merge:
+            error_msg = f"仍缺少段落：{', '.join(missing_after_merge)}"
+
+        # 落庫
+        persisted_id = persist_generation(
+            user_input=payload.user_input,
+            previous_segments=payload.previous_segments,
+            response_json={"segments": [s.dict() for s in merged]},
+            error=error_msg,
+            model=GEMINI_MODEL,
+            request_id=request_id,
+        )
+
+        # 回傳
+        return GenerateResponse(segments=merged, error=error_msg)
+
+    except GeminiError as ge:
+        # 落庫錯誤案例
+        persist_generation(
+            user_input=payload.user_input,
+            previous_segments=payload.previous_segments,
+            response_json=None,
+            error=str(ge),
+            model=GEMINI_MODEL,
+            request_id=None,
+        )
+        # 維持固定回應格式
+        return JSONResponse(
+            status_code=502,
+            content=GenerateResponse(segments=[], error=str(ge)).dict(),
+        )
+    except Exception as e:
+        persist_generation(
+            user_input=payload.user_input,
+            previous_segments=payload.previous_segments,
+            response_json=None,
+            error=f"Unhandled: {e}",
+            model=GEMINI_MODEL,
+            request_id=None,
+        )
+        return JSONResponse(
+            status_code=500,
+            content=GenerateResponse(segments=[], error=f"Unhandled: {e}").dict(),
+        )
+
+
+# ----------------------------
+# Health Check
+# ----------------------------
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "model": GEMINI_MODEL, "db": DB_PATH}
 
