@@ -2,8 +2,9 @@
 import os
 import json
 import sqlite3
-from typing import List, Optional, Any, Dict
-from fastapi import FastAPI, HTTPException, Request
+import time
+from typing import List, Optional, Any, Dict, Literal
+from fastapi import FastAPI, HTTPException, Request, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
@@ -38,6 +39,7 @@ def init_db():
     _ensure_db_dir(DB_PATH)
     conn = get_conn()
     cur = conn.cursor()
+    # 原本的請求記錄表
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS requests (
@@ -46,6 +48,25 @@ def init_db():
             user_input TEXT,
             previous_segments_json TEXT,
             response_json TEXT
+        )
+        """
+    )
+    # 新增：聊天會話 & 訊息表
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_session(
+            id TEXT PRIMARY KEY,
+            created_at INTEGER
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_message(
+            session_id TEXT,
+            role TEXT,     -- 'user'|'assistant'|'system'
+            content TEXT,
+            ts INTEGER
         )
         """
     )
@@ -62,7 +83,7 @@ def on_startup():
         # 只印出，不讓服務掛掉
         print("[BOOT] DB init failed:", e)
 
-# ========= Pydantic 模型 =========
+# ========= Pydantic 模型（產生段落） =========
 class Segment(BaseModel):
     type: str = Field(default="場景")
     camera: Optional[str] = ""
@@ -222,3 +243,107 @@ def generate_script(req: GenerateReq):
     except Exception as e:
         # 統一以 JSON 回傳
         return JSONResponse(status_code=500, content={"segments": [], "error": "internal_server_error"})
+
+# ========= 下面開始：聊天式 API（新增） =========
+
+# --- Chat 資料模型 ---
+class ChatMessage(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+class ChatRequest(BaseModel):
+    session_id: Optional[str] = None
+    messages: List[ChatMessage] = Field(default_factory=list)     # 本輪新訊息（至少 1 則 user）
+    previous_segments: List[Dict[str, Any]] = Field(default_factory=list)
+
+class ChatResponse(BaseModel):
+    session_id: str
+    assistant_message: str
+    segments: List[Dict[str, Any]]
+    error: Optional[str] = None
+
+chat_router = APIRouter()
+
+def _ensure_session(session_id: Optional[str]) -> str:
+    sid = session_id or f"s_{int(time.time()*1000)}"
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM chat_session WHERE id=?", (sid,))
+    if not cur.fetchone():
+        cur.execute("INSERT INTO chat_session(id, created_at) VALUES(?,?)", (sid, int(time.time())))
+        conn.commit()
+    conn.close()
+    return sid
+
+def _save_messages(session_id: str, msgs: List[ChatMessage]) -> None:
+    if not msgs:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    for m in msgs:
+        cur.execute(
+            "INSERT INTO chat_message(session_id, role, content, ts) VALUES(?,?,?,?)",
+            (session_id, m.role, m.content, int(time.time()))
+        )
+    conn.commit()
+    conn.close()
+
+def _load_history(session_id: str) -> List[ChatMessage]:
+    conn = get_conn()
+    cur = conn.cursor()
+    rows = cur.execute(
+        "SELECT role, content FROM chat_message WHERE session_id=? ORDER BY ts ASC",
+        (session_id,)
+    ).fetchall()
+    conn.close()
+    return [ChatMessage(role=r, content=c) for (r, c) in rows]
+
+# 把聊天內容壓成一條 user_input，仍然沿用你現有的產生器
+def _generate_segments_from_chat(history: List[ChatMessage], prev_segments: List[Dict[str, Any]]) -> List[Segment]:
+    header = "你是短影音腳本與文案助理，輸出 JSON segments：type/camera/dialog/visual。"
+    chat_txt = "\n".join([f"{'使用者' if m.role=='user' else '助理'}: {m.content}" for m in history])
+    prev_txt = json.dumps(prev_segments, ensure_ascii=False)
+    user_input = f"{header}\n\n對話紀錄：\n{chat_txt}\n\n已接受的前段：{prev_txt}\n請產生新的 segments（鍵名與格式保持不變）。"
+
+    req = GenerateReq(
+        user_input=user_input,
+        previous_segments=[Segment(**s) for s in prev_segments] if prev_segments else []
+    )
+
+    if GOOGLE_API_KEY:
+        try:
+            return _gemini_generate(req)
+        except Exception:
+            return _fallback_generate(req)
+    else:
+        return _fallback_generate(req)
+
+@chat_router.post("/chat_generate", response_model=ChatResponse)
+def chat_generate(req: ChatRequest):
+    # 1) session 與儲存本輪 user 訊息
+    sid = _ensure_session(req.session_id)
+    new_user_msgs = [m for m in req.messages if m.role == "user"]
+    if new_user_msgs:
+        _save_messages(sid, new_user_msgs)
+
+    # 2) 讀完整歷史（可在這裡做摘要/裁切以控長度）
+    history = _load_history(sid)
+
+    # 3) 產生 segments（沿用原本引擎）
+    segments_objs = _generate_segments_from_chat(history, req.previous_segments)
+    segments = [s.model_dump() for s in segments_objs]
+
+    # 4) 準備助手回覆並存檔
+    assistant_message = "好的，我已根據你的最新指示產出新分段，若想換風格或節奏直接跟我說。"
+    _save_messages(sid, [ChatMessage(role="assistant", content=assistant_message)])
+
+    return ChatResponse(
+        session_id=sid,
+        assistant_message=assistant_message,
+        segments=segments,
+        error=None
+    )
+
+# 掛上聊天路由
+app.include_router(chat_router)
+
