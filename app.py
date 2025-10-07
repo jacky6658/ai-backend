@@ -1,17 +1,17 @@
 #!/usr/bin/env python
 # coding: utf-8
 """
-FastAPI 後端服務（相容版）
+FastAPI 後端服務（相容 + 雲端寫入保險版）
 - 核心 API（不可變）：POST /generate_script
   Request:  {"user_input": "...", "previous_segments": [...]}
   Response: {"segments":[{"type":"片頭","camera":"...","dialog":"...","visual":"..."}], "error": null}
 - 功能：
   * Gemini 生成（分段生成 + 聚合）
   * 退避重試（429/502/503/504/timeout/網路錯誤）
-  * SQLite 永久化每次生成結果（請求/回應/錯誤）
+  * SQLite 永久化每次生成結果（自動挑選可寫目錄）
 - 運維：
   * GET /healthz（健康檢查）
-  * GET / 與 /favicon.ico（避免瀏覽器 404 噪音；不影響核心 API）
+  * GET / 與 /favicon.ico（避免瀏覽器 404 噪音）
 """
 
 import os
@@ -32,7 +32,7 @@ import google.generativeai as genai
 # ----------------------------
 # App 先宣告（避免裝飾器時找不到 app）
 # ----------------------------
-app = FastAPI(title="Script Generator API", version="1.2.0")
+app = FastAPI(title="Script Generator API", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,22 +43,65 @@ app.add_middleware(
 )
 
 # ----------------------------
-# 環境變數與 Gemini 設定
+# 環境變數與 Gemini 設定（不改 API）
 # ----------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
-DB_PATH = os.getenv("DB_PATH", "script_generation.db")
 
-# 沒金鑰也能啟動，/generate_script 才檢查
+# DB 預設（可被環境變數覆蓋）；若不可寫，後續會自動 fallback
+DB_PATH_ENV = os.getenv("DB_PATH", "/app/script_generation.db").strip()
+
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_available = True
 else:
-    gemini_available = False
+    gemini_available = False  # /generate_script 會回 502；/healthz OK
 
 # ----------------------------
-# SQLite 初始化
+# SQLite：挑選可寫路徑（解決雲端唯讀目錄）
 # ----------------------------
+def _ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent, exist_ok=True)
+
+def _touch(path: str) -> None:
+    # 預先建立檔案，避免部分平台首次連線報錯
+    with open(path, "a", encoding="utf-8"):
+        pass
+
+def pick_writable_db_path() -> str:
+    """
+    依序嘗試：
+    1) DB_PATH_ENV（例如你手動設成 /data/script_generation.db）
+    2) /data/script_generation.db
+    3) /tmp/appdata/script_generation.db
+    成功即可返回；若都失敗則拋出例外。
+    """
+    candidates = [
+        DB_PATH_ENV,
+        "/data/script_generation.db",
+        "/tmp/appdata/script_generation.db",
+    ]
+    last_err = None
+    for p in candidates:
+        try:
+            _ensure_parent_dir(p)
+            _touch(p)
+            # 測試能否開啟資料庫（建立檔案 + pragma）
+            conn = sqlite3.connect(p)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.close()
+            print(f"[BOOT] SQLite path OK: {p}")
+            return p
+        except Exception as e:
+            last_err = e
+            print(f"[BOOT] SQLite path failed: {p} -> {e}")
+            continue
+    raise sqlite3.OperationalError(f"No writable DB path. last_err={last_err}")
+
+DB_PATH = pick_writable_db_path()
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -159,19 +202,16 @@ def build_prompt(user_input: str, need_types: List[SegmentType], previous_segmen
 """.strip()
 
 def parse_model_json(txt: str) -> Dict[str, Any]:
-    # 直接嘗試
     try:
         return json.loads(txt)
     except Exception:
         pass
-    # 擷取首尾大括號
     s, e = txt.find("{"), txt.rfind("}")
     if s != -1 and e != -1 and e > s:
         try:
             return json.loads(txt[s:e+1])
         except Exception:
             pass
-    # 處理 ``` 包裹
     if "```" in txt:
         for p in txt.split("```"):
             p = p.strip()
@@ -198,7 +238,7 @@ def call_gemini_with_retry(
     generation_config = {
         "temperature": 0.8,
         "top_p": 0.95,
-        "response_mime_type": "application/json",  # 要求回 JSON
+        "response_mime_type": "application/json",
     }
 
     for attempt in range(1, max_retries + 1):
@@ -210,7 +250,7 @@ def call_gemini_with_retry(
                 raise GeminiError(f"Timeout > {timeout_sec}s")
 
             try:
-                request_id = getattr(resp, "request_id", None)  # 有些 SDK 版本提供
+                request_id = getattr(resp, "request_id", None)
             except Exception:
                 request_id = None
 
@@ -223,7 +263,7 @@ def call_gemini_with_retry(
             msg = str(e).lower()
             retryable = any(k in msg for k in ["429", "502", "503", "504", "timeout", "temporarily", "unavailable", "rate"])
             if attempt < max_retries and retryable:
-                time.sleep(base_delay * (2 ** (attempt - 1)))  # 指數退避：1s,2s,4s
+                time.sleep(base_delay * (2 ** (attempt - 1)))
                 continue
             break
 
@@ -342,7 +382,12 @@ def generate_script(payload: GenerateRequest):
 # ----------------------------
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "model": GEMINI_MODEL, "db": DB_PATH, "gemini": gemini_available}
+    return {
+        "ok": True,
+        "model": GEMINI_MODEL,
+        "db": DB_PATH,
+        "gemini": gemini_available
+    }
 
 @app.get("/")
 def index():
@@ -356,5 +401,4 @@ def index():
 
 @app.get("/favicon.ico")
 def favicon():
-    # 回 204 避免瀏覽器刷 404
     return JSONResponse(status_code=204, content=None)
