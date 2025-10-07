@@ -2,10 +2,8 @@
 import os
 import json
 import sqlite3
-import time
-import re
-from typing import List, Optional, Any, Dict, Literal
-from fastapi import FastAPI, HTTPException, Request, APIRouter
+from typing import List, Optional, Any, Dict, Tuple
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
@@ -20,7 +18,7 @@ app = FastAPI(title="AI Script Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],            # 若有固定前端網域，建議改成清單
     allow_credentials=True,
     allow_methods=["POST", "OPTIONS", "GET"],
     allow_headers=["*"],
@@ -40,7 +38,7 @@ def init_db():
     _ensure_db_dir(DB_PATH)
     conn = get_conn()
     cur = conn.cursor()
-    # 既有：請求記錄表（保留）
+    # 舊接口紀錄
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS requests (
@@ -52,57 +50,24 @@ def init_db():
         )
         """
     )
-    # 聊天會話（保留）
+    # 對話記憶
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS chat_session(
-            id TEXT PRIMARY KEY,
-            created_at INTEGER
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            mode TEXT DEFAULT 'auto'
         )
         """
     )
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS chat_message(
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT,
-            role TEXT,     -- 'user'|'assistant'|'system'
+            role TEXT,
             content TEXT,
-            ts INTEGER
-        )
-        """
-    )
-    # 新增：使用者長期記憶（key-value）與片段記憶（自由文本）
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_profile(
-            user_id TEXT PRIMARY KEY,
-            prefs_json TEXT,           -- 個人偏好（tone, language, writing_style, max_length等）
-            counters_json TEXT,        -- 回饋計數（thumbs_up/down等）
-            updated_at INTEGER
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_memory(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT,
-            content TEXT,              -- 記住的一句話/事實/偏好
-            importance INTEGER,        -- 1~5
-            tags TEXT,                 -- 逗號分隔
-            created_at INTEGER
-        )
-        """
-    )
-    # 新增：內部「思考草稿」存檔（不回傳給前端）
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS assistant_thought(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT,
-            user_id TEXT,
-            scratchpad TEXT,
-            created_at INTEGER
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
@@ -118,7 +83,7 @@ def on_startup():
     except Exception as e:
         print("[BOOT] DB init failed:", e)
 
-# ========= Pydantic 模型（產生段落） =========
+# ========= Pydantic 模型 =========
 class Segment(BaseModel):
     type: str = Field(default="場景")
     camera: Optional[str] = ""
@@ -133,7 +98,71 @@ class GenerateResp(BaseModel):
     segments: List[Segment] = Field(default_factory=list)
     error: Optional[str] = None
 
-# ========= 共用：回覆錯誤處理 =========
+class ChatMessage(BaseModel):
+    role: str  # "system" / "user" / "assistant"
+    content: str
+
+class ChatReq(BaseModel):
+    session_id: Optional[str] = None
+    messages: List[ChatMessage] = Field(default_factory=list)
+    mode: str = "auto"  # "script" / "copy" / "auto"
+
+class ChatResp(BaseModel):
+    assistant_message: str
+    metadata: Dict[str, Any] = {}
+
+# ========= 內建知識庫（由你心智圖濃縮，可再擴充） =========
+KB: Dict[str, Dict[str, List[str]]] = {
+    "流量技巧": {
+        "開頭鉤子": [
+            "反常識/數字衝擊：『你以為…其實…』、『3秒看懂…』",
+            "人設/場景切入：人物近景＋場景音效（鍵盤、電梯、鬧鐘）",
+            "痛點質問：『為什麼你每天…卻…？』",
+        ],
+        "加速節奏": [
+            "每 0.7–1.0 秒輕微鏡位變化（推、拉、移、晃），B-roll 快切",
+            "關鍵詞上字幕，節奏點做呼吸位（0.1–0.2s 停頓）",
+        ],
+    },
+    "視覺策略": {
+        "鏡位模板": [
+            "片頭：特寫主角臉部/手部 + 定向光，聚焦情緒",
+            "場景：半身跟拍→桌面近距→產品特寫（推近）",
+            "片尾：遠景拉遠 + LOGO/CTA 入場（左下或居中落版）",
+        ],
+        "畫面語言": [
+            "動作與字幕對拍點；B-roll：鍵盤/計時器/走路/開門/城市轉場",
+            "色彩：冷暖對比作情緒（冷→問題、暖→解法/成果）",
+        ],
+    },
+    "腳本結構": {
+        "短視頻三段式": [
+            "開頭（0–3s）：強鉤子 + 提出矛盾/問題",
+            "中段（3–20s）：解法步驟/案例演示/前後對比",
+            "結尾（20–30s）：總結 + CTA（私訊/連結/收藏/關注）",
+        ],
+        "常見套路": [
+            "故事式：人物→衝突→轉折→解決→結果",
+            "清單式：3 步驟/5 招技巧，搭配序號字幕",
+            "問答式：連環提問→揭示真相→一招帶走",
+        ],
+    },
+    "CTA": {
+        "類型": [
+            "行動：『私訊我拿清單』、『點連結領模板』",
+            "社交：『收藏這支，回頭照著拍』、『關注拿後續 Part2』",
+            "轉化：『限時 48h，填表體驗』",
+        ]
+    },
+    "時長節拍": {
+        "通用 30s": [
+            "0–3s 鉤子、3–12s 核心內容、高頻畫面變化",
+            "12–24s 案例/步驟/對比、24–30s 收束 + 明確 CTA",
+        ]
+    }
+}
+
+# ========= 錯誤處理（不要手動 Content-Length） =========
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
@@ -159,16 +188,143 @@ def root_page():
     return """
     <html><body>
       <h3>AI Backend OK</h3>
-      <p>POST <code>/generate_script</code> with JSON body.</p>
-      <pre>{
-  "user_input": "hi",
-  "previous_segments": []
-}</pre>
-      <p>Chat API: <code>/chat_generate</code>（支援 user_id / 記憶 / 學習）</p>
+      <p>POST <code>/chat</code> (新聊天模式) 或 <code>/generate_script</code> (舊分段模式)</p>
     </body></html>
     """
 
-# ========= 產生段落主流程（沿用） =========
+# ========= 小工具：知識檢索 / 提示詞生成 =========
+def _simple_retrieve(topic: str, mode: str = "auto") -> Dict[str, List[str]]:
+    """超輕量檢索：根據關鍵字挑選 KB 片段（無向量庫）。"""
+    topic_lc = (topic or "").lower()
+    picked: Dict[str, List[str]] = {}
+
+    def add(cat: str, key: str, items: List[str]):
+        picked.setdefault(f"{cat}/{key}", [])
+        picked[f"{cat}/{key}"].extend(items)
+
+    # 通用必帶
+    add("流量技巧", "開頭鉤子", KB["流量技巧"]["開頭鉤子"])
+    add("時長節拍", "通用 30s", KB["時長節拍"]["通用 30s"])
+
+    # 行業/意圖簡單匹配（可再擴）
+    if any(w in topic_lc for w in ["電商", "賣", "商品", "團購", "開箱", "優惠"]):
+        add("視覺策略", "鏡位模板", KB["視覺策略"]["鏡位模板"])
+        add("CTA", "類型", [KB["CTA"]["類型"][0], KB["CTA"]["類型"][2]])
+    if any(w in topic_lc for w in ["個人品牌", "創作者", "學習", "自媒體", "經驗"]):
+        add("腳本結構", "常見套路", KB["腳本結構"]["常見套路"])
+        add("CTA", "類型", [KB["CTA"]["類型"][1]])
+
+    # 模式導向
+    if mode == "copy":
+        add("腳本結構", "常見套路", ["清單式：3-5 點，句子短、口語、有表情符號可讀性"])
+    else:
+        add("視覺策略", "畫面語言", KB["視覺策略"]["畫面語言"])
+
+    return picked
+
+def _knowledge_block(picked: Dict[str, List[str]]) -> str:
+    lines = []
+    for k, arr in picked.items():
+        lines.append(f"- {k}：")
+        for it in arr:
+            lines.append(f"  • {it}")
+    return "\n".join(lines)
+
+def _ensure_session(session_id: Optional[str], mode: str = "auto") -> str:
+    """建立或回傳 session_id；並在 DB 建立紀錄。"""
+    sid = session_id or os.urandom(8).hex()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("INSERT OR IGNORE INTO sessions (session_id, mode) VALUES (?, ?)", (sid, mode))
+    conn.commit()
+    conn.close()
+    return sid
+
+def _save_messages(session_id: str, messages: List[ChatMessage]):
+    if not messages:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.executemany(
+        "INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)",
+        [(session_id, m.role, m.content) for m in messages],
+    )
+    conn.commit()
+    conn.close()
+
+def _lm_generate_text(prompt_text: str) -> str:
+    """包一層模型呼叫；沒有 Key 就回本地預設。"""
+    if not GOOGLE_API_KEY:
+        return "（本地回覆）我已讀取你的主題，將以短影音顧問的方式提供腳本/文案建議。"
+
+    import google.generativeai as genai
+    genai.configure(api_key=GOOGLE_API_KEY)
+    model = genai.GenerativeModel(GEMINI_MODEL)
+    res = model.generate_content(prompt_text)
+    return (res.text or "").strip()
+
+# ========= 新接口：聊天模式 =========
+@app.post("/chat", response_model=ChatResp)
+def chat(req: ChatReq):
+    sid = _ensure_session(req.session_id, req.mode)
+    _save_messages(sid, req.messages)
+
+    # 取最後一則 user 當「主題/需求」
+    last_user = ""
+    for m in reversed(req.messages):
+        if m.role == "user":
+            last_user = m.content.strip()
+            break
+
+    picked = _simple_retrieve(last_user, req.mode)
+    kb_txt = _knowledge_block(picked)
+
+    # 兩種模式的產出規範
+    script_spec = (
+        "若需求是『腳本』，請輸出：\n"
+        "1)『分析』：受眾/痛點/策略（條列）\n"
+        "2)『時間軸規劃』：0–3s、3–10s、10–20s、20–30s 各段要點\n"
+        "3)『分段 JSON』：僅輸出 JSON 陣列（type/camera/dialog/visual），不要多餘文字\n"
+    )
+    copy_spec = (
+        "若需求是『文案』，請輸出：\n"
+        "1)『貼文骨架』：開頭鉤子→問題→解法→行動\n"
+        "2)『平台變體』：IG Reels/抖音/小紅書（各 1 版簡短）\n"
+        "3)『CTA 選項』：行動型/社交型各 2 條\n"
+    )
+
+    system = (
+        "你是專業短影音顧問，精通腳本拆解、畫面語言與社群文案。"
+        "必須語氣專業、可執行、條列清晰。"
+        "先簡短確認需求，再給出具體方案。"
+    )
+
+    prompt = []
+    prompt.append(f"[系統]\n{system}")
+    prompt.append("[內建知識]\n" + kb_txt)
+    prompt.append("[產出規範]\n" + script_spec + "\n" + copy_spec)
+    prompt.append("[對話]")
+    for m in req.messages:
+        tag = "使用者" if m.role == "user" else ("助理" if m.role == "assistant" else "系統")
+        prompt.append(f"{tag}：{m.content}")
+    if req.mode == "script":
+        prompt.append("請優先走『腳本』規範；若資訊不足，先以提問澄清後仍要給暫定方案。")
+    elif req.mode == "copy":
+        prompt.append("請優先走『文案』規範；若資訊不足，先以提問澄清後仍要給暫定方案。")
+    else:
+        prompt.append("請根據語意自動判斷更適合腳本或文案，並說明原因。")
+
+    text = _lm_generate_text("\n\n".join(prompt))
+
+    # 存助理回覆
+    _save_messages(sid, [ChatMessage(role="assistant", content=text)])
+
+    return ChatResp(
+        assistant_message=text,
+        metadata={"session_id": sid, "picked_knowledge": picked, "mode": req.mode},
+    )
+
+# ========= 舊接口：分段生成（保留且增強：帶知識庫提示） =========
 def _fallback_generate(req: GenerateReq) -> List[Segment]:
     step = len(req.previous_segments)
     pick_type = "片頭" if step == 0 else ("片尾" if step >= 2 else "場景")
@@ -197,32 +353,36 @@ def _fallback_generate(req: GenerateReq) -> List[Segment]:
         )
     ]
 
-def _gemini_generate(req: GenerateReq) -> List[Segment]:
+def _gemini_generate_with_kb(req: GenerateReq) -> List[Segment]:
     import google.generativeai as genai
     genai.configure(api_key=GOOGLE_API_KEY)
     model = genai.GenerativeModel(GEMINI_MODEL)
 
+    picked = _simple_retrieve(req.user_input, "script")
+    kb_txt = _knowledge_block(picked)
+
     system_prompt = (
-        "你是短影音腳本助手。輸出 JSON 陣列，每個元素含 type(片頭|場景|片尾)、"
-        "camera、dialog、visual 三欄，不要加註解或多餘文字。"
+        "你是短影音腳本助手。只輸出 JSON 陣列，每個元素含："
+        "type(片頭|場景|片尾)、camera、dialog、visual。"
+        "不要加註解或額外說明。"
     )
     prev = [s.model_dump() for s in req.previous_segments]
     user = req.user_input or "請生成一段 30 秒短影音腳本的下一個分段。"
 
     prompt = (
-        f"{system_prompt}\n"
-        f"使用者輸入: {user}\n"
-        f"已接受段落(previous_segments): {json.dumps(prev, ensure_ascii=False)}\n"
-        f"請僅回傳 JSON 陣列，如: "
+        f"{system_prompt}\n\n"
+        f"[內建知識]\n{kb_txt}\n\n"
+        f"[主題]\n{user}\n"
+        f"[已接受段落 previous_segments]\n{json.dumps(prev, ensure_ascii=False)}\n\n"
+        f"僅回傳 JSON 陣列，例如："
         f'[{{"type":"片頭","camera":"...","dialog":"...","visual":"..."}}]'
     )
 
     res = model.generate_content(prompt)
     text = (res.text or "").strip()
-    first_bracket = text.find("[")
-    last_bracket = text.rfind("]")
-    if first_bracket != -1 and last_bracket != -1 and last_bracket > first_bracket:
-        text = text[first_bracket:last_bracket + 1]
+    i, j = text.find("["), text.rfind("]")
+    if i != -1 and j != -1 and j > i:
+        text = text[i:j+1]
     data = json.loads(text)
 
     segments: List[Segment] = []
@@ -242,13 +402,13 @@ def generate_script(req: GenerateReq):
     try:
         if GOOGLE_API_KEY:
             try:
-                segments = _gemini_generate(req)
+                segments = _gemini_generate_with_kb(req)
             except Exception as _:
                 segments = _fallback_generate(req)
         else:
             segments = _fallback_generate(req)
 
-        # 記錄
+        # 記錄到 DB（最小審計；失敗不影響回應）
         try:
             conn = get_conn()
             cur = conn.cursor()
@@ -266,311 +426,7 @@ def generate_script(req: GenerateReq):
             print("[DB] insert failed:", e)
 
         return GenerateResp(segments=segments, error=None)
-    except HTTPException:
-        raise
+    except HTTPException as exc:
+        raise exc
     except Exception:
         return JSONResponse(status_code=500, content={"segments": [], "error": "internal_server_error"})
-
-# ========= 聊天 + 記憶 + 學習 =========
-class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str
-
-class ChatRequest(BaseModel):
-    session_id: Optional[str] = None
-    user_id: Optional[str] = None                 # ★ 新增：用來綁定記憶
-    messages: List[ChatMessage] = Field(default_factory=list)
-    previous_segments: List[Dict[str, Any]] = Field(default_factory=list)
-    remember: Optional[bool] = False              # ★ 勾選後，會嘗試把本輪重點寫入記憶
-
-class ChatResponse(BaseModel):
-    session_id: str
-    assistant_message: str
-    segments: List[Dict[str, Any]]
-    error: Optional[str] = None
-
-chat_router = APIRouter()
-
-def _ensure_session(session_id: Optional[str]) -> str:
-    sid = session_id or f"s_{int(time.time()*1000)}"
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM chat_session WHERE id=?", (sid,))
-    if not cur.fetchone():
-        cur.execute("INSERT INTO chat_session(id, created_at) VALUES(?,?)", (sid, int(time.time())))
-        conn.commit()
-    conn.close()
-    return sid
-
-# ----- 記憶與偏好 -----
-DEFAULT_PREFS = {
-    "tone": "friendly",          # 語氣
-    "language": "zh-TW",         # 回覆語系
-    "writing_style": "concise",  # 文風：concise/balanced/rich
-    "max_length": 1200,          # 回覆最大字數
-}
-
-def _get_or_create_profile(user_id: str) -> Dict[str, Any]:
-    conn = get_conn()
-    cur = conn.cursor()
-    row = cur.execute("SELECT prefs_json, counters_json FROM user_profile WHERE user_id=?", (user_id,)).fetchone()
-    if row:
-        prefs = json.loads(row[0]) if row[0] else {}
-        counters = json.loads(row[1]) if row[1] else {}
-    else:
-        prefs = DEFAULT_PREFS.copy()
-        counters = {"thumbs_up": 0, "thumbs_down": 0}
-        cur.execute(
-            "INSERT INTO user_profile(user_id, prefs_json, counters_json, updated_at) VALUES(?,?,?,?)",
-            (user_id, json.dumps(prefs, ensure_ascii=False), json.dumps(counters, ensure_ascii=False), int(time.time()))
-        )
-        conn.commit()
-    conn.close()
-    return {"prefs": prefs, "counters": counters}
-
-def _update_profile(user_id: str, prefs: Dict[str, Any] = None, counters: Dict[str, Any] = None):
-    conn = get_conn()
-    cur = conn.cursor()
-    row = cur.execute("SELECT prefs_json, counters_json FROM user_profile WHERE user_id=?", (user_id,)).fetchone()
-    old_prefs = json.loads(row[0]) if row and row[0] else {}
-    old_counters = json.loads(row[1]) if row and row[1] else {}
-    if prefs:
-        old_prefs.update(prefs)
-    if counters:
-        for k, v in counters.items():
-            old_counters[k] = old_counters.get(k, 0) + int(v)
-    cur.execute(
-        "REPLACE INTO user_profile(user_id, prefs_json, counters_json, updated_at) VALUES(?,?,?,?)",
-        (user_id, json.dumps(old_prefs, ensure_ascii=False), json.dumps(old_counters, ensure_ascii=False), int(time.time()))
-    )
-    conn.commit()
-    conn.close()
-
-def _save_memory(user_id: str, content: str, importance: int = 2, tags: List[str] = None):
-    if not content:
-        return
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO user_memory(user_id, content, importance, tags, created_at) VALUES(?,?,?,?,?)",
-        (user_id, content, max(1, min(importance, 5)), ",".join(tags or []), int(time.time()))
-    )
-    conn.commit()
-    conn.close()
-
-def _recent_memories(user_id: str, limit: int = 10) -> List[str]:
-    conn = get_conn()
-    cur = conn.cursor()
-    rows = cur.execute(
-        "SELECT content FROM user_memory WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
-        (user_id, limit)
-    ).fetchall()
-    conn.close()
-    return [r[0] for r in rows]
-
-def _extract_memories_from_text(text: str) -> List[str]:
-    """
-    超輕量規則：從使用者文字找可持久化的事實/偏好。
-    真正上線可換成 NER/分類器或 LLM 兩階段抽取。
-    """
-    memories = []
-    # 個人稱呼 / 名字
-    m = re.search(r"(我叫|我的名字是|可以叫我)([^，。,！!?\s]{1,12})", text)
-    if m:
-        memories.append(f"使用者偏好稱呼：{m.group(2)}")
-    # 偏好語氣/語言
-    if "用台灣繁體" in text or "用繁體中文" in text:
-        memories.append("偏好語言：zh-TW")
-    if "幽默" in text:
-        memories.append("偏好語氣：humorous")
-    if "專業" in text or "正式" in text:
-        memories.append("偏好語氣：professional")
-    # 類別興趣
-    if "短影音" in text:
-        memories.append("興趣：短影音創作")
-    return memories
-
-def _compose_system_preamble(user_prefs: Dict[str, Any], recent_memory: List[str]) -> str:
-    tone = user_prefs.get("tone", "friendly")
-    lang = user_prefs.get("language", "zh-TW")
-    style = user_prefs.get("writing_style", "concise")
-    limit = int(user_prefs.get("max_length", 1200))
-
-    mem = "；".join(recent_memory[:8]) if recent_memory else "（無）"
-    return (
-        f"你是短影音腳本與文案助理，請用 {lang} 回覆；語氣 {tone}；文風 {style}；"
-        f"請限制在 {limit} 字內。綜合考慮使用者的長期記憶：{mem}。"
-        f"輸出結果時，先完成最終回覆給使用者，並額外提供一份 segments JSON（type/camera/dialog/visual）。"
-        f"不要在回覆中包含你的思考過程或草稿。"
-    )
-
-# ----- 內部思考草稿（不回傳，僅存 DB）-----
-def _save_thought(session_id: str, user_id: Optional[str], scratch: str):
-    if not scratch:
-        return
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO assistant_thought(session_id, user_id, scratchpad, created_at) VALUES(?,?,?,?)",
-        (session_id, user_id or "", scratch, int(time.time()))
-    )
-    conn.commit()
-    conn.close()
-
-# ----- 會話工具 -----
-def _save_messages(session_id: str, msgs: List[ChatMessage]) -> None:
-    if not msgs:
-        return
-    conn = get_conn()
-    cur = conn.cursor()
-    for m in msgs:
-        cur.execute(
-            "INSERT INTO chat_message(session_id, role, content, ts) VALUES(?,?,?,?)",
-            (session_id, m.role, m.content, int(time.time()))
-        )
-    conn.commit()
-    conn.close()
-
-def _load_history(session_id: str) -> List[ChatMessage]:
-    conn = get_conn()
-    cur = conn.cursor()
-    rows = cur.execute(
-        "SELECT role, content FROM chat_message WHERE session_id=? ORDER BY ts ASC",
-        (session_id,)
-    ).fetchall()
-    conn.close()
-    return [ChatMessage(role=r, content=c) for (r, c) in rows]
-
-# ----- 核心：由聊天生成分段（沿用你的生成器）-----
-def _generate_segments_with_context(user_input: str, prev_segments: List[Dict[str, Any]]) -> List[Segment]:
-    req = GenerateReq(
-        user_input=user_input,
-        previous_segments=[Segment(**s) for s in prev_segments] if prev_segments else []
-    )
-    if GOOGLE_API_KEY:
-        try:
-            return _gemini_generate(req)
-        except Exception:
-            return _fallback_generate(req)
-    else:
-        return _fallback_generate(req)
-
-# ----- Chat API -----
-@chat_router.post("/chat_generate", response_model=ChatResponse)
-def chat_generate(req: ChatRequest):
-    # 1) session & user
-    sid = _ensure_session(req.session_id)
-    uid = req.user_id or "anon"
-
-    # 2) 讀/建使用者偏好與最近記憶
-    profile = _get_or_create_profile(uid)
-    prefs = profile["prefs"]
-    recent_mem = _recent_memories(uid, limit=10)
-
-    # 3) 寫入本輪 user 訊息
-    new_user_msgs = [m for m in req.messages if m.role == "user"]
-    if new_user_msgs:
-        _save_messages(sid, new_user_msgs)
-
-    # 4) 組合「系統前言 + 會話」成一段 user_input，送進既有生成器
-    history = _load_history(sid)
-    preamble = _compose_system_preamble(prefs, recent_mem)
-    chat_txt = "\n".join([f"{'使用者' if m.role=='user' else '助理'}: {m.content}" for m in history])
-    user_input_for_gen = (
-        f"{preamble}\n\n"
-        f"以下是雙方對話紀錄：\n{chat_txt}\n\n"
-        f"請先決定整體腳本策略（只在內部思考，勿回給使用者），"
-        f"接著輸出最終回覆（中文）；並產生 segments JSON 陣列。"
-    )
-
-    # 5) （可選）做一份「內部思考草稿」文字——我們這裡用簡單規劃字串示意並存檔
-    scratch = (
-        "【內部草稿】規劃本輪回覆步驟：\n"
-        "1) 先重述使用者目標\n2) 產出短影音主線與風格\n3) 給 1~2 段分段\n4) 給文案CTA\n"
-        "（此草稿不會回傳給前端，只存DB便於日後分析品質）"
-    )
-    _save_thought(sid, uid, scratch)
-
-    # 6) 生成 segments（沿用你的生成器）
-    segments_objs = _generate_segments_with_context(user_input_for_gen, req.previous_segments)
-    segments = [s.model_dump() for s in segments_objs]
-
-    # 7) 產出可讀回覆（assistant_message）
-    #    這裡用非常簡化的模板。若有 Google Key，你也可以再丟一次 LLM 讓口吻更貼偏好。
-    tone_hint = {
-        "friendly": "親切口語",
-        "humorous": "帶點幽默",
-        "professional": "專業清楚"
-    }.get(prefs.get("tone", "friendly"), "親切口語")
-
-    assistant_message = (
-        f"好的，這輪我會用「{tone_hint}」風格來協助你。\n"
-        f"我已先規劃一本短影音的主線，並產出新的分段，"
-        f"你可以直接說「調快節奏」「更口語」或提供主題方向，我會接著優化。"
-    )
-
-    # 8) 記憶抽取（顯式 remember=true 或自動從最新 user 訊息抓）
-    if uid:
-        if req.remember:
-            # 顯式記憶：把最後一則 user 訊息整句存起來（importance=3）
-            if new_user_msgs:
-                _save_memory(uid, new_user_msgs[-1].content, importance=3, tags=["explicit"])
-        else:
-            # 自動抽取：從使用者訊息中撈偏好/事實（importance=2）
-            if new_user_msgs:
-                autos = []
-                for m in new_user_msgs:
-                    autos.extend(_extract_memories_from_text(m.content))
-                for item in autos[:5]:
-                    _save_memory(uid, item, importance=2, tags=["auto"])
-
-    # 9) 紀錄助理回覆
-    _save_messages(sid, [ChatMessage(role="assistant", content=assistant_message)])
-
-    return ChatResponse(
-        session_id=sid,
-        assistant_message=assistant_message,
-        segments=segments,
-        error=None
-    )
-
-# 回饋 API：讓前端送 thumbs_up/down，做「學習」
-class FeedbackReq(BaseModel):
-    user_id: Optional[str] = None
-    kind: Literal["thumbs_up", "thumbs_down"]
-    note: Optional[str] = None
-
-@app.post("/feedback")
-def feedback(req: FeedbackReq):
-    uid = req.user_id or "anon"
-    if req.kind not in ("thumbs_up", "thumbs_down"):
-        raise HTTPException(status_code=400, detail="invalid kind")
-    _update_profile(uid, counters={req.kind: 1})
-    # 策略：若連續多次 thumbs_down，可把 writing_style 改為 'concise' 或 tone 改 'professional'
-    profile = _get_or_create_profile(uid)
-    downs = profile["counters"].get("thumbs_down", 0)
-    ups = profile["counters"].get("thumbs_up", 0)
-    patched = {}
-    if downs >= 3 and profile["prefs"].get("writing_style") != "concise":
-        patched["writing_style"] = "concise"
-    if ups >= 5 and profile["prefs"].get("tone") != "friendly":
-        patched["tone"] = "friendly"
-    if patched:
-        _update_profile(uid, prefs=patched)
-    return {"ok": True, "prefs": _get_or_create_profile(uid)["prefs"]}
-
-# 偏好 API：讓前端直接更新偏好（語言、語氣…）
-class PrefsReq(BaseModel):
-    user_id: Optional[str] = None
-    prefs: Dict[str, Any]
-
-@app.post("/update_prefs")
-def update_prefs(req: PrefsReq):
-    uid = req.user_id or "anon"
-    _update_profile(uid, prefs=req.prefs or {})
-    return {"ok": True, "prefs": _get_or_create_profile(uid)["prefs"]}
-
-# 掛上聊天路由
-app.include_router(chat_router)
-
-
