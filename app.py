@@ -1,31 +1,32 @@
 # app.py
 import os
 import json
+import glob
 import sqlite3
-from typing import List, Optional, Any, Dict, Union
+from typing import List, Optional, Any, Dict
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse, Response
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, HTMLResponse, Response, StreamingResponse
 
-# ========= Env =========
+# ========= 環境變數 =========
 DB_PATH = os.getenv("DB_PATH", "/data/script_generation.db")
-# 同時相容兩種命名
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+# 兼容舊變數名
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
-# ========= App / CORS =========
-app = FastAPI(title="AI Script/Copy Backend")
+# ========= App 與 CORS =========
+app = FastAPI(title="AI Script + Copy Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],            # 若有固定前端網域，建議改成清單
     allow_credentials=True,
     allow_methods=["POST", "OPTIONS", "GET"],
     allow_headers=["*"],
 )
 
-# ========= DB Tools =========
+# ========= DB 工具 =========
 def _ensure_db_dir(path: str):
     db_dir = os.path.dirname(path) or "."
     os.makedirs(db_dir, exist_ok=True)
@@ -45,78 +46,26 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             user_input TEXT,
+            mode TEXT,
+            messages_json TEXT,
             previous_segments_json TEXT,
-            response_json TEXT,
-            task TEXT
+            response_json TEXT
         )
         """
     )
     conn.commit()
     conn.close()
 
+# ========= 啟動時初始化 =========
 @app.on_event("startup")
 def on_startup():
     try:
         init_db()
-        print(f"[BOOT] SQLite OK: {DB_PATH}")
+        print(f"[BOOT] SQLite path OK: {DB_PATH}")
     except Exception as e:
         print("[BOOT] DB init failed:", e)
 
-# ========= Schemas =========
-class Segment(BaseModel):
-    type: Optional[str] = Field(default=None, description="片頭/場景/片尾 or hook/value/cta")
-    start_sec: Optional[int] = None
-    end_sec: Optional[int] = None
-    camera: Optional[str] = ""
-    dialog: Optional[str] = ""
-    visual: Optional[str] = ""
-    cta: Optional[str] = ""
-
-class CopyProduct(BaseModel):
-    main_copy: Optional[str] = ""
-    alternates: Optional[List[str]] = Field(default_factory=list)
-    hashtags: Optional[List[str]] = Field(default_factory=list)
-    cta: Optional[str] = ""
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-class ChatGenerateReq(BaseModel):
-    # 通用
-    user_id: Optional[str] = None
-    session_id: Optional[str] = None
-    messages: Optional[List[ChatMessage]] = Field(default_factory=list)
-    previous_segments: Optional[List[Segment]] = Field(default_factory=list)
-    remember: Optional[bool] = False
-    # 明確指定任務（不帶也可，自動判斷）
-    task: Optional[str] = Field(default=None, description="script | copy")
-
-class ChatGenerateResp(BaseModel):
-    session_id: Optional[str] = None
-    assistant_message: Optional[str] = ""
-    segments: Optional[List[Segment]] = Field(default_factory=list)
-    copy: Optional[CopyProduct] = None
-    error: Optional[str] = None
-
-class GenerateReq(BaseModel):
-    user_input: Optional[str] = ""
-    previous_segments: Optional[List[Segment]] = Field(default_factory=list)
-
-class GenerateResp(BaseModel):
-    segments: List[Segment] = Field(default_factory=list)
-    error: Optional[str] = None
-
-# ========= Errors =========
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail or "http_error"})
-
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    return JSONResponse(status_code=500, content={"error": "internal_server_error"})
-
-# ========= Health / Static =========
+# ========= 健康檢查 & 靜態 =========
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
@@ -130,191 +79,304 @@ def root_page():
     return """
     <html><body>
       <h3>AI Backend OK</h3>
-      <p>POST <code>/chat_generate</code> or <code>/generate_script</code></p>
+      <p>POST <code>/chat_generate</code> (script/copy, 聊天式) 或 <code>/generate_script</code> (舊流程)。</p>
+      <p>POST <code>/export/docx</code>, <code>/export/xlsx</code> 可匯出檔案。</p>
+      <p>文案模式新增欄位：<code>copy.image_ideas: string[]</code>（圖片/視覺建議）。</p>
     </body></html>
     """
 
-# ========= Helpers =========
-def _too_short(text: str) -> bool:
-    if not text:
-        return True
-    # 粗估：中文字兩倍長度
-    t = text.strip()
-    return len(t) < 36  # 大約 18 全形字
+# ========= 內建「知識庫」 + 可擴充檔案 =========
+BUILTIN_KB_SCRIPT = """
+【短影音腳本原則（濃縮）】
+1) 分段結構：Hook(0-5s) → Value(中段 5-25s / 延長可到40s) → CTA(收尾)。
+2) 每段輸出欄位：type(片頭/場景/片尾或 hook/value/cta)、start_sec、end_sec、camera、dialog(口播/字幕台詞)、visual(畫面感/運鏡/畫面元素)、cta。
+3) Hook：痛點 / 反差 / 數據鉤子 / 一句 punch line；快節奏 B-roll 導入。
+4) Value：拆重點（3個以內），每個重點配「畫面元素」；節奏：切點明確。
+5) CTA：動詞+利益，具體下一步（點連結 / 領取 / 私訊）；畫面配大字卡+Logo。
+6) 語氣：口語、節奏感、短句、可搭 emoji；避免空話。
+"""
 
-def _detect_task(messages: List[ChatMessage], explicit: Optional[str]) -> str:
-    if explicit in ("copy", "script"):
+BUILTIN_KB_COPY = """
+【社群文案原則（濃縮）】
+1) 結構：吸睛開頭（2-3行）→ 主體敘事/賣點 → CTA（動詞 + 指令）→ Hashtags。
+2) 風格：對受眾說人話、短句、可搭 emoji、結尾有呼喚動作。
+3) Hashtags：主關鍵字 1-3、延伸 5-8，避免太廣泛或無關。
+4) 產出欄位：main_copy（主貼文）、alternates（3-4個短開頭）、hashtags（陣列）、cta（短句）、image_ideas（圖像/素材建議，依平台差異給方向）。
+"""
+
+def load_extra_kb(max_chars=2500) -> str:
+    """
+    讀取 /data/kb*.txt 或 /data/*.txt（可自備）並裁切。找不到則回空字串。
+    """
+    paths = glob.glob("/data/kb*.txt") + glob.glob("/data/*.kb.txt") + glob.glob("/data/knowledge*.txt")
+    buf = []
+    total = 0
+    for p in paths:
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                t = f.read().strip()
+                if not t:
+                    continue
+                remain = max_chars - total
+                seg = t[:remain]
+                if seg:
+                    buf.append(f"\n[KB:{os.path.basename(p)}]\n{seg}")
+                    total += len(seg)
+                if total >= max_chars:
+                    break
+        except Exception:
+            continue
+    return "\n".join(buf)
+
+EXTRA_KB = load_extra_kb()
+
+# ========= Prompt 組裝 =========
+SHORT_HINT_SCRIPT = "內容有點太短了 🙏 請提供：行業/平台/時長(秒)/目標/主題（例如：『電商｜Reels｜30秒｜購買｜夏季新品開箱』），我就能生成完整腳本。"
+SHORT_HINT_COPY   = "內容有點太短了 🙏 請提供：平台/受眾/語氣/主題/CTA（例如：『IG｜男生視角｜活力回歸｜CTA：點連結』），我就能生成完整貼文。"
+
+def _ensure_json_block(text: str) -> str:
+    """
+    嘗試從 LLM 回應裡把第一個 JSON 區塊拉出來。
+    """
+    if not text:
+        raise ValueError("empty model output")
+    t = text.strip()
+    if t.startswith("```"):
+        fence = "```"
+        parts = t.split(fence)
+        if len(parts) >= 3:
+            t = parts[1]
+    i1 = t.find("{")
+    i2 = t.find("[")
+    i = min([x for x in [i1, i2] if x >= 0], default=-1)
+    if i < 0:
+        return t
+    j1 = t.rfind("}")
+    j2 = t.rfind("]")
+    j = max(j1, j2)
+    if j > i:
+        return t[i:j+1]
+    return t
+
+def detect_mode(messages: List[Dict[str, str]], explicit: Optional[str] = None) -> str:
+    """
+    回傳 'script' 或 'copy'
+    """
+    if explicit in ("script", "copy"):
         return explicit
-    last = (messages or [])[-1].content.lower() if messages else ""
-    # 簡單偵測：提到 linkedin/ig/facebook/hashtag/貼文 視為文案
-    if any(k in last for k in ["linkedin", "ig", "instagram", "facebook", "小紅書", "貼文", "hashtags", "#"]):
+    last = ""
+    for m in reversed(messages or []):
+        if m.get("role") == "user":
+            last = (m.get("content") or "").lower()
+            break
+    copy_keys = ["文案", "hashtag", "貼文", "copy", "ig", "facebook", "小紅書", "抖音文案"]
+    if any(k.lower() in last for k in copy_keys):
         return "copy"
     return "script"
 
-def _fewshot_rules_script() -> str:
-    return (
-        "你是短影音腳本顧問，請輸出 JSON 陣列，每個元素代表一段："
-        "字段：type(hook|value|cta)、camera、dialog(口白/字幕稿)、visual(畫面描述)、cta。"
-        "請以 0-60秒的節奏拆成 3-6 段，每段約 6-12 秒，語氣口語、節奏感。"
-    )
+def parse_segments(json_text: str) -> List[Dict[str, Any]]:
+    data = json.loads(json_text)
+    if isinstance(data, dict) and "segments" in data:
+        data = data["segments"]
+    if not isinstance(data, list):
+        raise ValueError("segments must be a list")
+    segs = []
+    for item in data:
+        segs.append({
+            "type": item.get("type") or item.get("label") or "場景",
+            "start_sec": item.get("start_sec", None),
+            "end_sec": item.get("end_sec", None),
+            "camera": item.get("camera", ""),
+            "dialog": item.get("dialog", ""),
+            "visual": item.get("visual", ""),
+            "cta": item.get("cta", "")
+        })
+    return segs
 
-def _fewshot_rules_copy() -> str:
-    return (
-        "你是社群文案顧問，請輸出 JSON 物件："
-        "{ main_copy: string, alternates: string[], hashtags: string[], cta: string }。"
-        "要求：結構化、可直接貼上平台；hashtags 不少於 8 個；語氣貼近平台。"
-    )
+def parse_copy(json_text: str) -> Dict[str, Any]:
+    data = json.loads(json_text)
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    return {
+        "main_copy":   data.get("main_copy", ""),
+        "alternates":  data.get("alternates", []) or data.get("openers", []),
+        "hashtags":    data.get("hashtags", []),
+        "cta":         data.get("cta", ""),
+        "image_ideas": data.get("image_ideas", [])   # ← 新增：圖片/視覺建議
+    }
 
-def _run_gemini(prompt: str) -> str:
+def build_script_prompt(user_input: str, previous_segments: List[Dict[str, Any]]) -> str:
+    fewshot = """
+【輸出格式（JSON）】
+{
+  "segments":[
+    {"type":"hook","start_sec":0,"end_sec":5,"camera":"CU","dialog":"...","visual":"...","cta":""},
+    {"type":"value","start_sec":5,"end_sec":25,"camera":"MS","dialog":"...","visual":"...","cta":""},
+    {"type":"cta","start_sec":25,"end_sec":30,"camera":"WS","dialog":"...","visual":"...","cta":"..."}
+  ]
+}
+"""
+    prev = json.dumps(previous_segments or [], ensure_ascii=False)
+    kb = (BUILTIN_KB_SCRIPT + "\n" + (EXTRA_KB or "")).strip()
+    return f"""
+你是短影音腳本顧問。請根據「使用者輸入」與「已接受段落」延續/或重寫，輸出 JSON（不要其他說明文字）。
+
+{kb}
+
+使用者輸入：
+{user_input}
+
+已接受段落（previous_segments）：
+{prev}
+
+請直接回傳 JSON（單一物件，不要 markdown code fence），範例如下：
+{fewshot}
+"""
+
+def build_copy_prompt(user_input: str) -> str:
+    fewshot = """
+【輸出格式（JSON）】
+{
+  "main_copy": "主貼文（含換行與 emoji）",
+  "alternates": ["備選開頭A","備選開頭B","備選開頭C"],
+  "hashtags": ["#關鍵字1","#關鍵字2","#延伸3","#延伸4"],
+  "cta": "行動呼籲一句話",
+  "image_ideas": ["配圖/照片/示意圖建議1","建議2","建議3"]
+}
+"""
+    kb = (BUILTIN_KB_COPY + "\n" + (EXTRA_KB or "")).strip()
+    return f"""
+你是社群文案顧問。請根據「使用者輸入」輸出 JSON（不要其他說明文字），涵蓋主貼文、備選開頭、Hashtags、CTA，
+並加入 <image_ideas>（建議可用圖片/圖像風格/拍法/示意圖，並因應 IG/FB/小紅書/LinkedIn 差異給方向）。
+
+{kb}
+
+使用者輸入：
+{user_input}
+
+請直接回傳 JSON（單一物件，不要 markdown code fence），範例如下：
+{fewshot}
+"""
+
+# ========= Gemini 產文 =========
+def use_gemini() -> bool:
+    return bool(GEMINI_API_KEY)
+
+def gemini_generate_text(prompt: str) -> str:
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel(GEMINI_MODEL)
     res = model.generate_content(prompt)
     return (res.text or "").strip()
 
-# ========= Generators =========
-def _fallback_script(req_text: str, previous_segments: List[Segment]) -> List[Segment]:
-    step = len(previous_segments)
-    labels = [("hook","CU"), ("value","MS"), ("cta","WS")]
-    i = min(step, len(labels)-1)
-    t, cam = labels[i]
-    return [Segment(
-        type=t, camera=cam,
-        dialog=f"（示例口白）依你需求的 {req_text[:24]} …",
-        visual="示例畫面：快切 B-roll + 重點字卡",
-        cta="點連結瞭解更多"
-    )]
+# ========= Fallback（無 API Key 時） =========
+def fallback_segments(user_input: str, prev_len: int) -> List[Dict[str, Any]]:
+    step = prev_len
+    return [
+        {
+            "type": "hook" if step == 0 else ("cta" if step >= 2 else "value"),
+            "start_sec": 0 if step == 0 else 5 if step == 1 else 25,
+            "end_sec":   5 if step == 0 else 25 if step == 1 else 30,
+            "camera": "CU" if step == 0 else "MS" if step == 1 else "WS",
+            "dialog": f"（模擬）{user_input[:36]}…",
+            "visual": "（模擬）快切 B-roll / 大字卡",
+            "cta": "點連結領取" if step >= 2 else ""
+        }
+    ]
 
-def _gemini_script(req_text: str, previous_segments: List[Segment]) -> List[Segment]:
-    base = _fewshot_rules_script()
-    prev = [s.model_dump() for s in previous_segments]
-    prompt = (
-        f"{base}\n"
-        f"使用者需求：{req_text}\n"
-        f"已加入時間軸：{json.dumps(prev, ensure_ascii=False)}\n"
-        "請僅回傳 JSON 陣列，形如："
-        '[{"type":"hook","camera":"CU","dialog":"...","visual":"...","cta":"..."}]'
-    )
-    text = _run_gemini(prompt)
-    first, last = text.find("["), text.rfind("]")
-    if first != -1 and last > first:
-        text = text[first:last+1]
-    data = json.loads(text)
-    out: List[Segment] = []
-    # 自動補秒數
-    base_start = 0
-    for idx, item in enumerate(data):
-        d = Segment(
-            type=item.get("type") or "value",
-            camera=item.get("camera",""),
-            dialog=item.get("dialog",""),
-            visual=item.get("visual",""),
-            cta=item.get("cta",""),
-            start_sec=item.get("start_sec") or base_start,
-            end_sec=item.get("end_sec") or base_start + 8
-        )
-        base_start = d.end_sec or (base_start+8)
-        out.append(d)
-    return out
+def fallback_copy(user_input: str) -> Dict[str, Any]:
+    return {
+        "main_copy":  f"（模擬）IG 貼文：{user_input}\n關鍵賣點 + 故事 + CTA。",
+        "alternates": ["開頭A：抓痛點","開頭B：丟數據","開頭C：小故事"],
+        "hashtags":   ["#短影音","#行銷","#AI"],
+        "cta":        "立即點連結",
+        "image_ideas":["產品近拍 + 生活化情境","輕素材：手持使用前後對比","品牌色背景的俐落字卡"]
+    }
 
-def _fallback_copy(req_text: str) -> CopyProduct:
-    return CopyProduct(
-        main_copy=f"（示例文案）{req_text} 的社群貼文初稿：以痛點引入、亮點說服、CTA 收束。",
-        alternates=["開頭A：抓痛點","開頭B：拋數據","開頭C：口語反問"],
-        hashtags=["#行銷","#品牌","#短影音","#社群","#成長","#案例","#技巧","#CTA"],
-        cta="點擊連結了解更多"
-    )
+# ========= /chat_generate（新流程，腳本/文案二合一）=========
+@app.post("/chat_generate")
+async def chat_generate(req: Request):
+    """
+    body: {
+      user_id?: str,
+      session_id?: str,
+      messages: [{role, content}],
+      previous_segments?: [segment...],
+      remember?: bool,
+      mode?: "script" | "copy"
+    }
+    """
+    try:
+        data = await req.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="invalid_json")
 
-def _gemini_copy(req_text: str) -> CopyProduct:
-    base = _fewshot_rules_copy()
-    prompt = (
-        f"{base}\n"
-        f"使用者需求/主題：{req_text}\n"
-        "請只回傳 JSON 物件，形如："
-        '{"main_copy":"...","alternates":["...","..."],"hashtags":["#a","#b"],"cta":"..."}'
-    )
-    text = _run_gemini(prompt)
-    first, last = text.find("{"), text.rfind("}")
-    if first != -1 and last > first:
-        text = text[first:last+1]
-    data = json.loads(text)
-    return CopyProduct(
-        main_copy=data.get("main_copy",""),
-        alternates=data.get("alternates") or [],
-        hashtags=data.get("hashtags") or [],
-        cta=data.get("cta","")
-    )
+    user_id = (data.get("user_id") or "").strip() or "web"
+    messages = data.get("messages") or []
+    previous_segments = data.get("previous_segments") or []
+    explicit_mode = (data.get("mode") or "").strip().lower() or None
+    mode = detect_mode(messages, explicit=explicit_mode)
 
-# ========= Endpoints =========
-@app.post("/chat_generate", response_model=ChatGenerateResp)
-def chat_generate(req: ChatGenerateReq):
-    # 取最後一句作為 user_input
-    last_text = ""
-    if req.messages:
-        last_text = req.messages[-1].content or ""
-    task = _detect_task(req.messages, req.task)
+    user_input = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            user_input = (m.get("content") or "").strip()
+            break
 
-    # 太短先友善引導
-    if _too_short(last_text):
-        tip = "內容有點太短了 🙏 請補充：行業/平台/目標/主題/受眾（例如：「電商｜IG｜購買｜新品開箱｜目標顧客大學生」）。"
-        return ChatGenerateResp(
-            session_id=req.session_id or "sess",
-            assistant_message=tip,
-            segments=[],
-            copy=None,
-            error=None
-        )
+    hint = SHORT_HINT_COPY if mode == "copy" else SHORT_HINT_SCRIPT
+    if len(user_input) < 6:
+        return {
+            "session_id": data.get("session_id") or "s",
+            "assistant_message": hint,
+            "segments": [],
+            "copy": None,
+            "error": None
+        }
 
     try:
-        if GEMINI_API_KEY:
-            if task == "copy":
-                copy_out = _gemini_copy(last_text)
-                assistant = "我先給你第一版完整文案（可再加要求，我會幫你改得更貼近風格）。"
-                resp = ChatGenerateResp(
-                    session_id=req.session_id or "sess",
-                    assistant_message=assistant,
-                    segments=[],
-                    copy=copy_out
-                )
+        if mode == "copy":
+            prompt = build_copy_prompt(user_input)
+            if use_gemini():
+                out = gemini_generate_text(prompt)
+                j = _ensure_json_block(out)
+                copy = parse_copy(j)
             else:
-                segs = _gemini_script(last_text, req.previous_segments or [])
-                assistant = "我先補一個段落作為延續，附鏡位、台詞與畫面感。若你要一次看到 0–60 秒完整腳本，直接跟我說「給我完整腳本」。"
-                resp = ChatGenerateResp(
-                    session_id=req.session_id or "sess",
-                    assistant_message=assistant,
-                    segments=segs,
-                    copy=None
-                )
+                copy = fallback_copy(user_input)
+            resp = {
+                "session_id": data.get("session_id") or "s",
+                "assistant_message": "我先給你第一版完整貼文（可再加要求，我會幫你改得更貼近風格）。",
+                "segments": [],
+                "copy": copy,
+                "error": None
+            }
         else:
-            # 沒有 API Key，使用 fallback
-            if task == "copy":
-                copy_out = _fallback_copy(last_text)
-                assistant = "目前未提供 API Key，先用規則產生文案草稿供你微調。"
-                resp = ChatGenerateResp(
-                    session_id=req.session_id or "sess",
-                    assistant_message=assistant,
-                    copy=copy_out
-                )
+            prompt = build_script_prompt(user_input, previous_segments)
+            if use_gemini():
+                out = gemini_generate_text(prompt)
+                j = _ensure_json_block(out)
+                segments = parse_segments(j)
             else:
-                segs = _fallback_script(last_text, req.previous_segments or [])
-                assistant = "目前未提供 API Key，先用規則生成一版草稿供你微調。"
-                resp = ChatGenerateResp(
-                    session_id=req.session_id or "sess",
-                    assistant_message=assistant,
-                    segments=segs
-                )
+                segments = fallback_segments(user_input, len(previous_segments or []))
+            resp = {
+                "session_id": data.get("session_id") or "s",
+                "assistant_message": "我先給你第一版完整腳本（可再加要求，我會幫你改得更貼近風格）。",
+                "segments": segments,
+                "copy": None,
+                "error": None
+            }
 
-        # DB 記錄（非必要）
+        # DB 紀錄（失敗不影響回應）
         try:
             conn = get_conn()
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO requests (user_input, previous_segments_json, response_json, task) VALUES (?, ?, ?, ?)",
+                "INSERT INTO requests (user_input, mode, messages_json, previous_segments_json, response_json) VALUES (?, ?, ?, ?, ?)",
                 (
-                    last_text,
-                    json.dumps([s.model_dump() for s in (req.previous_segments or [])], ensure_ascii=False),
-                    json.dumps(resp.model_dump(), ensure_ascii=False),
-                    task
+                    user_input,
+                    mode,
+                    json.dumps(messages, ensure_ascii=False),
+                    json.dumps(previous_segments, ensure_ascii=False),
+                    json.dumps(resp, ensure_ascii=False),
                 ),
             )
             conn.commit()
@@ -323,50 +385,230 @@ def chat_generate(req: ChatGenerateReq):
             print("[DB] insert failed:", e)
 
         return resp
-    except HTTPException:
-        raise
+    except HTTPException as exc:
+        raise exc
     except Exception as e:
-        return ChatGenerateResp(
-            session_id=req.session_id or "sess",
-            error="internal_server_error",
-            assistant_message="系統忙碌，稍後再試或補充更具體的需求。",
+        print("[chat_generate] error:", e)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "session_id": data.get("session_id") or "s",
+                "assistant_message": "伺服器忙碌，稍後再試",
+                "segments": [],
+                "copy": None,
+                "error": "internal_server_error"
+            }
         )
 
-@app.post("/generate_script", response_model=GenerateResp)
-def generate_script(req: GenerateReq):
-    # 舊流程保留
-    user_text = req.user_input or ""
-    if _too_short(user_text):
-        tip_seg = Segment(
-            type="提示",
-            dialog="內容太短，請補：行業/平台/時長/目標/主題（例如：電商｜Reels｜30秒｜購買｜夏季新品開箱）。"
-        )
-        return GenerateResp(segments=[tip_seg])
+# ========= 舊流程：/generate_script（保留） =========
+@app.post("/generate_script")
+async def generate_script(req: Request):
+    """
+    body: { "user_input": str, "previous_segments": [] }
+    """
+    try:
+        data = await req.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="invalid_json")
+
+    user_input = (data.get("user_input") or "").strip()
+    previous_segments = data.get("previous_segments") or []
+
+    if len(user_input) < 6:
+        return {"segments": [], "error": SHORT_HINT_SCRIPT}
 
     try:
-        if GEMINI_API_KEY:
-            segs = _gemini_script(user_text, req.previous_segments or [])
+        prompt = build_script_prompt(user_input, previous_segments)
+        if use_gemini():
+            out = gemini_generate_text(prompt)
+            j = _ensure_json_block(out)
+            segments = parse_segments(j)
         else:
-            segs = _fallback_script(user_text, req.previous_segments or [])
-        # 記錄
+            segments = fallback_segments(user_input, len(previous_segments or []))
+
         try:
             conn = get_conn()
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO requests (user_input, previous_segments_json, response_json, task) VALUES (?, ?, ?, ?)",
+                "INSERT INTO requests (user_input, mode, messages_json, previous_segments_json, response_json) VALUES (?, ?, ?, ?, ?)",
                 (
-                    user_text,
-                    json.dumps([s.model_dump() for s in (req.previous_segments or [])], ensure_ascii=False),
-                    json.dumps([s.model_dump() for s in segs], ensure_ascii=False),
-                    "script"
+                    user_input,
+                    "legacy_generate_script",
+                    json.dumps([], ensure_ascii=False),
+                    json.dumps(previous_segments, ensure_ascii=False),
+                    json.dumps({"segments": segments, "error": None}, ensure_ascii=False),
                 ),
             )
             conn.commit()
             conn.close()
         except Exception as e:
             print("[DB] insert failed:", e)
-        return GenerateResp(segments=segs, error=None)
-    except HTTPException:
-        raise
+
+        return {"segments": segments, "error": None}
     except Exception as e:
+        print("[generate_script] error:", e)
         return JSONResponse(status_code=500, content={"segments": [], "error": "internal_server_error"})
+
+# ========= 偏好 & 回饋（簡易）=========
+@app.post("/update_prefs")
+async def update_prefs(req: Request):
+    try:
+        _ = await req.json()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+@app.post("/feedback")
+async def feedback(req: Request):
+    try:
+        data = await req.json()
+        print("[feedback]", data)
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+# ========= 匯出（DOCX / XLSX）=========
+def _ensure_docx():
+    try:
+        import docx  # noqa
+        return True
+    except Exception:
+        return False
+
+def _ensure_xlsx():
+    try:
+        import openpyxl  # noqa
+        return True
+    except Exception:
+        return False
+
+@app.post("/export/docx")
+async def export_docx(req: Request):
+    """
+    body: { messages_script?, messages_copy?, segments?, copy? }
+    直接回傳 docx 檔案串流
+    """
+    if not _ensure_docx():
+        return JSONResponse(status_code=501, content={"error": "docx_not_available"})
+    from docx import Document
+    from docx.shared import Pt
+
+    data = await req.json()
+    messages_script = data.get("messages_script") or []
+    messages_copy = data.get("messages_copy") or []
+    segments = data.get("segments") or []
+    copy = data.get("copy") or None
+
+    doc = Document()
+    style = doc.styles["Normal"]
+    style.font.name = "Microsoft JhengHei"
+    style.font.size = Pt(11)
+
+    doc.add_heading("短影音顧問 AI 專案匯出", level=1)
+
+    # 對話（腳本）
+    doc.add_heading("一、對話紀錄（腳本）", level=2)
+    for m in messages_script:
+        doc.add_paragraph(f"{m.get('role')}: {m.get('content') or ''}")
+
+    # 對話（文案）
+    doc.add_heading("二、對話紀錄（文案）", level=2)
+    for m in messages_copy:
+        doc.add_paragraph(f"{m.get('role')}: {m.get('content') or ''}")
+
+    # 腳本分段
+    doc.add_heading("三、腳本分段", level=2)
+    if segments:
+        for i, s in enumerate(segments, 1):
+            doc.add_paragraph(f"#{i} {s.get('type')} ({s.get('start_sec')}s–{s.get('end_sec')}s) camera:{s.get('camera')}")
+            if s.get("dialog"): doc.add_paragraph("台詞：" + s.get("dialog"))
+            if s.get("visual"): doc.add_paragraph("畫面：" + s.get("visual"))
+            if s.get("cta"):    doc.add_paragraph("CTA：" + s.get("cta"))
+    else:
+        doc.add_paragraph("（無片段）")
+
+    # 文案
+    doc.add_heading("四、文案模組", level=2)
+    if copy:
+        doc.add_paragraph("【主貼文】")
+        doc.add_paragraph(copy.get("main_copy") or "")
+        doc.add_paragraph("【備選開頭】")
+        for i, a in enumerate(copy.get("alternates") or [], 1):
+            doc.add_paragraph(f"{i}. {a}")
+        doc.add_paragraph("【Hashtags】")
+        doc.add_paragraph(" ".join(copy.get("hashtags") or []))
+        doc.add_paragraph("【CTA】")
+        doc.add_paragraph(copy.get("cta") or "")
+
+        # 新增：圖片建議
+        ideas = copy.get("image_ideas") or []
+        if ideas:
+            doc.add_paragraph("【圖片建議】")
+            for i, idea in enumerate(ideas, 1):
+                doc.add_paragraph(f"{i}. {idea}")
+    else:
+        doc.add_paragraph("（無文案）")
+
+    from io import BytesIO
+    bio = BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": 'attachment; filename="export.docx"'}
+    )
+
+@app.post("/export/xlsx")
+async def export_xlsx(req: Request):
+    """
+    body: { segments?, copy? }
+    """
+    if not _ensure_xlsx():
+        return JSONResponse(status_code=501, content={"error": "xlsx_not_available"})
+    import openpyxl
+    from openpyxl.utils import get_column_letter
+    from io import BytesIO
+
+    data = await req.json()
+    segments = data.get("segments") or []
+    copy = data.get("copy") or None
+
+    wb = openpyxl.Workbook()
+    ws1 = wb.active
+    ws1.title = "腳本分段"
+    ws1.append(["#","type","start_sec","end_sec","camera","dialog","visual","cta"])
+    for i, s in enumerate(segments, 1):
+        ws1.append([i, s.get("type"), s.get("start_sec"), s.get("end_sec"), s.get("camera"), s.get("dialog"), s.get("visual"), s.get("cta")])
+
+    ws2 = wb.create_sheet("文案")
+    ws2.append(["主貼文"])
+    ws2.append([copy.get("main_copy") if copy else ""])
+    ws2.append([])
+    ws2.append(["備選開頭"])
+    for a in (copy.get("alternates") if copy else []) or []:
+        ws2.append([a])
+    ws2.append([])
+    ws2.append(["Hashtags"])
+    ws2.append([" ".join(copy.get("hashtags") if copy else [])])
+    ws2.append([])
+    ws2.append(["CTA"])
+    ws2.append([copy.get("cta") if copy else ""])
+    ws2.append([])
+    ws2.append(["圖片建議"])
+    for idea in (copy.get("image_ideas") if copy else []) or []:
+        ws2.append([idea])
+
+    for ws in (ws1, ws2):
+        for col in ws.columns:
+            width = max(len(str(c.value)) if c.value else 0 for c in col) + 2
+            ws.column_dimensions[get_column_letter(col[0].column)].width = min(width, 80)
+
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="export.xlsx"'}
+    )
