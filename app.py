@@ -1,135 +1,92 @@
 # app.py
 import os
 import json
+import re
 import sqlite3
 from typing import List, Optional, Any, Dict
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse, Response
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
 
 # ========= 環境變數 =========
 DB_PATH = os.getenv("DB_PATH", "/data/script_generation.db")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # 可不設；不設時走 fallback
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # 可不設；不設時用本地 fallback
+
+# ========= 知識庫（輕量內建，可擴充） =========
+# 這裡放你腦圖裡的共通「流量技巧 / 視覺焦點 / 節奏套路 / 文案結構」等摘要，作為模型的 domain hint
+SYSTEM_KB = """
+你是短影音顧問與拍攝腳本專家。請依下列原則輸出：
+- 流量技巧：5秒內吸睛鉤子、對比、懸念、數字/清單、轉場節奏、口語 punch line。
+- 視覺焦點：主體清晰、畫面層次（前中後景/景別切換）、關鍵道具、B-roll 補畫。
+- 節奏與段落：Hook(0~5s) → Value(5~25s，可2~3小段) → CTA(25~30s)；若時長非30s，等比縮放。
+- 文案調性：口語、具畫面感、避免制式敘述，重視『對白、畫面、重點』的對齊。
+- CTA 結尾清楚：追蹤/私訊/點連結/預約/領取等。
+
+輸出時不要贅詞，不要『說明痛點→亮點→轉折』這類模板語。務必給出可直接拍攝的腳本。
+"""
 
 # ========= App 與 CORS =========
-app = FastAPI(title="AI Script Backend", version="2025-10-07")
+app = FastAPI(title="AI Script Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],            # 若有固定前端網域，建議改成清單
     allow_credentials=True,
     allow_methods=["POST", "OPTIONS", "GET"],
     allow_headers=["*"],
 )
 
-# ========= DB 工具（失敗不致命） =========
+# ========= DB 工具 =========
 def _ensure_db_dir(path: str):
     db_dir = os.path.dirname(path) or "."
-    try:
-        os.makedirs(db_dir, exist_ok=True)
-    except Exception:
-        pass
+    os.makedirs(db_dir, exist_ok=True)
 
 def get_conn() -> sqlite3.Connection:
     _ensure_db_dir(DB_PATH)
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    return conn
 
 def init_db():
-    try:
-        _ensure_db_dir(DB_PATH)
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS requests (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                endpoint TEXT,
-                user_input TEXT,
-                payload_json TEXT,
-                response_json TEXT
-            )
-            """
+    _ensure_db_dir(DB_PATH)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            user_input TEXT,
+            previous_segments_json TEXT,
+            response_json TEXT
         )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS feedback (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                user_id TEXT,
-                kind TEXT,
-                note TEXT
-            )
-            """
+        """
+    )
+    # 也順手放聊天記錄（非必要）
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            user_id TEXT,
+            session_id TEXT,
+            messages_json TEXT,
+            assistant_json TEXT
         )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS prefs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                user_id TEXT,
-                prefs_json TEXT
-            )
-            """
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print("[BOOT] DB init failed:", e)
+        """
+    )
+    conn.commit()
+    conn.close()
 
+# ========= 啟動時初始化 =========
 @app.on_event("startup")
 def on_startup():
-    init_db()
-    print(f"[BOOT] SQLite path: {DB_PATH}")
-
-# ========= 系統知識庫（讓模型一次吐完整腳本包） =========
-SYSTEM_KB = """
-你是一名「短影音技術顧問 & 腳本導演」。你的任務是：根據使用者輸入的行業、平台、目標、時長與主題，
-直接產出一次可用的「完整創意腳本包」，而不是泛用建議。
-
-【口吻與原則】
-- 口吻：真實口語、節奏快、有情緒、有畫面。
-- 內容要「可拍可演」：每段給出明確鏡位、對白（可口播台詞）、畫面感（B-roll/動作/道具）。
-- 結構必須完整覆蓋全片時長（例如 0–60 秒），且每段區間不可重疊、不可缺口。
-- 優先根據：行業爆款套路、常見鉤子（Hook）、反轉、強 CTA。
-
-【內部知識庫（精簡）】
-- 流量技巧：鉤子要強、情緒強、反轉、卡點、字幕節奏、對比/前後對照。
-- 視頻策劃：受眾明確、場景貼近日常、賣點抓 1–2 個、畫面動起來（移動鏡頭/切 B-roll）。
-- 視頻結構（參考）：開場鉤子(0–5s) → 價值鋪陳(5–25s) → 高潮/轉折(15–25s) → 收尾 CTA(25–30s/或 60s)。
-- 文案結構：情緒 + 亮點 + 轉折 + CTA；字幕適度加 emoji，口語自然。
-
-【輸出格式（只回傳 JSON，勿夾雜說明）】
-{
-  "assistant_message": "對使用者的 1 句簡短回覆（概括思路，非重複內容）",
-  "segments": [
-    {
-      "start_sec": 0,
-      "end_sec": 6,
-      "type": "hook|value|demo|proof|cta|outro",
-      "camera": "CU|MS|WS 等 + 是否移動/轉場",
-      "dialog": "可直接口播/字幕的台詞（請自然口語）",
-      "visual": "畫面感/B-roll/動作/道具/場景",
-      "cta": "若本段需要 CTA，否則留空"
-    }
-  ],
-  "creative_notes": {
-    "alt_hooks": ["備選鉤子 A","備選鉤子 B","備選鉤子 C"],
-    "shooting_tips": [
-      "運鏡/燈光/場景佈置/BGM 等具體建議（可拍可執行）",
-      "字卡與字幕節奏、表情/動作建議",
-      "如果有產品：如何特寫/對比/前後效果"
-    ]
-  }
-}
-
-【嚴格要求】
-- 必須是合法 JSON，不能有註解或多餘文字。
-- 段數自動按時長分配（15/30/60 秒），常見 3–6 段；每段 5–12 秒左右。
-- 若使用者只丟一個詞，也要主動補齊題材（先假設行業與平台、再生腳本），但語氣要禮貌地把假設寫進第一段對白。
-"""
+    try:
+        init_db()
+        print(f"[BOOT] SQLite path OK: {DB_PATH}")
+    except Exception as e:
+        print("[BOOT] DB init failed:", e)
 
 # ========= Pydantic 模型 =========
 class Segment(BaseModel):
@@ -149,62 +106,44 @@ class GenerateResp(BaseModel):
     segments: List[Segment] = Field(default_factory=list)
     error: Optional[str] = None
 
+# v2 對話模式
 class ChatMessage(BaseModel):
     role: str
     content: str
 
-    @validator("role")
-    def _role_ok(cls, v):
-        v = (v or "").strip().lower()
-        if v not in {"user", "assistant", "system"}:
-            raise ValueError("role must be user|assistant|system")
-        return v
-
 class ChatReq(BaseModel):
     user_id: Optional[str] = None
     session_id: Optional[str] = None
-    messages: List[ChatMessage] = Field(default_factory=list)
-    previous_segments: List[Segment] = Field(default_factory=list)
+    messages: List[ChatMessage]
+    previous_segments: Optional[List[Segment]] = Field(default_factory=list)
     remember: Optional[bool] = False
 
 class ChatResp(BaseModel):
-    session_id: str
-    assistant_message: str
-    segments: List[Segment] = Field(default_factory=list)
-    creative_notes: Optional[Dict[str, Any]] = None
+    session_id: Optional[str] = None
+    assistant_message: str = ""
+    segments: Optional[List[Segment]] = None
+    copy: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
 
-class UpdatePrefsReq(BaseModel):
+class PrefsReq(BaseModel):
     user_id: Optional[str] = None
     prefs: Dict[str, Any] = Field(default_factory=dict)
 
 class FeedbackReq(BaseModel):
     user_id: Optional[str] = None
-    kind: str  # thumbs_up | thumbs_down
+    kind: str
     note: Optional[str] = None
 
-# ========= 通用工具 =========
-def _safe_db_log(endpoint: str, payload: dict, response: dict, user_input: str = ""):
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO requests (endpoint, user_input, payload_json, response_json) VALUES (?, ?, ?, ?)",
-            (endpoint, user_input, json.dumps(payload, ensure_ascii=False), json.dumps(response, ensure_ascii=False)),
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print("[DB] log failed:", e)
-
-# ========= 錯誤處理 =========
+# ========= 錯誤處理（不要手動 Content-Length） =========
 @app.exception_handler(HTTPException)
-async def http_exc_handler(request: Request, exc: HTTPException):
-    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail or "http_error"})
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.detail if exc.detail else "http_error"},
+    )
 
 @app.exception_handler(Exception)
-async def unhandled_exc_handler(request: Request, exc: Exception):
-    print("[UNHANDLED]", repr(exc))
+async def unhandled_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"error": "internal_server_error"})
 
 # ========= 健康檢查 & 靜態 =========
@@ -219,205 +158,304 @@ def favicon():
 @app.get("/", response_class=HTMLResponse)
 def root_page():
     return """
-    <html><body style="font-family: ui-sans-serif, system-ui">
-      <h3>AI Script Backend OK</h3>
-      <p>POST <code>/chat_generate</code> 或 <code>/generate_script</code> with JSON body.</p>
-      <pre style="background:#f6f7fb;padding:10px;border-radius:8px">/chat_generate example:
-{
-  "user_id": "web-abc",
-  "session_id": null,
-  "messages": [{"role":"user","content":"行業: 電商｜平台: Reels｜時長: 30秒｜目標: 購買｜主題: 夏季新品開箱"}],
-  "previous_segments": [],
-  "remember": false
-}</pre>
+    <html><body>
+      <h3>AI Backend OK</h3>
+      <p>POST <code>/generate_script</code>（舊流程）與 <code>/chat_generate</code>（新對話）</p>
     </body></html>
     """
 
-# ========= 生成（舊流程 /generate_script） =========
-def _fallback_generate(req: GenerateReq) -> List[Segment]:
-    step = len(req.previous_segments)
-    pick_type = "片頭" if step == 0 else ("片尾" if step >= 2 else "場景")
-    short = (req.user_input or "")[:30]
-    seg = Segment(
-        type=pick_type,
-        camera=("CU 特寫眼神" if step == 0 else "MS 半身跟拍" if step == 1 else "WS 遠景拉遠"),
-        dialog=(
-            f"你是否也曾這樣想過？{short} —— 用 30 秒改變你的看法。"
-            if step == 0 else
-            f"把難的變簡單。{short}，現在就開始。"
-            if step == 1 else
-            "行動永遠比等待重要。現在，輪到你了。"
-        ),
-        visual=("彈入 #主題 標籤" if step == 0 else "快切 B-roll 與拍點" if step == 1 else "LOGO 收合 + CTA 卡片"),
-        cta=("點我了解更多" if step >= 2 else "")
+# ========= 工具 =========
+def short_text(msg: str) -> bool:
+    """判斷是否過短（中文約 6~10 字以下 或 英文 < 3 個詞）"""
+    s = (msg or "").strip()
+    if not s:
+        return True
+    # 粗略偵測：中文字數
+    zh_chars = re.findall(r"[\u4e00-\u9fff]", s)
+    if len(zh_chars) <= 6:
+        # 英文詞數
+        words = re.findall(r"[A-Za-z0-9]+", s)
+        if len(words) < 3:
+            return True
+    return False
+
+def make_guidance() -> str:
+    return (
+        "我需要更多資訊才能幫你生成可拍攝的完整腳本。\n"
+        "請補充：行業、平台（Reels/Shorts/TikTok…）、時長（15/30/60秒）、目標（導流/購買/品牌）、主題與受眾痛點/賣點。\n"
+        "例如：行業: 電商｜平台: Reels｜時長: 30秒｜目標: 購買｜主題: 夏季新品開箱｜受眾: 上班族｜賣點: 輕薄速乾。"
     )
-    # 粗配秒數
-    seg.start_sec = step * 6
-    seg.end_sec = seg.start_sec + 6
-    return [seg]
 
-def _fallback_chat(req: ChatReq) -> Dict[str, Any]:
-    # 產一份 0–60s 標準 6 段
-    text = (req.messages[-1].content if req.messages else "")[:30]
-    segs: List[Segment] = []
-    labels = [("hook", "CU"), ("value", "MS"), ("value", "MS"), ("demo", "MS"), ("proof", "WS"), ("cta", "WS")]
-    for i, (t, cam) in enumerate(labels):
-        s = Segment(
-            type=t,
-            start_sec=i*10,
-            end_sec=i*10+10,
-            camera=cam,
-            dialog=f"{'開場鉤子' if i==0 else '內容'}：{text}…",
-            visual="B-roll + 字卡節奏",
-            cta="點連結領取" if t == "cta" else ""
-        )
-        segs.append(s)
-    return {
-        "session_id": req.session_id or "fallback-session",
-        "assistant_message": "這是模擬回覆：已依你的需求產生 0–60s 初稿。",
-        "segments": [s.dict() for s in segs],
-        "creative_notes": {
-            "alt_hooks": ["不想再拖了嗎？", "30秒告訴你關鍵", "真相其實很簡單"],
-            "shooting_tips": ["上強對比字卡", "節奏卡點剪輯", "多用移動鏡頭與手部特寫"]
-        }
+def safe_json_loads(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+def _rule_fallback(user_text: str, total_sec: int = 30) -> List[Segment]:
+    """無模型或解析失敗時的本地規則稿，保證前端不會空白"""
+    hook_end = min(5, total_sec // 6)
+    mid_end = max(total_sec - 5, 10)
+    if mid_end <= hook_end:
+        mid_end = hook_end + 10
+    return [
+        Segment(
+            type="hook",
+            start_sec=0, end_sec=hook_end,
+            camera="CU",
+            dialog=f"開場鉤子：{user_text[:18]}…",
+            visual="快切 B-roll + 動態字幕",
+            cta=""
+        ),
+        Segment(
+            type="value",
+            start_sec=hook_end, end_sec=min(mid_end, total_sec-5),
+            camera="MS",
+            dialog="三個重點講清楚，口語 punch line。",
+            visual="對焦產品/數據圖/使用對比",
+            cta=""
+        ),
+        Segment(
+            type="cta",
+            start_sec=min(total_sec-5, mid_end), end_sec=total_sec,
+            camera="WS",
+            dialog="行動呼籲口播，收束。",
+            visual="大字卡 + Logo",
+            cta="點連結領取 / 立即私訊"
+        ),
+    ]
+
+# ========= Gemini 生成（結構化 Prompt + few-shot） =========
+def _build_struct_prompt(user_text: str, prev: List[dict]) -> str:
+    """
+    產生一個『明確格式』的提示，要求模型輸出 JSON 陣列，每個元素含：
+    type(start with: hook/value/cta)、start_sec、end_sec、camera、dialog、visual、cta
+    """
+    exemplar = {
+        "type": "hook",
+        "start_sec": 0,
+        "end_sec": 5,
+        "camera": "CU",
+        "dialog": "鉤子對白…",
+        "visual": "鏡頭與畫面描述…",
+        "cta": ""
     }
+    prompt = f"""
+{SYSTEM_KB}
 
-def _gemini_chat(req: ChatReq) -> Dict[str, Any]:
-    # 延遲載入，避免沒裝套件時直接崩
-    import google.generativeai as genai
+你必須根據使用者主題，直接輸出「JSON 陣列」並且每一段對應拍攝用的欄位。
+不要輸出多餘說明，不要包在 code block 裡，更不要加「解釋」。
+每個元素欄位必須包含：type (必為 hook/value/cta 三類之一)、start_sec、end_sec、camera、dialog、visual、cta。
+
+- 時長：若使用者未指定，預設 30 秒（0~30s），Hook 約 0~5s，Value 5~25s（可分 2 段 value），CTA 25~30s。
+- 語言：沿用使用者語言（優先繁體中文）。
+- 口氣：口語、畫面感強烈、可直接拍。
+
+已接受段落 previous_segments（可作上下文延續）：
+{json.dumps(prev, ensure_ascii=False)}
+
+使用者輸入：
+{user_text}
+
+✅ 僅回傳 JSON 陣列，例如：
+[
+  {json.dumps(exemplar, ensure_ascii=False)},
+  {{
+    "type": "value",
+    "start_sec": 5,
+    "end_sec": 22,
+    "camera": "MS",
+    "dialog": "…",
+    "visual": "…",
+    "cta": ""
+  }},
+  {{
+    "type": "cta",
+    "start_sec": 22,
+    "end_sec": 30,
+    "camera": "WS",
+    "dialog": "…",
+    "visual": "…",
+    "cta": "點連結…"
+  }}
+]
+"""
+    return prompt.strip()
+
+def _gemini_generate_segments(user_text: str, prev_segments: List[Segment]) -> List[Segment]:
+    import google.generativeai as genai  # 延遲載入
     genai.configure(api_key=GOOGLE_API_KEY)
     model = genai.GenerativeModel(GEMINI_MODEL)
 
-    history = [{"role": m.role, "content": m.content} for m in req.messages[-10:]]
-    user_block = {
-        "messages_tail": history,
-        "previous_segments": [s.dict() for s in req.previous_segments],
-    }
-    prompt = SYSTEM_KB + "\n\n[使用者上下文]\n" + json.dumps(user_block, ensure_ascii=False) + "\n只回傳 JSON。"
+    prev = [s.model_dump() for s in prev_segments]
+    prompt = _build_struct_prompt(user_text, prev)
 
     res = model.generate_content(prompt)
     text = (res.text or "").strip()
-    i, j = text.find("{"), text.rfind("}")
-    if i == -1 or j == -1 or j <= i:
-        raise ValueError("model_return_not_json")
-    data = json.loads(text[i:j+1])
 
-    # 保險轉型（避免 key 缺漏或型別怪）
-    session_id = req.session_id or "chat-"  # 不傳也給預設
-    assistant_message = str(data.get("assistant_message", "")).strip() or "腳本已生成。"
-    raw_segments = data.get("segments") or []
+    # 嘗試只提取第一個 JSON 陣列
+    lb = text.find("["); rb = text.rfind("]")
+    if lb != -1 and rb != -1 and rb > lb:
+        text = text[lb:rb+1]
+
+    data = safe_json_loads(text)
+    if not isinstance(data, list):
+        raise ValueError("model_return_not_json")
+
     segments: List[Segment] = []
-    for item in raw_segments:
+    for item in data:
         segments.append(
             Segment(
-                type=str(item.get("type", "場景") or "場景"),
-                start_sec=int(item.get("start_sec") or 0),
-                end_sec=int(item.get("end_sec") or 0),
-                camera=str(item.get("camera", "") or ""),
-                dialog=str(item.get("dialog", "") or ""),
-                visual=str(item.get("visual", "") or ""),
-                cta=str(item.get("cta", "") or ""),
+                type=item.get("type", "value"),
+                start_sec=item.get("start_sec"),
+                end_sec=item.get("end_sec"),
+                camera=item.get("camera", ""),
+                dialog=item.get("dialog", ""),
+                visual=item.get("visual", ""),
+                cta=item.get("cta", ""),
             )
         )
-    creative_notes = data.get("creative_notes") or {}
+    # 確保類型合理且時間不重疊（簡單修正）
+    for i, s in enumerate(segments):
+        if s.start_sec is None or s.end_sec is None or s.end_sec <= s.start_sec:
+            s.start_sec = i * 6
+            s.end_sec = s.start_sec + 6
+        if s.type not in ("hook", "value", "cta"):
+            s.type = "value"
+    return segments
 
-    return {
-        "session_id": session_id,
-        "assistant_message": assistant_message,
-        "segments": [s.dict() for s in segments],
-        "creative_notes": creative_notes,
-    }
+# ========= 舊流程：/generate_script =========
+def _fallback_generate(req: GenerateReq) -> List[Segment]:
+    step = len(req.previous_segments)
+    pick_type = "hook" if step == 0 else ("cta" if step >= 2 else "value")
+    short = (req.user_input or "")[:30]
+    base = _rule_fallback(short or "你的主題", 30)
+    # 調整第一段 type 與台詞以符合舊習慣
+    base[0].type = pick_type
+    return base
 
-# ========= 路由：聊天式生成 =========
-@app.post("/chat_generate", response_model=ChatResp)
-def chat_generate(req: ChatReq):
-    try:
-        if GOOGLE_API_KEY:
-            try:
-                out = _gemini_chat(req)
-            except Exception as e:
-                print("[Gemini] fail -> fallback:", repr(e))
-                out = _fallback_chat(req)
-        else:
-            out = _fallback_chat(req)
-
-        # DB log（不影響回應）
-        _safe_db_log("/chat_generate", payload=req.dict(), response=out, user_input=(req.messages[-1].content if req.messages else ""))
-
-        return ChatResp(
-            session_id=out["session_id"] or (req.session_id or "chat-session"),
-            assistant_message=out.get("assistant_message", "OK"),
-            segments=[Segment(**s) for s in out.get("segments", [])],
-            creative_notes=out.get("creative_notes"),
-            error=None,
-        )
-    except HTTPException as exc:
-        raise exc
-    except Exception as e:
-        print("[chat_generate] error:", repr(e))
-        return JSONResponse(status_code=500, content={"session_id": req.session_id or "chat-session", "assistant_message": "", "segments": [], "creative_notes": None, "error": "internal_server_error"})
-
-# ========= 路由：舊流程 =========
 @app.post("/generate_script", response_model=GenerateResp)
 def generate_script(req: GenerateReq):
     try:
+        # 若輸入太短，直接回友善引導（保持 200，segments 空，讓前端顯示文字）
+        if short_text(req.user_input):
+            return GenerateResp(segments=[], error=None)  # 前端顯示 assistant 提示由 /chat_generate，舊流程僅給空列表
+
         if GOOGLE_API_KEY:
-            # 這裡沿用 fallback 策略；若你想改用 Gemini 也可呼叫 _gemini_chat 的 segments
             try:
-                # 直接包一份 chat 形式呼叫，方便維護
-                chat_req = ChatReq(
-                    user_id=None,
-                    session_id=None,
-                    messages=[ChatMessage(role="user", content=req.user_input or "請生成下一段 30 秒短影音腳本")],
-                    previous_segments=req.previous_segments,
-                    remember=False,
-                )
-                out = _gemini_chat(chat_req) if GOOGLE_API_KEY else _fallback_chat(chat_req)
-                segs = [Segment(**s) for s in out.get("segments", [])]
-                if not segs:
-                    segs = _fallback_generate(req)
+                segs = _gemini_generate_segments(req.user_input, req.previous_segments)
             except Exception as _:
                 segs = _fallback_generate(req)
         else:
             segs = _fallback_generate(req)
 
-        resp = GenerateResp(segments=segs, error=None)
+        # 記錄 DB（忽略失敗）
+        try:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO requests (user_input, previous_segments_json, response_json) VALUES (?, ?, ?)",
+                (
+                    req.user_input,
+                    json.dumps([s.model_dump() for s in req.previous_segments], ensure_ascii=False),
+                    json.dumps([s.model_dump() for s in segs], ensure_ascii=False),
+                ),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print("[DB] insert failed:", e)
 
-        _safe_db_log("/generate_script", payload=req.dict(), response=resp.dict(), user_input=req.user_input)
-        return resp
+        return GenerateResp(segments=segs, error=None)
     except HTTPException as exc:
         raise exc
     except Exception as e:
-        print("[generate_script] error:", repr(e))
         return JSONResponse(status_code=500, content={"segments": [], "error": "internal_server_error"})
 
-# ========= 路由：偏好 / 回饋 =========
-@app.post("/update_prefs")
-def update_prefs(req: UpdatePrefsReq):
+# ========= 新：/chat_generate（對話模式） =========
+@app.post("/chat_generate", response_model=ChatResp)
+def chat_generate(req: ChatReq):
+    """
+    - 保留你前端契約：回傳 assistant_message、segments（可選）、copy（可選）
+    - 若用戶輸入過短：不丟 422，改回 200 + 引導文（assistant_message），segments 空
+    - 一律嘗試輸出「可拍攝」的分段（Hook/Value/CTA），格式固定，便於右欄時間軸
+    """
     try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO prefs (user_id, prefs_json) VALUES (?, ?)",
-            (req.user_id or "", json.dumps(req.prefs, ensure_ascii=False)),
+        # 1) 取得最後一則使用者訊息
+        last_user = ""
+        for m in reversed(req.messages):
+            if m.role == "user":
+                last_user = (m.content or "").strip()
+                break
+
+        if not last_user:
+            return ChatResp(
+                session_id=req.session_id or "s0",
+                assistant_message="我需要一段你的主題描述，才能開始協作喔。",
+                segments=[],
+                copy=None,
+                error=None
+            )
+
+        # 2) 過短則回友善引導（200）
+        if short_text(last_user):
+            return ChatResp(
+                session_id=req.session_id or "s0",
+                assistant_message=make_guidance(),
+                segments=[],
+                copy=None,
+                error=None
+            )
+
+        # 3) 正常生成
+        if GOOGLE_API_KEY:
+            try:
+                segs = _gemini_generate_segments(last_user, req.previous_segments or [])
+                assistant = "我根據你的需求，已產生 0~30s 可直接拍攝的分段腳本。"
+            except Exception as _:
+                segs = _rule_fallback(last_user, 30)
+                assistant = "模型解析失敗，我先用規則生成一版草稿供你微調。"
+        else:
+            segs = _rule_fallback(last_user, 30)
+            assistant = "目前未提供 API Key，先用規則生成一版草稿供你微調。"
+
+        # 4) 記錄 DB（忽略失敗）
+        try:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO chats (user_id, session_id, messages_json, assistant_json) VALUES (?, ?, ?, ?)",
+                (
+                    req.user_id or "",
+                    req.session_id or "",
+                    json.dumps([m.model_dump() for m in req.messages], ensure_ascii=False),
+                    json.dumps({"assistant_message": assistant, "segments": [s.model_dump() for s in segs]}, ensure_ascii=False),
+                ),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print("[DB] chat insert failed:", e)
+
+        return ChatResp(
+            session_id=req.session_id or "s1",
+            assistant_message=assistant,
+            segments=segs,
+            copy=None,
+            error=None
         )
-        conn.commit()
-        conn.close()
+    except HTTPException as exc:
+        raise exc
     except Exception as e:
-        print("[DB] prefs insert failed:", e)
+        return JSONResponse(status_code=500, content={"assistant_message":"", "segments":[], "error":"internal_server_error"})
+
+# ========= 偏好 & 回饋（維持契約） =========
+@app.post("/update_prefs")
+def update_prefs(req: PrefsReq):
+    # 這裡簡單回 OK，若你要存 DB 可自行擴充
     return {"ok": True}
 
 @app.post("/feedback")
 def feedback(req: FeedbackReq):
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO feedback (user_id, kind, note) VALUES (?, ?, ?)",
-            (req.user_id or "", req.kind, req.note or ""),
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print("[DB] feedback insert failed:", e)
+    # 這裡簡單回 OK，若你要存 DB 可自行擴充
     return {"ok": True}
