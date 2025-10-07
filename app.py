@@ -1,16 +1,17 @@
 #!/usr/bin/env python
 # coding: utf-8
 """
-FastAPI 後端服務（Zeabur-friendly）
-- 固定 API：POST /generate_script
-- Request JSON: {"user_input": "...", "previous_segments": [...]}
-- Response JSON: {"segments":[{"type":"片頭","camera":"...","dialog":"...","visual":"..."}], "error": null}
+FastAPI 後端服務（相容版）
+- 核心 API（不可變）：POST /generate_script
+  Request:  {"user_input": "...", "previous_segments": [...]}
+  Response: {"segments":[{"type":"片頭","camera":"...","dialog":"...","visual":"..."}], "error": null}
 - 功能：
-  * Gemini 生成（分段生成與聚合）
+  * Gemini 生成（分段生成 + 聚合）
   * 退避重試（429/502/503/504/timeout/網路錯誤）
-  * SQLite 永久化每次生成結果
-- 健康檢查：GET /healthz
-- 友善首頁與 favicon：GET /、/favicon.ico
+  * SQLite 永久化每次生成結果（請求/回應/錯誤）
+- 運維：
+  * GET /healthz（健康檢查）
+  * GET / 與 /favicon.ico（避免瀏覽器 404 噪音；不影響核心 API）
 """
 
 import os
@@ -29,34 +30,34 @@ from starlette.responses import JSONResponse
 import google.generativeai as genai
 
 # ----------------------------
-# 0) App 必須先宣告（避免 NameError）
+# App 先宣告（避免裝飾器時找不到 app）
 # ----------------------------
-app = FastAPI(title="Script Generator API", version="1.1.0")
+app = FastAPI(title="Script Generator API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # 視情況鎖定網域
+    allow_origins=["*"],        # 視需求鎖定網域
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ----------------------------
-# 1) 環境變數與 Gemini 設定
+# 環境變數與 Gemini 設定
 # ----------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
 DB_PATH = os.getenv("DB_PATH", "script_generation.db")
 
-# 不要在沒有金鑰時中斷啟動，以免 Zeabur BackOff
+# 沒金鑰也能啟動，/generate_script 才檢查
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_available = True
 else:
-    gemini_available = False  # /generate_script 會回 502，/healthz 可正常
+    gemini_available = False
 
 # ----------------------------
-# 2) SQLite 初始化
+# SQLite 初始化
 # ----------------------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -94,7 +95,7 @@ def init_db():
 init_db()
 
 # ----------------------------
-# 3) Pydantic Schema
+# Pydantic 結構（不可變）
 # ----------------------------
 SegmentType = Literal["片頭", "場景", "片尾"]
 
@@ -115,7 +116,7 @@ class GenerateResponse(BaseModel):
     error: Optional[str] = None
 
 # ----------------------------
-# 4) 分段判定
+# 分段判定
 # ----------------------------
 ALL_TYPES: List[SegmentType] = ["片頭", "場景", "片尾"]
 
@@ -126,7 +127,7 @@ def segments_missing(previous: Optional[List[Segment]]) -> List[SegmentType]:
     return [t for t in ALL_TYPES if t not in have]
 
 # ----------------------------
-# 5) Gemini 呼叫與重試
+# Gemini 呼叫 + 重試
 # ----------------------------
 class GeminiError(Exception):
     pass
@@ -148,7 +149,7 @@ def build_prompt(user_input: str, need_types: List[SegmentType], previous_segmen
 2) 你「只生成」以下缺少的段落：{need_text}
 3) 每個欄位務必是字串，不可為空；dialog 要口語且符合短影音節奏（5-12秒/段）。
 4) camera：鏡位與運鏡；visual：畫面元素與轉場。
-5) 請確保 JSON 合法可 parse。
+5) 確保 JSON 可被 parse（無多餘註解/文字/markdown）。
 
 使用者需求：
 {user_input}
@@ -163,14 +164,14 @@ def parse_model_json(txt: str) -> Dict[str, Any]:
         return json.loads(txt)
     except Exception:
         pass
-    # 擷取第一段大括號
+    # 擷取首尾大括號
     s, e = txt.find("{"), txt.rfind("}")
     if s != -1 and e != -1 and e > s:
         try:
             return json.loads(txt[s:e+1])
         except Exception:
             pass
-    # 移除 ``` 包裹
+    # 處理 ``` 包裹
     if "```" in txt:
         for p in txt.split("```"):
             p = p.strip()
@@ -197,19 +198,19 @@ def call_gemini_with_retry(
     generation_config = {
         "temperature": 0.8,
         "top_p": 0.95,
-        "response_mime_type": "application/json",
+        "response_mime_type": "application/json",  # 要求回 JSON
     }
 
     for attempt in range(1, max_retries + 1):
         try:
             model = genai.GenerativeModel(model_name)
-            start_ts = time.time()
+            start = time.time()
             resp = model.generate_content(prompt, generation_config=generation_config)
-            if (time.time() - start_ts) > timeout_sec:
+            if (time.time() - start) > timeout_sec:
                 raise GeminiError(f"Timeout > {timeout_sec}s")
 
             try:
-                request_id = getattr(resp, "request_id", None)
+                request_id = getattr(resp, "request_id", None)  # 有些 SDK 版本提供
             except Exception:
                 request_id = None
 
@@ -222,14 +223,14 @@ def call_gemini_with_retry(
             msg = str(e).lower()
             retryable = any(k in msg for k in ["429", "502", "503", "504", "timeout", "temporarily", "unavailable", "rate"])
             if attempt < max_retries and retryable:
-                time.sleep(base_delay * (2 ** (attempt - 1)))
+                time.sleep(base_delay * (2 ** (attempt - 1)))  # 指數退避：1s,2s,4s
                 continue
             break
 
     raise GeminiError(f"Gemini 呼叫失敗：{last_err}")
 
 # ----------------------------
-# 6) 永久化
+# DB 持久化
 # ----------------------------
 def persist_generation(
     user_input: str,
@@ -280,7 +281,7 @@ def persist_generation(
     return generation_id
 
 # ----------------------------
-# 7) API：POST /generate_script（不可變）
+# 核心 API（不可變）：POST /generate_script
 # ----------------------------
 @app.post("/generate_script", response_model=GenerateResponse)
 def generate_script(payload: GenerateRequest):
@@ -298,11 +299,10 @@ def generate_script(payload: GenerateRequest):
             base_delay=1.0,
             timeout_sec=90.0,
         )
-
         if "segments" not in parsed_json or not isinstance(parsed_json["segments"], list):
             raise GeminiError("模型回應缺少 'segments' 陣列")
 
-        # 合併 previous + 新生成（只補缺的）
+        # 合併（只補缺的）
         merged: List[Segment] = list(payload.previous_segments or [])
         for item in parsed_json["segments"]:
             seg = Segment(
@@ -314,19 +314,21 @@ def generate_script(payload: GenerateRequest):
             if seg.type in need:
                 merged.append(seg)
 
+        # 補齊檢查
         merged_types = {s.type for s in merged}
         missing_after = [t for t in ALL_TYPES if t not in merged_types]
-        error_msg = None if not missing_after else f"仍缺少段落：{', '.join(missing_after)}"
+        err_msg = None if not missing_after else f"仍缺少段落：{', '.join(missing_after)}"
 
+        # 入庫
         persist_generation(
             user_input=payload.user_input,
             previous_segments=payload.previous_segments,
             response_json={"segments": [s.dict() for s in merged]},
-            error=error_msg,
+            error=err_msg,
             model=GEMINI_MODEL,
             request_id=request_id,
         )
-        return GenerateResponse(segments=merged, error=error_msg)
+        return GenerateResponse(segments=merged, error=err_msg)
 
     except GeminiError as ge:
         persist_generation(payload.user_input, payload.previous_segments, None, str(ge), GEMINI_MODEL, None)
@@ -336,7 +338,7 @@ def generate_script(payload: GenerateRequest):
         return JSONResponse(status_code=500, content=GenerateResponse(segments=[], error=f"Unhandled: {e}").dict())
 
 # ----------------------------
-# 8) 健康檢查 & 友善首頁
+# 運維：健康檢查與友善首頁（不影響核心 API）
 # ----------------------------
 @app.get("/healthz")
 def healthz():
@@ -354,4 +356,5 @@ def index():
 
 @app.get("/favicon.ico")
 def favicon():
+    # 回 204 避免瀏覽器刷 404
     return JSONResponse(status_code=204, content=None)
