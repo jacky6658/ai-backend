@@ -1,110 +1,72 @@
 #!/usr/bin/env python
 # coding: utf-8
 """
-FastAPI 後端服務（相容 + 雲端寫入保險版）
-- 核心 API（不可變）：POST /generate_script
-  Request:  {"user_input": "...", "previous_segments": [...]}
-  Response: {"segments":[{"type":"片頭","camera":"...","dialog":"...","visual":"..."}], "error": null}
-- 功能：
-  * Gemini 生成（分段生成 + 聚合）
-  * 退避重試（429/502/503/504/timeout/網路錯誤）
-  * SQLite 永久化每次生成結果（自動挑選可寫目錄）
-- 運維：
-  * GET /healthz（健康檢查）
-  * GET / 與 /favicon.ico（避免瀏覽器 404 噪音）
+FastAPI 後端服務
+- POST /generate_script
+- 使用 Gemini 生成短影片腳本（片頭/場景/片尾）
+- 分段生成（根據 previous_segments 決定補哪些段落）
+- 自動重試（429/502/timeout/網路錯誤）
+- SQLite 永久化每次生成結果
+
+注意：維持原本 API 介面/URL/方法/Schema 不變，前端相容。
 """
 
 import os
 import json
 import time
-import uuid
 import sqlite3
+import uuid
 from datetime import datetime
-from typing import List, Optional, Literal, Dict, Any, Tuple
+from typing import List, Optional, Literal, Any, Dict, Tuple
 
+import google.generativeai as genai
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse
 
-import google.generativeai as genai
+# ----------------------------
+# 環境變數與 Gemini 設定
+# ----------------------------
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+
+if not GEMINI_API_KEY:
+    # 讓容器啟動就發現問題，而不是延後到第一個請求
+    raise RuntimeError("環境變數 GEMINI_API_KEY 未設定。請在 Zeabur 設定 GEMINI_API_KEY。")
+
+genai.configure(api_key=GEMINI_API_KEY)
 
 # ----------------------------
-# App 先宣告（避免裝飾器時找不到 app）
+# FastAPI 初始化 & CORS
 # ----------------------------
-app = FastAPI(title="Script Generator API", version="1.3.0")
+app = FastAPI(title="Script Generator API", version="1.0.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # 視需求鎖定網域
+    allow_origins=["*"],     # 依需求收斂
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ----------------------------
-# 環境變數與 Gemini 設定（不改 API）
+# SQLite 初始化
 # ----------------------------
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+DB_PATH = os.getenv("DB_PATH", "/data/script_generation.db").strip()
 
-# DB 預設（可被環境變數覆蓋）；若不可寫，後續會自動 fallback
-DB_PATH_ENV = os.getenv("DB_PATH", "/app/script_generation.db").strip()
-
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_available = True
-else:
-    gemini_available = False  # /generate_script 會回 502；/healthz OK
-
-# ----------------------------
-# SQLite：挑選可寫路徑（解決雲端唯讀目錄）
-# ----------------------------
-def _ensure_parent_dir(path: str) -> None:
-    parent = os.path.dirname(path)
-    if parent and not os.path.exists(parent):
-        os.makedirs(parent, exist_ok=True)
-
-def _touch(path: str) -> None:
-    # 預先建立檔案，避免部分平台首次連線報錯
-    with open(path, "a", encoding="utf-8"):
-        pass
-
-def pick_writable_db_path() -> str:
-    """
-    依序嘗試：
-    1) DB_PATH_ENV（例如你手動設成 /data/script_generation.db）
-    2) /data/script_generation.db
-    3) /tmp/appdata/script_generation.db
-    成功即可返回；若都失敗則拋出例外。
-    """
-    candidates = [
-        DB_PATH_ENV,
-        "/data/script_generation.db",
-        "/tmp/appdata/script_generation.db",
-    ]
-    last_err = None
-    for p in candidates:
-        try:
-            _ensure_parent_dir(p)
-            _touch(p)
-            # 測試能否開啟資料庫（建立檔案 + pragma）
-            conn = sqlite3.connect(p)
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.close()
-            print(f"[BOOT] SQLite path OK: {p}")
-            return p
-        except Exception as e:
-            last_err = e
-            print(f"[BOOT] SQLite path failed: {p} -> {e}")
-            continue
-    raise sqlite3.OperationalError(f"No writable DB path. last_err={last_err}")
-
-DB_PATH = pick_writable_db_path()
+def _ensure_db_dir(path: str) -> None:
+    """確保 SQLite 目錄存在且可寫。"""
+    dir_ = os.path.dirname(path)
+    if dir_ and not os.path.exists(dir_):
+        os.makedirs(dir_, exist_ok=True)
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    _ensure_db_dir(DB_PATH)
+    # check_same_thread=False 讓 FastAPI/uvicorn 多執行緒可以共用同一連線 (我們仍然短連線)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     cur = conn.cursor()
+    # 儲存每次請求與回應
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS generations (
@@ -119,6 +81,7 @@ def init_db():
         )
         """
     )
+    # 可選：把 segments 正規化到子表
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS segments (
@@ -136,9 +99,10 @@ def init_db():
     conn.close()
 
 init_db()
+print(f"[BOOT] SQLITE path OK: {DB_PATH}")  # 方便在 Zeabur Runtime Logs 檢查
 
 # ----------------------------
-# Pydantic 結構（不可變）
+# Pydantic Schema（維持相容）
 # ----------------------------
 SegmentType = Literal["片頭", "場景", "片尾"]
 
@@ -159,7 +123,7 @@ class GenerateResponse(BaseModel):
     error: Optional[str] = None
 
 # ----------------------------
-# 分段判定
+# 工具：決定需要生成的段落
 # ----------------------------
 ALL_TYPES: List[SegmentType] = ["片頭", "場景", "片尾"]
 
@@ -170,7 +134,7 @@ def segments_missing(previous: Optional[List[Segment]]) -> List[SegmentType]:
     return [t for t in ALL_TYPES if t not in have]
 
 # ----------------------------
-# Gemini 呼叫 + 重試
+# Gemini 呼叫與重試
 # ----------------------------
 class GeminiError(Exception):
     pass
@@ -192,26 +156,31 @@ def build_prompt(user_input: str, need_types: List[SegmentType], previous_segmen
 2) 你「只生成」以下缺少的段落：{need_text}
 3) 每個欄位務必是字串，不可為空；dialog 要口語且符合短影音節奏（5-12秒/段）。
 4) camera：鏡位與運鏡；visual：畫面元素與轉場。
-5) 確保 JSON 可被 parse（無多餘註解/文字/markdown）。
+5) 請確保 JSON 合法可 parse。
 
 使用者需求：
 {user_input}
 
 已存在的段落（請勿重複生成）：
 {prev_text}
-""".strip()
+    """.strip()
 
 def parse_model_json(txt: str) -> Dict[str, Any]:
+    # 直接嘗試
     try:
         return json.loads(txt)
     except Exception:
         pass
-    s, e = txt.find("{"), txt.rfind("}")
-    if s != -1 and e != -1 and e > s:
+    # 抽取第一個 {...}
+    start = txt.find("{")
+    end = txt.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = txt[start : end + 1]
         try:
-            return json.loads(txt[s:e+1])
+            return json.loads(candidate)
         except Exception:
             pass
+    # 處理 ``` 包裹
     if "```" in txt:
         for p in txt.split("```"):
             p = p.strip()
@@ -227,11 +196,8 @@ def call_gemini_with_retry(
     model_name: str,
     max_retries: int = 3,
     base_delay: float = 1.0,
-    timeout_sec: float = 90.0,
+    request_timeout_sec: float = 60.0,
 ) -> Tuple[Dict[str, Any], Optional[str]]:
-    if not gemini_available:
-        raise GeminiError("GEMINI_API_KEY 未設定")
-
     last_err: Optional[Exception] = None
     request_id: Optional[str] = None
 
@@ -244,33 +210,33 @@ def call_gemini_with_retry(
     for attempt in range(1, max_retries + 1):
         try:
             model = genai.GenerativeModel(model_name)
-            start = time.time()
-            resp = model.generate_content(prompt, generation_config=generation_config)
-            if (time.time() - start) > timeout_sec:
-                raise GeminiError(f"Timeout > {timeout_sec}s")
+            start_ts = time.time()
+            response = model.generate_content(prompt, generation_config=generation_config)
+            if (time.time() - start_ts) > request_timeout_sec:
+                raise GeminiError(f"Timeout > {request_timeout_sec}s")
 
+            # 嘗試取 request_id（不同 SDK 版本行為略異）
             try:
-                request_id = getattr(resp, "request_id", None)
+                request_id = getattr(response, "request_id", None)
             except Exception:
                 request_id = None
 
-            text = resp.text or ""
-            parsed = parse_model_json(text)
+            parsed = parse_model_json(response.text or "")
             return parsed, request_id
 
         except Exception as e:
             last_err = e
             msg = str(e).lower()
-            retryable = any(k in msg for k in ["429", "502", "503", "504", "timeout", "temporarily", "unavailable", "rate"])
-            if attempt < max_retries and retryable:
-                time.sleep(base_delay * (2 ** (attempt - 1)))
+            is_retryable = any(x in msg for x in ("429","502","503","504","timeout","temporarily","unavailable","rate"))
+            if attempt < max_retries and is_retryable:
+                time.sleep(base_delay * (2 ** (attempt - 1)))  # 指數退避
                 continue
             break
 
     raise GeminiError(f"Gemini 呼叫失敗：{last_err}")
 
 # ----------------------------
-# DB 持久化
+# 永久化：寫入 DB
 # ----------------------------
 def persist_generation(
     user_input: str,
@@ -283,7 +249,7 @@ def persist_generation(
     generation_id = str(uuid.uuid4())
     created_at = datetime.utcnow().isoformat()
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     cur = conn.cursor()
     cur.execute(
         """
@@ -321,7 +287,7 @@ def persist_generation(
     return generation_id
 
 # ----------------------------
-# 核心 API（不可變）：POST /generate_script
+# API：POST /generate_script（維持相容）
 # ----------------------------
 @app.post("/generate_script", response_model=GenerateResponse)
 def generate_script(payload: GenerateRequest):
@@ -337,13 +303,12 @@ def generate_script(payload: GenerateRequest):
             model_name=GEMINI_MODEL,
             max_retries=3,
             base_delay=1.0,
-            timeout_sec=90.0,
+            request_timeout_sec=90.0,
         )
         if "segments" not in parsed_json or not isinstance(parsed_json["segments"], list):
             raise GeminiError("模型回應缺少 'segments' 陣列")
 
-        # 合併（只補缺的）
-        merged: List[Segment] = list(payload.previous_segments or [])
+        merged = list(payload.previous_segments or [])
         for item in parsed_json["segments"]:
             seg = Segment(
                 type=item.get("type"),
@@ -354,51 +319,53 @@ def generate_script(payload: GenerateRequest):
             if seg.type in need:
                 merged.append(seg)
 
-        # 補齊檢查
         merged_types = {s.type for s in merged}
-        missing_after = [t for t in ALL_TYPES if t not in merged_types]
-        err_msg = None if not missing_after else f"仍缺少段落：{', '.join(missing_after)}"
+        missing_after_merge = [t for t in ALL_TYPES if t not in merged_types]
+        error_msg = None
+        if missing_after_merge:
+            error_msg = f"仍缺少段落：{', '.join(missing_after_merge)}"
 
-        # 入庫
         persist_generation(
             user_input=payload.user_input,
             previous_segments=payload.previous_segments,
             response_json={"segments": [s.dict() for s in merged]},
-            error=err_msg,
+            error=error_msg,
             model=GEMINI_MODEL,
             request_id=request_id,
         )
-        return GenerateResponse(segments=merged, error=err_msg)
+        return GenerateResponse(segments=merged, error=error_msg)
 
     except GeminiError as ge:
-        persist_generation(payload.user_input, payload.previous_segments, None, str(ge), GEMINI_MODEL, None)
-        return JSONResponse(status_code=502, content=GenerateResponse(segments=[], error=str(ge)).dict())
+        persist_generation(
+            user_input=payload.user_input,
+            previous_segments=payload.previous_segments,
+            response_json=None,
+            error=str(ge),
+            model=GEMINI_MODEL,
+            request_id=None,
+        )
+        return JSONResponse(
+            status_code=502,
+            content=GenerateResponse(segments=[], error=str(ge)).dict(),
+        )
     except Exception as e:
-        persist_generation(payload.user_input, payload.previous_segments, None, f"Unhandled: {e}", GEMINI_MODEL, None)
-        return JSONResponse(status_code=500, content=GenerateResponse(segments=[], error=f"Unhandled: {e}").dict())
+        persist_generation(
+            user_input=payload.user_input,
+            previous_segments=payload.previous_segments,
+            response_json=None,
+            error=f"Unhandled: {e}",
+            model=GEMINI_MODEL,
+            request_id=None,
+        )
+        return JSONResponse(
+            status_code=500,
+            content=GenerateResponse(segments=[], error=f"Unhandled: {e}").dict(),
+        )
 
 # ----------------------------
-# 運維：健康檢查與友善首頁（不影響核心 API）
+# Health Check（維持相容）
 # ----------------------------
 @app.get("/healthz")
 def healthz():
-    return {
-        "ok": True,
-        "model": GEMINI_MODEL,
-        "db": DB_PATH,
-        "gemini": gemini_available
-    }
+    return {"ok": True, "model": GEMINI_MODEL, "db": DB_PATH}
 
-@app.get("/")
-def index():
-    return {
-        "service": "AI Script Backend",
-        "endpoints": {
-            "POST /generate_script": "主 API，請以 JSON 請求",
-            "GET /healthz": "健康檢查"
-        }
-    }
-
-@app.get("/favicon.ico")
-def favicon():
-    return JSONResponse(status_code=204, content=None)
