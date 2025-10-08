@@ -622,3 +622,120 @@ def export_google_sheet_flat(limit: int = 200):
         media_type="text/csv",
         headers={"Content-Disposition": "inline; filename=export_flat.csv"},
     )
+# ========= Google Sheet 扁平化（v2：避免快取 & 明確多欄位） =========
+import csv
+import json
+from io import StringIO
+from fastapi.responses import Response
+
+@app.get("/export/google-sheet-flat-v2")
+def export_google_sheet_flat_v2(limit: int = 200):
+    """
+    扁平化 CSV（含 copy 與前 3 個 segments），禁用快取。
+    在 Google Sheets 使用：
+      =IMPORTDATA("https://aijobvideobackend.zeabur.app/export/google-sheet-flat-v2?limit=500")
+    """
+    # sanitize limit
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 200
+    limit = max(1, min(limit, 2000))
+
+    # 讀資料
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        SELECT id, created_at, user_input, mode, response_json
+        FROM requests
+        ORDER BY id DESC
+        LIMIT {limit}
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    # 準備 CSV
+    out = StringIO()
+    writer = csv.writer(out)
+
+    headers = [
+        "id", "created_at", "mode", "user_input",
+        "assistant_message",
+        "copy_main_copy", "copy_cta", "copy_hashtags", "copy_alternates_joined",
+        "segments_count",
+        "seg1_type", "seg1_start_sec", "seg1_end_sec", "seg1_dialog", "seg1_visual", "seg1_cta",
+        "seg2_type", "seg2_start_sec", "seg2_end_sec", "seg2_dialog", "seg2_visual", "seg2_cta",
+        "seg3_type", "seg3_start_sec", "seg3_end_sec", "seg3_dialog", "seg3_visual", "seg3_cta",
+    ]
+    writer.writerow(headers)
+
+    def empty_seg():
+        return ["", "", "", "", "", ""]
+
+    for _id, created_at, user_input, mode, resp_json in rows:
+        assistant_message = ""
+        copy_main = ""
+        copy_cta = ""
+        copy_hashtags = ""
+        copy_alternates = ""
+        segments_count = 0
+        seg1 = empty_seg()
+        seg2 = empty_seg()
+        seg3 = empty_seg()
+
+        try:
+            data = json.loads(resp_json or "{}")
+            assistant_message = (data.get("assistant_message") or "")[:500]
+
+            c = data.get("copy") or {}
+            if isinstance(c, dict):
+                copy_main = c.get("main_copy") or ""
+                copy_cta = c.get("cta") or ""
+                tags = c.get("hashtags") or []
+                if isinstance(tags, list):
+                    copy_hashtags = " ".join(map(str, tags))
+                alts = c.get("alternates") or c.get("openers") or []
+                if isinstance(alts, list):
+                    copy_alternates = " | ".join(map(str, alts))
+
+            segs = data.get("segments") or []
+            if isinstance(segs, list):
+                segments_count = len(segs)
+
+                def to_seg(s):
+                    return [
+                        s.get("type", ""),
+                        s.get("start_sec", ""),
+                        s.get("end_sec", ""),
+                        s.get("dialog", ""),
+                        s.get("visual", ""),
+                        s.get("cta", ""),
+                    ]
+
+                if len(segs) >= 1: seg1 = to_seg(segs[0])
+                if len(segs) >= 2: seg2 = to_seg(segs[1])
+                if len(segs) >= 3: seg3 = to_seg(segs[2])
+
+        except Exception as e:
+            assistant_message = f"[JSON parse error] {str(e)}"
+
+        writer.writerow([
+            _id, created_at, mode, user_input,
+            assistant_message,
+            copy_main, copy_cta, copy_hashtags, copy_alternates,
+            segments_count,
+            *seg1, *seg2, *seg3,
+        ])
+
+    return Response(
+        content=out.getvalue(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": "inline; filename=export_flat_v2.csv",
+            "Cache-Control": "no-store, max-age=0, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
