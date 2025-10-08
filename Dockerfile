@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py /app/
 
 # 你原本的環境變數
-ENV GEMINI_MODEL=gemini-1.5-flash
+ENV GEMINI_MODEL=gemini-2.5-flash
 ENV DB_PATH=/data/script_generation.db
 
 EXPOSE 8080
