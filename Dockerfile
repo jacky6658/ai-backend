@@ -29,5 +29,5 @@ CMD ["uvicorn", "app:app", "--host=0.0.0.0", "--port=8080"]
 
 # 放知識庫進容器
 RUN mkdir -p /data
-COPY data/短視頻_知識庫.txt /data/短視頻_知識庫.txt
-ENV KNOWLEDGE_TXT_PATH=/data/短視頻_知識庫.txt
+COPY data/短视频_知識庫.txt /data/kb.txt
+ENV KNOWLEDGE_TXT_PATH=/data/kb.txt
