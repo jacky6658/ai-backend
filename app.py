@@ -448,7 +448,9 @@ async def export_xlsx(req: Request):
     )
 # ========= CSV 下載 & Google Sheet 連動 =========
 import csv
-from fastapi.responses import FileResponse
+import json
+from fastapi.responses import FileResponse, Response
+from io import StringIO
 
 @app.get("/download/requests_export.csv")
 def download_requests_csv():
@@ -493,7 +495,6 @@ def export_for_google_sheet(limit: int = 100):
     rows = cur.fetchall()
     conn.close()
 
-    from io import StringIO
     output = StringIO()
     writer = csv.writer(output)
     writer.writerow(["id", "created_at", "user_input", "mode"])
@@ -510,7 +511,6 @@ def export_google_sheet_flat(limit: int = 200):
     Usage (Google Sheets):
       =IMPORTDATA("https://你的網域/export/google-sheet-flat?limit=500")
     """
-    from io import StringIO
 
     # sanitize limit
     try:
@@ -538,20 +538,13 @@ def export_google_sheet_flat(limit: int = 200):
     writer = csv.writer(out)
 
     # columns:
-    # base
     headers = [
         "id", "created_at", "mode", "user_input",
         "assistant_message",
-    ]
-    # copy fields
-    headers += [
         "copy_main_copy",
         "copy_cta",
         "copy_hashtags",
         "copy_alternates_joined",
-    ]
-    # script segments (first 3)
-    headers += [
         "segments_count",
         "seg1_type", "seg1_start_sec", "seg1_end_sec", "seg1_dialog", "seg1_visual", "seg1_cta",
         "seg2_type", "seg2_start_sec", "seg2_end_sec", "seg2_dialog", "seg2_visual", "seg2_cta",
@@ -567,7 +560,6 @@ def export_google_sheet_flat(limit: int = 200):
         copy_alternates_joined = ""
         segments_count = 0
 
-        # prefill 3 segments
         def empty_seg():
             return ["", "", "", "", "", ""]
         seg1 = empty_seg()
@@ -611,9 +603,8 @@ def export_google_sheet_flat(limit: int = 200):
                 if len(segs) >= 2: seg2 = to_seg(segs[1])
                 if len(segs) >= 3: seg3 = to_seg(segs[2])
 
-        except Exception:
-            # keep row with blanks if parsing failed
-            pass
+        except Exception as e:
+            assistant_message = f"[JSON parse error] {str(e)}"
 
         writer.writerow([
             _id, created_at, mode, user_input,
