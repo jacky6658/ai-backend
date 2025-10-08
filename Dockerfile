@@ -16,6 +16,7 @@ COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py /app/
+COPY knowledge_text_loader.py /app/
 
 # 你原本的環境變數
 ENV GEMINI_MODEL=gemini-2.5-flash
