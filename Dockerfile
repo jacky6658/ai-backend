@@ -5,6 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# 安裝基本套件
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates tzdata && \
     rm -rf /var/lib/apt/lists/*
@@ -12,16 +13,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 建立 DB 目錄（給 SQLite 用）
 RUN mkdir -p /data && chmod 777 /data
 
+# 安裝 Python 套件
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
+# 複製程式碼
 COPY app.py /app/
 COPY knowledge_text_loader.py /app/
 
-# 放知識庫進容器
+# 放知識庫進容器（改成正確路徑）
 COPY data/data/kb.txt /data/kb.txt
 
-# 你原本的環境變數
+# 設定環境變數
 ENV GEMINI_MODEL=gemini-2.5-flash
 ENV DB_PATH=/data/script_generation.db
 ENV KNOWLEDGE_TXT_PATH=/data/kb.txt
