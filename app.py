@@ -31,9 +31,10 @@ app.add_middleware(
 QA_SESSIONS: Dict[str, Dict[str, Any]] = {}  # key: session_id
 QA_QUESTIONS = [
     {"key":"structure","q":"【Q1】請選擇腳本結構（A 三段式 / B 問題解決 / C Before-After / D 教學 / E 敘事 / F 爆點連發）"},
-    {"key":"topic","q":"【Q2】請輸入主題或產品名稱"},
-    {"key":"goal","q":"【Q3】主要目標（吸流量 / 教育 / 轉單 / 品牌）"},
-    {"key":"audience","q":"【Q4】目標受眾（年齡/性別/特質/痛點）"},
+    {"key":"duration","q":"【Q2】影片時長（30 或 60 秒）"},
+    {"key":"topic","q":"【Q3】請輸入主題或產品名稱"},
+    {"key":"goal","q":"【Q4】主要目標（吸流量 / 教育 / 轉單 / 品牌）"},
+    {"key":"audience","q":"【Q5】目標受眾（年齡/性別/特質/痛點）"},
     {"key":"hook","q":"【Q6】開場鉤子類型（問句/反差/同理/數字）＋想放的關鍵詞"},
     {"key":"cta","q":"【Q7】CTA（關注/收藏 / 留言/私訊 / 購買連結）"}
 ]
@@ -60,7 +61,7 @@ def qa_record_answer(session_id: str, user_text: str):
 
 def compose_brief_from_answers(ans: Dict[str,str]) -> str:
     labels = {
-        "structure":"結構","topic":"主題","goal":"目標","audience":"受眾",
+        "structure":"結構","duration":"時長","topic":"主題","goal":"目標","audience":"受眾",
         "hook":"鉤子","cta":"CTA"
     }
     lines = []
@@ -85,11 +86,8 @@ def retrieve_context(query: str, max_chars: int = 1200) -> str:
     text = GLOBAL_KB_TEXT or ""
     if not text: 
         return ""
-    # very simple keyword scoring: keep lines that contain any keyword tokens
     import re
-    # tokens: words > 1 char (Chinese char included)
     toks = [t for t in re.split(r'[\s，。；、,.:?!\-\/\[\]()]+', (query or "")) if len(t)>=1]
-    # unique
     toks = list(dict.fromkeys(toks))
     lines = text.splitlines()
     scored = []
@@ -97,7 +95,6 @@ def retrieve_context(query: str, max_chars: int = 1200) -> str:
         score = sum(1 for t in toks if t and t in line)
         if score>0:
             scored.append((score, i, line))
-    # take top lines keeping order by appearance
     scored.sort(key=lambda x:(-x[0], x[1]))
     selected=[]
     total=0
@@ -143,7 +140,6 @@ def init_db():
 def on_startup():
     try:
         init_db()
-        # load KB
         global GLOBAL_KB_TEXT
         GLOBAL_KB_TEXT = load_kb_text()
         print(f"[BOOT] KB loaded from {KNOWLEDGE_TXT_PATH} len={len(GLOBAL_KB_TEXT)}")
@@ -173,9 +169,9 @@ def root_page():
 # ========= 內建知識庫 =========
 BUILTIN_KB_SCRIPT = """
 【短影音腳本原則（濃縮）】
-1) Hook(0-5s) → Value(5-25s 可延伸) → CTA。
+1) Hook(0-5s) → Value → CTA。60s 版可拆 5~6 段，節奏清楚。
 2) 每段輸出：type/start_sec/end_sec/camera/dialog/visual/cta。
-3) Hook 用痛點/反差/數據鉤子 + 快節奏 B-roll；Value 拆 3 點以內；CTA 動詞+利益+下一步。
+3) Hook 用痛點/反差/數據鉤子 + 快節奏 B-roll；Value 拆重點；CTA 動詞+利益+下一步。
 4) 語氣口語、短句、有節奏，避免空話。
 """
 
@@ -189,13 +185,11 @@ BUILTIN_KB_COPY = """
 
 def load_extra_kb(max_chars=2500) -> str:
     chunks, total = [], 0
-    # 以 GLOBAL_KB_TEXT 為主（你新放的 /data/kb.txt）
     if GLOBAL_KB_TEXT:
         seg = GLOBAL_KB_TEXT[:max_chars]
         chunks.append(f"\n[KB:global]\n{seg}")
         total += len(seg)
     else:
-        # 兼容你舊有的自動掃描 /data/kb*.txt
         paths = glob.glob("/data/kb*.txt") + glob.glob("/data/*.kb.txt") + glob.glob("/data/knowledge*.txt")
         for p in paths:
             try:
@@ -214,7 +208,7 @@ def load_extra_kb(max_chars=2500) -> str:
 EXTRA_KB = load_extra_kb()
 
 # ========= 提示字 & 工具 =========
-SHORT_HINT_SCRIPT = "內容有點太短了 🙏 請提供：行業/平台/時長(秒)/目標/主題（例如：『電商｜Reels｜30秒｜購買｜夏季新品開箱』），我就能生成完整腳本。"
+SHORT_HINT_SCRIPT = "內容有點太短了 🙏 請提供：行業/平台/時長(秒)/目標/主題（例如：『電商｜Reels｜60秒｜購買｜夏季新品開箱』），我就能生成完整腳本。"
 SHORT_HINT_COPY   = "內容有點太短了 🙏 請提供：平台/受眾/語氣/主題/CTA（例如：『IG｜男生視角｜活力回歸｜CTA：點連結』），我就能生成完整貼文。"
 
 def _ensure_json_block(text: str) -> str:
@@ -274,7 +268,33 @@ def parse_copy(json_text: str) -> Dict[str, Any]:
         "image_ideas": data.get("image_ideas", [])
     }
 
-def build_script_prompt(user_input: str, previous_segments: List[Dict[str, Any]]) -> str:
+# === NEW: 模板/時長/模式說明 ===
+TEMPLATE_GUIDE = {
+    "A": "三段式：Hook → Value → CTA。重點清楚、節奏明快，適合廣泛情境。",
+    "B": "問題解決：痛點 → 解法 → 證據/示例 → CTA。適合教育與導購。",
+    "C": "Before-After：改變前後對比，強調差異與收益 → CTA。適合案例/見證。",
+    "D": "教學：步驟化教學（1-2-3）+ 注意事項 → CTA。適合技巧分享。",
+    "E": "敘事：小故事鋪陳 → 轉折亮點 → CTA。適合品牌情緒/人物敘事。",
+    "F": "爆點連發：連續強 Hook/金句/反差點，最後收斂 → CTA。適合抓注意力。"
+}
+
+def _duration_plan(duration: Optional[int]) -> Dict[str, Any]:
+    """
+    回傳分段建議與 fewshot JSON。30s 走 3 段；60s 走 6 段（每段~10s）。
+    """
+    if int(duration or 0) == 60:
+        fewshot = """
+{"segments":[
+  {"type":"hook","start_sec":0,"end_sec":10,"camera":"CU","dialog":"...","visual":"...","cta":""},
+  {"type":"value1","start_sec":10,"end_sec":20,"camera":"MS","dialog":"...","visual":"...","cta":""},
+  {"type":"value2","start_sec":20,"end_sec":30,"camera":"MS","dialog":"...","visual":"...","cta":""},
+  {"type":"value3","start_sec":30,"end_sec":40,"camera":"MS","dialog":"...","visual":"...","cta":""},
+  {"type":"value4","start_sec":40,"end_sec":50,"camera":"MS","dialog":"...","visual":"...","cta":""},
+  {"type":"cta","start_sec":50,"end_sec":60,"camera":"WS","dialog":"...","visual":"...","cta":"..."}
+]}
+"""
+        return {"fewshot": fewshot, "note": "請以 60 秒約 6 段輸出，段與段間節奏分明。"}
+    # default 30s
     fewshot = """
 {"segments":[
   {"type":"hook","start_sec":0,"end_sec":5,"camera":"CU","dialog":"...","visual":"...","cta":""},
@@ -282,15 +302,45 @@ def build_script_prompt(user_input: str, previous_segments: List[Dict[str, Any]]
   {"type":"cta","start_sec":25,"end_sec":30,"camera":"WS","dialog":"...","visual":"...","cta":"..."}
 ]}
 """
-    prev = json.dumps(previous_segments or [], ensure_ascii=False)
+    return {"fewshot": fewshot, "note": "請以 30 秒 3 段輸出，Hook 要強、CTA 明確。"}
+
+def build_script_prompt(
+    user_input: str,
+    previous_segments: List[Dict[str, Any]],
+    template_type: Optional[str] = None,
+    duration: Optional[int] = None,
+    dialogue_mode: Optional[str] = None,
+    knowledge_hint: Optional[str] = None,
+) -> str:
+    plan = _duration_plan(duration)
+    fewshot = plan["fewshot"]
+    duration_note = plan["note"]
+    tmpl = (template_type or "").strip().upper()
+    tmpl_text = TEMPLATE_GUIDE.get(tmpl, "未指定模板時由你判斷最合適的結構。")
+
     kb = (BUILTIN_KB_SCRIPT + "\n" + (EXTRA_KB or "")).strip()
-    # 依照輸入再從 KB 擷取相關段落
+    # 動態 KB 擷取：合併使用者輸入與可選提示
+    q = user_input
+    if knowledge_hint:
+        q = f"{knowledge_hint}\n{user_input}"
     try:
-        kb_ctx_dynamic = retrieve_context(user_input)
+        kb_ctx_dynamic = retrieve_context(q)
     except Exception:
         kb_ctx_dynamic = ""
+
+    prev = json.dumps(previous_segments or [], ensure_ascii=False)
+
+    mode_line = ""
+    if (dialogue_mode or "").lower() == "free":
+        mode_line = "語氣更自由、可主動提出精煉建議與反問以完善腳本；"
+    elif (dialogue_mode or "").lower() == "guide":
+        mode_line = "語氣偏引導，逐步釐清要素後直接給出完整分段；"
+
     return f"""
-你是短影音腳本顧問。請根據「使用者輸入」與「已接受段落」延續或重寫，輸出 JSON（禁止額外說明文字）。
+你是短影音腳本顧問。{mode_line}請根據「使用者輸入」與「已接受段落」延續或重寫，輸出 JSON（禁止額外說明文字）。
+
+【選擇的模板】{tmpl or "（未指定）"}：{tmpl_text}
+【時長要求】{int(duration) if duration else "（未指定，預設 30）"} 秒。{duration_note}
 
 {kb}
 
@@ -342,7 +392,26 @@ def gemini_generate_text(prompt: str) -> str:
     return (res.text or "").strip()
 
 # ========= Fallback =========
-def fallback_segments(user_input: str, prev_len: int) -> List[Dict[str, Any]]:
+def fallback_segments(user_input: str, prev_len: int, duration: Optional[int]=None) -> List[Dict[str, Any]]:
+    d = int(duration or 30)
+    if d >= 60:
+        # 粗略 60s 六段
+        labels = ["hook","value1","value2","value3","value4","cta"]
+        segs=[]
+        start=0
+        for i,l in enumerate(labels):
+            end = 10*(i+1)
+            if i==len(labels)-1: end = 60
+            cam = "CU" if i==0 else ("WS" if i==len(labels)-1 else "MS")
+            segs.append({
+                "type": l, "start_sec": start, "end_sec": end, "camera": cam,
+                "dialog": f"（模擬）{user_input[:36]}…",
+                "visual": "（模擬）快切 B-roll / 大字卡",
+                "cta": "點連結領取 🔗" if l=="cta" else ""
+            })
+            start = end
+        return segs
+    # 預設 30s 三段
     step = prev_len
     return [{
         "type": "hook" if step == 0 else ("cta" if step >= 2 else "value"),
@@ -399,18 +468,30 @@ async def chat_qa(req: Request):
     ans = QA_SESSIONS.get(session_id, {}).get("answers", {})
     brief = compose_brief_from_answers(ans)
     kb_ctx = retrieve_context(brief) or ""
+    # 將 QA 選到的 structure/duration 帶入
+    template_type = (ans.get("structure") or "").strip()[:1].upper() or None
+    try:
+        duration = int((ans.get("duration") or "").strip())
+    except Exception:
+        duration = 30
+
     user_input = f"{brief}\n\n【KB輔助摘錄】\n{kb_ctx}"
 
-    # 使用原本的 build_script_prompt 與 Gemini 流程
     previous_segments = []
-    prompt = build_script_prompt(user_input, previous_segments)
+    prompt = build_script_prompt(
+        user_input,
+        previous_segments,
+        template_type=template_type,
+        duration=duration,
+        dialogue_mode="guide",
+    )
     try:
         if use_gemini():
             out = gemini_generate_text(prompt)
             j = _ensure_json_block(out)
             segments = parse_segments(j)
         else:
-            segments = fallback_segments(user_input, 0)
+            segments = fallback_segments(user_input, 0, duration=duration)
     except Exception as e:
         print("[chat_qa] error:", e)
         segments = []
@@ -418,7 +499,6 @@ async def chat_qa(req: Request):
     # 清除 session
     QA_SESSIONS.pop(session_id, None)
 
-    # 回傳
     return {
         "session_id": session_id,
         "assistant_message": "我已根據你的回答生成第一版腳本（可再調整）。",
@@ -426,6 +506,7 @@ async def chat_qa(req: Request):
         "done": True,
         "error": None
     }
+
 # ========= /chat_generate =========
 @app.post("/chat_generate")
 async def chat_generate(req: Request):
@@ -436,8 +517,12 @@ async def chat_generate(req: Request):
       messages: [{role, content}],
       previous_segments?: [segment...],
       remember?: bool,
-      mode?: "script" | "copy",    # ← 前端強制帶入避免誤判
-      topic?: str                  # ← 文案主題（可選）
+      mode?: "script" | "copy",          # ← 保留既有：腳本/文案
+      topic?: str,                        # ← 文案主題（可選）
+      dialogue_mode?: "guide" | "free",   # ← 新增：引導/自由 對話風格（可選）
+      template_type?: "A"|"B"|"C"|"D"|"E"|"F",  # ← 新增
+      duration?: 30|60,                   # ← 新增：腳本時長
+      knowledge_hint?: str                # ← 新增：檢索提示詞（可選）
     }
     """
     try:
@@ -453,13 +538,21 @@ async def chat_generate(req: Request):
     explicit_mode = (data.get("mode") or "").strip().lower() or None
     mode = detect_mode(messages, explicit=explicit_mode)
 
+    # NEW: 讀取新參數（後端若沒收到也不影響舊行為）
+    dialogue_mode = (data.get("dialogue_mode") or "").strip().lower() or None
+    template_type = (data.get("template_type") or "").strip().upper() or None
+    try:
+        duration = int(data.get("duration")) if data.get("duration") is not None else None
+    except Exception:
+        duration = None
+    knowledge_hint = (data.get("knowledge_hint") or "").strip() or None
+
     user_input = ""
     for m in reversed(messages):
         if m.get("role") == "user":
             user_input = (m.get("content") or "").strip()
             break
 
-    # 針對 copy 與 script 分流短字提示
     hint = SHORT_HINT_COPY if mode == "copy" else SHORT_HINT_SCRIPT
     if len(user_input) < 6:
         return {
@@ -489,13 +582,20 @@ async def chat_generate(req: Request):
             }
 
         else:  # script
-            prompt = build_script_prompt(user_input, previous_segments)
+            prompt = build_script_prompt(
+                user_input,
+                previous_segments,
+                template_type=template_type,
+                duration=duration,
+                dialogue_mode=dialogue_mode,
+                knowledge_hint=knowledge_hint,
+            )
             if use_gemini():
                 out = gemini_generate_text(prompt)
                 j = _ensure_json_block(out)
                 segments = parse_segments(j)
             else:
-                segments = fallback_segments(user_input, len(previous_segments or []))
+                segments = fallback_segments(user_input, len(previous_segments or []), duration=duration)
 
             resp = {
                 "session_id": data.get("session_id") or "s",
@@ -505,7 +605,7 @@ async def chat_generate(req: Request):
                 "error": None
             }
 
-        # DB 紀錄
+        # DB 紀錄（保留原行為）
         try:
             conn = get_conn()
             cur = conn.cursor()
@@ -546,17 +646,29 @@ async def generate_script(req: Request):
     user_input = (data.get("user_input") or "").strip()
     previous_segments = data.get("previous_segments") or []
 
+    # 向下相容：舊端點若想支援 60s/模板，也可帶入這兩個欄位（可選）
+    template_type = (data.get("template_type") or "").strip().upper() or None
+    try:
+        duration = int(data.get("duration")) if data.get("duration") is not None else None
+    except Exception:
+        duration = None
+
     if len(user_input) < 6:
         return {"segments": [], "error": SHORT_HINT_SCRIPT}
 
     try:
-        prompt = build_script_prompt(user_input, previous_segments)
+        prompt = build_script_prompt(
+            user_input,
+            previous_segments,
+            template_type=template_type,
+            duration=duration
+        )
         if use_gemini():
             out = gemini_generate_text(prompt)
             j = _ensure_json_block(out)
             segments = parse_segments(j)
         else:
-            segments = fallback_segments(user_input, len(previous_segments or []))
+            segments = fallback_segments(user_input, len(previous_segments or []), duration=duration)
         return {"segments": segments, "error": None}
     except Exception as e:
         print("[generate_script] error:", e)
@@ -565,7 +677,6 @@ async def generate_script(req: Request):
 # ========= 匯出：Word 暫停 / Excel 保留 =========
 @app.post("/export/docx")
 async def export_docx_disabled():
-    # 先停用：避免前端誤按導致錯誤；之後要開再實作
     return JSONResponse(status_code=501, content={"error": "docx_export_disabled"})
 
 def _ensure_xlsx():
@@ -616,6 +727,7 @@ async def export_xlsx(req: Request):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": 'attachment; filename="export.xlsx"'}
     )
+
 # ========= CSV 下載 & Google Sheet 連動 =========
 import csv
 import json
@@ -624,7 +736,6 @@ from io import StringIO
 
 @app.get("/download/requests_export.csv")
 def download_requests_csv():
-    """Export the whole 'requests' table as CSV for manual download."""
     export_path = "/data/requests_export.csv"
     conn = get_conn()
     cur = conn.cursor()
@@ -647,10 +758,6 @@ def download_requests_csv():
 
 @app.get("/export/google-sheet")
 def export_for_google_sheet(limit: int = 100):
-    """
-    Simple CSV for Google Sheet:
-      =IMPORTDATA("https://你的網域/export/google-sheet?limit=50")
-    """
     try:
         limit = int(limit)
     except Exception:
@@ -676,20 +783,12 @@ def export_for_google_sheet(limit: int = 100):
 
 @app.get("/export/google-sheet-flat")
 def export_google_sheet_flat(limit: int = 200):
-    """
-    Flattened CSV for Google Sheet, includes common fields from response_json.
-    Usage (Google Sheets):
-      =IMPORTDATA("https://你的網域/export/google-sheet-flat?limit=500")
-    """
-
-    # sanitize limit
     try:
         limit = int(limit)
     except Exception:
         limit = 200
     limit = max(1, min(limit, 2000))
 
-    # fetch rows
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -703,11 +802,9 @@ def export_google_sheet_flat(limit: int = 200):
     rows = cur.fetchall()
     conn.close()
 
-    # prepare csv
     out = StringIO()
     writer = csv.writer(out)
 
-    # columns:
     headers = [
         "id", "created_at", "mode", "user_input",
         "assistant_message",
@@ -738,11 +835,8 @@ def export_google_sheet_flat(limit: int = 200):
 
         try:
             data = json.loads(resp_json or "{}")
-
-            # message
             assistant_message = (data.get("assistant_message") or "")[:500]
 
-            # copy block
             c = data.get("copy") or {}
             if isinstance(c, dict):
                 copy_main = c.get("main_copy") or ""
@@ -754,7 +848,6 @@ def export_google_sheet_flat(limit: int = 200):
                 if isinstance(alts, list):
                     copy_alternates_joined = " | ".join(map(str, alts))
 
-            # segments block
             segs = data.get("segments") or []
             if isinstance(segs, list):
                 segments_count = len(segs)
@@ -792,7 +885,8 @@ def export_google_sheet_flat(limit: int = 200):
         media_type="text/csv",
         headers={"Content-Disposition": "inline; filename=export_flat.csv"},
     )
-# ========= Google Sheet 扁平化（v2：避免快取 & 明確多欄位） =========
+
+# ========= Google Sheet 扁平化（v2） =========
 import csv
 import json
 from io import StringIO
@@ -805,14 +899,12 @@ def export_google_sheet_flat_v2(limit: int = 200):
     在 Google Sheets 使用：
       =IMPORTDATA("https://aijobvideobackend.zeabur.app/export/google-sheet-flat-v2?limit=500")
     """
-    # sanitize limit
     try:
         limit = int(limit)
     except Exception:
         limit = 200
     limit = max(1, min(limit, 2000))
 
-    # 讀資料
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -826,7 +918,6 @@ def export_google_sheet_flat_v2(limit: int = 200):
     rows = cur.fetchall()
     conn.close()
 
-    # 準備 CSV
     out = StringIO()
     writer = csv.writer(out)
 
