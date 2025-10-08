@@ -476,15 +476,22 @@ def download_requests_csv():
 @app.get("/export/google-sheet")
 def export_for_google_sheet(limit: int = 100):
     """
-    給 Google Sheet 用的簡化匯出。
-    可以在 Google Sheet 裡用：
-      =IMPORTDATA("https://你的網域/export/google-sheet?limit=50")
+    Google Sheet 友善版（欄位已攤平，適合直接 IMPORTDATA）
+    例：=IMPORTDATA("https://你的網域/export/google-sheet?limit=50")
     """
+    # 1) 安全處理 limit
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 100
+    limit = max(1, min(limit, 2000))  # 1~2000
+
+    # 2) 讀資料（用字面量避免 sqlite LIMIT 綁定限制）
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, created_at, user_input, mode FROM requests ORDER BY id DESC LIMIT ?",
-        (limit,)
+        f"SELECT id, created_at, user_input, mode, response_json "
+        f"FROM requests ORDER BY id DESC LIMIT {limit}"
     )
     rows = cursor.fetchall()
     conn.close()
@@ -492,17 +499,72 @@ def export_for_google_sheet(limit: int = 100):
     from io import StringIO
     output = StringIO()
     writer = csv.writer(output)
-    writer.writerow(["id", "created_at", "user_input", "mode"])
-    for row in rows:
-        writer.writerow(row)
+
+    # 3) 標題行（常用欄位）
+    writer.writerow([
+        "id", "created_at", "user_input", "mode",
+        # 文案（copy）
+        "copy_main_copy", "copy_alternates", "copy_hashtags", "copy_cta",
+        # 腳本三段（各自的對白/畫面）
+        "hook_dialog", "hook_visual",
+        "value_dialog", "value_visual",
+        "cta_dialog",  "cta_visual"
+    ])
+
+    # 4) 逐列攤平
+    for (_id, created_at, user_input, mode, resp_json) in rows:
+        copy_main = copy_alts = copy_tags = copy_cta = ""
+        hook_d = hook_v = value_d = value_v = cta_d = cta_v = ""
+
+        try:
+            data = json.loads(resp_json or "{}")
+
+            # 文案
+            copy = data.get("copy") or {}
+            if isinstance(copy, dict):
+                copy_main = copy.get("main_copy") or ""
+                alts = copy.get("alternates") or copy.get("openers") or []
+                if isinstance(alts, list):
+                    copy_alts = " | ".join(map(str, alts))
+                tags = copy.get("hashtags") or []
+                if isinstance(tags, list):
+                    copy_tags = " ".join(map(str, tags))
+                copy_cta = copy.get("cta") or ""
+
+            # 腳本（抓 hook / value / cta 三段）
+            segs = data.get("segments") or []
+            if isinstance(segs, list):
+                for s in segs:
+                    t = (s.get("type") or "").lower()
+                    if t == "hook":
+                        hook_d = s.get("dialog", "") or hook_d
+                        hook_v = s.get("visual", "") or hook_v
+                    elif t == "value":
+                        value_d = s.get("dialog", "") or value_d
+                        value_v = s.get("visual", "") or value_v
+                    elif t == "cta":
+                        cta_d = s.get("dialog", "") or cta_d
+                        cta_v = s.get("visual", "") or cta_v
+        except Exception:
+            pass
+
+        writer.writerow([
+            _id, created_at, user_input, mode,
+            copy_main, copy_alts, copy_tags, copy_cta,
+            hook_d, hook_v, value_d, value_v, cta_d, cta_v
+        ])
+
     return Response(content=output.getvalue(), media_type="text/csv")
+
+
 @app.get("/export/google-sheet-flat")
 def export_google_sheet_flat(limit: int = 200):
     """
-    扁平版 CSV：把常用欄位攤平，Google Sheet 直接讀就乾淨。
-    例：=IMPORTDATA("https://aijobvideobackend.zeabur.app/export/google-sheet-flat?limit=200")
+    扁平版 CSV（更完整欄位）：
+    - 文案：main_copy / alternates / hashtags / cta / image_ideas
+    - 段落：hook/value/cta 各自的 start/end/camera/dialog/visual/cta
+    例：=IMPORTDATA("https://你的網域/export/google-sheet-flat?limit=200")
     """
-    import csv
     from io import StringIO
 
     # 1) 安全處理 limit
@@ -512,7 +574,7 @@ def export_google_sheet_flat(limit: int = 200):
         limit = 200
     limit = max(1, min(limit, 2000))  # 1~2000
 
-    # 2) 讀資料（避免 LIMIT ? 綁定問題，這裡用字面量）
+    # 2) 讀資料
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -525,59 +587,93 @@ def export_google_sheet_flat(limit: int = 200):
     # 3) 準備輸出
     out = StringIO()
     writer = csv.writer(out)
+
+    # 完整標題行
     writer.writerow([
         "id","created_at","mode","user_input",
-        "assistant_message",
-        "segments_count",
-        "hook_dialog","value_dialog","cta_dialog",
-        "copy_main_copy","copy_hashtags"
+        "assistant_message","segments_count",
+        # 文案
+        "copy_main_copy","copy_alternates","copy_hashtags","copy_cta","copy_image_ideas",
+        # HOOK
+        "hook_start_sec","hook_end_sec","hook_camera","hook_dialog","hook_visual","hook_cta",
+        # VALUE
+        "value_start_sec","value_end_sec","value_camera","value_dialog","value_visual","value_cta",
+        # CTA
+        "cta_start_sec","cta_end_sec","cta_camera","cta_dialog","cta_visual","cta_cta"
     ])
 
-    for _id, created_at, user_input, mode, resp_json in rows:
+    def _seg_to_tuple(seg: dict):
+        """把單一段落轉成 6 欄（start/end/camera/dialog/visual/cta）"""
+        return (
+            seg.get("start_sec", ""),
+            seg.get("end_sec", ""),
+            seg.get("camera", ""),
+            seg.get("dialog", ""),
+            seg.get("visual", ""),
+            seg.get("cta", ""),
+        )
+
+    for (_id, created_at, user_input, mode, resp_json) in rows:
         assistant_message = ""
-        segments_count = ""
-        hook_dialog = value_dialog = cta_dialog = ""
-        copy_main = ""
-        copy_hashtags = ""
+        segments_count = 0
+        # 文案
+        copy_main = copy_alts = copy_tags = copy_cta = copy_imgs = ""
+
+        # 預設空的三段
+        hook = ("","","","","","")
+        value = ("","","","","","")
+        cta   = ("","","","","","")
 
         try:
             data = json.loads(resp_json or "{}")
-            assistant_message = (data.get("assistant_message") or "")[:500]
+            assistant_message = (data.get("assistant_message") or "")[:800]
 
-            segs = data.get("segments") or []
-            if isinstance(segs, list):
-                segments_count = len(segs)
-
-                def find_dialog(t):
-                    tl = str(t).lower()
-                    for s in segs:
-                        if str(s.get("type","")).lower() == tl:
-                            return s.get("dialog","")
-                    return ""
-
-                hook_dialog  = find_dialog("hook")
-                value_dialog = find_dialog("value")
-                cta_dialog   = find_dialog("cta")
-
+            # 文案
             copy = data.get("copy") or {}
             if isinstance(copy, dict):
                 copy_main = copy.get("main_copy") or ""
+                alts = copy.get("alternates") or copy.get("openers") or []
+                if isinstance(alts, list):
+                    copy_alts = " | ".join(map(str, alts))
                 tags = copy.get("hashtags") or []
                 if isinstance(tags, list):
-                    copy_hashtags = " ".join(map(str, tags))
+                    copy_tags = " ".join(map(str, tags))
+                copy_cta = copy.get("cta") or ""
+                imgs = copy.get("image_ideas") or []
+                if isinstance(imgs, list):
+                    copy_imgs = " | ".join(map(str, imgs))
+
+            # 段落
+            segs = data.get("segments") or []
+            if isinstance(segs, list):
+                segments_count = len(segs)
+                for s in segs:
+                    t = (s.get("type") or "").lower()
+                    if t == "hook":
+                        hook = _seg_to_tuple(s)
+                    elif t == "value":
+                        value = _seg_to_tuple(s)
+                    elif t == "cta":
+                        cta = _seg_to_tuple(s)
         except Exception:
-            # 解析失敗就保持空字串，避免整支掛掉
             pass
 
         writer.writerow([
             _id, created_at, mode, user_input,
             assistant_message, segments_count,
-            hook_dialog, value_dialog, cta_dialog,
-            copy_main, copy_hashtags
+            copy_main, copy_alts, copy_tags, copy_cta, copy_imgs,
+            # HOOK
+            *hook,
+            # VALUE
+            *value,
+            # CTA
+            *cta
         ])
 
     return Response(
         content=out.getvalue(),
         media_type="text/csv",
         headers={"Content-Disposition": "inline; filename=export_flat.csv"}
+    )
+
     )
