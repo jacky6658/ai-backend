@@ -496,32 +496,3 @@ def export_for_google_sheet(limit: int = 100):
     for row in rows:
         writer.writerow(row)
     return Response(content=output.getvalue(), media_type="text/csv")
-@app.get("/export/google-sheet-flat")
-def export_google_sheet_flat(limit: int = 200):
-    """
-    扁平版 CSV：把常用欄位攤平，Google Sheet 直接讀就乾淨。
-    例：=IMPORTDATA("https://aijobvideobackend.zeabur.app/export/google-sheet-flat?limit=200")
-    """
-    import csv
-    from io import StringIO
-
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, created_at, user_input, mode, response_json FROM requests ORDER BY id DESC LIMIT ?",
-        (limit,)
-    )
-    rows = cur.fetchall()
-    conn.close()
-
-    out = StringIO()
-    writer = csv.writer(out)
-    writer.writerow([
-        "id","created_at","mode","user_input",
-        "assistant_message",
-        "segments_count",
-        "hook_dialog","value_dialog","cta_dialog",
-        "copy_main_copy","copy_hashtags"  # 以空白分隔
-    ])
-
-    for _id, created_at, user_input, mode,_
