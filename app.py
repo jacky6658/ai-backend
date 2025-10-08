@@ -452,13 +452,13 @@ from fastapi.responses import FileResponse
 
 @app.get("/download/requests_export.csv")
 def download_requests_csv():
-    """匯出資料庫 requests 表為 CSV 檔，方便手動下載或備份"""
+    """Export the whole 'requests' table as CSV for manual download."""
     export_path = "/data/requests_export.csv"
     conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM requests ORDER BY id DESC")
-    rows = cursor.fetchall()
-    headers = [desc[0] for desc in cursor.description]
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM requests ORDER BY id DESC")
+    rows = cur.fetchall()
+    headers = [desc[0] for desc in cur.description]
     conn.close()
 
     with open(export_path, "w", newline="", encoding="utf-8") as f:
@@ -469,90 +469,36 @@ def download_requests_csv():
     return FileResponse(
         export_path,
         media_type="text/csv",
-        filename="requests_export.csv"
+        filename="requests_export.csv",
     )
 
 
 @app.get("/export/google-sheet")
 def export_for_google_sheet(limit: int = 100):
     """
-    Google Sheet 友善版（欄位已攤平，適合直接 IMPORTDATA）
-    例：=IMPORTDATA("https://你的網域/export/google-sheet?limit=50")
+    Simple CSV for Google Sheet:
+      =IMPORTDATA("https://你的網域/export/google-sheet?limit=50")
     """
-    # 1) 安全處理 limit
     try:
         limit = int(limit)
     except Exception:
         limit = 100
-    limit = max(1, min(limit, 2000))  # 1~2000
+    limit = max(1, min(limit, 2000))
 
-    # 2) 讀資料（用字面量避免 sqlite LIMIT 綁定限制）
     conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        f"SELECT id, created_at, user_input, mode, response_json "
-        f"FROM requests ORDER BY id DESC LIMIT {limit}"
+    cur = conn.cursor()
+    cur.execute(
+        f"SELECT id, created_at, user_input, mode FROM requests ORDER BY id DESC LIMIT {limit}"
     )
-    rows = cursor.fetchall()
+    rows = cur.fetchall()
     conn.close()
 
     from io import StringIO
     output = StringIO()
     writer = csv.writer(output)
-
-    # 3) 標題行（常用欄位）
-    writer.writerow([
-        "id", "created_at", "user_input", "mode",
-        # 文案（copy）
-        "copy_main_copy", "copy_alternates", "copy_hashtags", "copy_cta",
-        # 腳本三段（各自的對白/畫面）
-        "hook_dialog", "hook_visual",
-        "value_dialog", "value_visual",
-        "cta_dialog",  "cta_visual"
-    ])
-
-    # 4) 逐列攤平
-    for (_id, created_at, user_input, mode, resp_json) in rows:
-        copy_main = copy_alts = copy_tags = copy_cta = ""
-        hook_d = hook_v = value_d = value_v = cta_d = cta_v = ""
-
-        try:
-            data = json.loads(resp_json or "{}")
-
-            # 文案
-            copy = data.get("copy") or {}
-            if isinstance(copy, dict):
-                copy_main = copy.get("main_copy") or ""
-                alts = copy.get("alternates") or copy.get("openers") or []
-                if isinstance(alts, list):
-                    copy_alts = " | ".join(map(str, alts))
-                tags = copy.get("hashtags") or []
-                if isinstance(tags, list):
-                    copy_tags = " ".join(map(str, tags))
-                copy_cta = copy.get("cta") or ""
-
-            # 腳本（抓 hook / value / cta 三段）
-            segs = data.get("segments") or []
-            if isinstance(segs, list):
-                for s in segs:
-                    t = (s.get("type") or "").lower()
-                    if t == "hook":
-                        hook_d = s.get("dialog", "") or hook_d
-                        hook_v = s.get("visual", "") or hook_v
-                    elif t == "value":
-                        value_d = s.get("dialog", "") or value_d
-                        value_v = s.get("visual", "") or value_v
-                    elif t == "cta":
-                        cta_d = s.get("dialog", "") or cta_d
-                        cta_v = s.get("visual", "") or cta_v
-        except Exception:
-            pass
-
-        writer.writerow([
-            _id, created_at, user_input, mode,
-            copy_main, copy_alts, copy_tags, copy_cta,
-            hook_d, hook_v, value_d, value_v, cta_d, cta_v
-        ])
+    writer.writerow(["id", "created_at", "user_input", "mode"])
+    for row in rows:
+        writer.writerow(row)
 
     return Response(content=output.getvalue(), media_type="text/csv")
 
@@ -560,120 +506,128 @@ def export_for_google_sheet(limit: int = 100):
 @app.get("/export/google-sheet-flat")
 def export_google_sheet_flat(limit: int = 200):
     """
-    扁平版 CSV（更完整欄位）：
-    - 文案：main_copy / alternates / hashtags / cta / image_ideas
-    - 段落：hook/value/cta 各自的 start/end/camera/dialog/visual/cta
-    例：=IMPORTDATA("https://你的網域/export/google-sheet-flat?limit=200")
+    Flattened CSV for Google Sheet, includes common fields from response_json.
+    Usage (Google Sheets):
+      =IMPORTDATA("https://你的網域/export/google-sheet-flat?limit=500")
     """
     from io import StringIO
 
-    # 1) 安全處理 limit
+    # sanitize limit
     try:
         limit = int(limit)
     except Exception:
         limit = 200
-    limit = max(1, min(limit, 2000))  # 1~2000
+    limit = max(1, min(limit, 2000))
 
-    # 2) 讀資料
+    # fetch rows
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        f"SELECT id, created_at, user_input, mode, response_json "
-        f"FROM requests ORDER BY id DESC LIMIT {limit}"
+        f"""
+        SELECT id, created_at, user_input, mode, response_json
+        FROM requests
+        ORDER BY id DESC
+        LIMIT {limit}
+        """
     )
     rows = cur.fetchall()
     conn.close()
 
-    # 3) 準備輸出
+    # prepare csv
     out = StringIO()
     writer = csv.writer(out)
 
-    # 完整標題行
-    writer.writerow([
-        "id","created_at","mode","user_input",
-        "assistant_message","segments_count",
-        # 文案
-        "copy_main_copy","copy_alternates","copy_hashtags","copy_cta","copy_image_ideas",
-        # HOOK
-        "hook_start_sec","hook_end_sec","hook_camera","hook_dialog","hook_visual","hook_cta",
-        # VALUE
-        "value_start_sec","value_end_sec","value_camera","value_dialog","value_visual","value_cta",
-        # CTA
-        "cta_start_sec","cta_end_sec","cta_camera","cta_dialog","cta_visual","cta_cta"
-    ])
+    # columns:
+    # base
+    headers = [
+        "id", "created_at", "mode", "user_input",
+        "assistant_message",
+    ]
+    # copy fields
+    headers += [
+        "copy_main_copy",
+        "copy_cta",
+        "copy_hashtags",
+        "copy_alternates_joined",
+    ]
+    # script segments (first 3)
+    headers += [
+        "segments_count",
+        "seg1_type", "seg1_start_sec", "seg1_end_sec", "seg1_dialog", "seg1_visual", "seg1_cta",
+        "seg2_type", "seg2_start_sec", "seg2_end_sec", "seg2_dialog", "seg2_visual", "seg2_cta",
+        "seg3_type", "seg3_start_sec", "seg3_end_sec", "seg3_dialog", "seg3_visual", "seg3_cta",
+    ]
+    writer.writerow(headers)
 
-    def _seg_to_tuple(seg: dict):
-        """把單一段落轉成 6 欄（start/end/camera/dialog/visual/cta）"""
-        return (
-            seg.get("start_sec", ""),
-            seg.get("end_sec", ""),
-            seg.get("camera", ""),
-            seg.get("dialog", ""),
-            seg.get("visual", ""),
-            seg.get("cta", ""),
-        )
-
-    for (_id, created_at, user_input, mode, resp_json) in rows:
+    for _id, created_at, user_input, mode, resp_json in rows:
         assistant_message = ""
+        copy_main = ""
+        copy_cta = ""
+        copy_hashtags = ""
+        copy_alternates_joined = ""
         segments_count = 0
-        # 文案
-        copy_main = copy_alts = copy_tags = copy_cta = copy_imgs = ""
 
-        # 預設空的三段
-        hook = ("","","","","","")
-        value = ("","","","","","")
-        cta   = ("","","","","","")
+        # prefill 3 segments
+        def empty_seg():
+            return ["", "", "", "", "", ""]
+        seg1 = empty_seg()
+        seg2 = empty_seg()
+        seg3 = empty_seg()
 
         try:
             data = json.loads(resp_json or "{}")
-            assistant_message = (data.get("assistant_message") or "")[:800]
 
-            # 文案
-            copy = data.get("copy") or {}
-            if isinstance(copy, dict):
-                copy_main = copy.get("main_copy") or ""
-                alts = copy.get("alternates") or copy.get("openers") or []
-                if isinstance(alts, list):
-                    copy_alts = " | ".join(map(str, alts))
-                tags = copy.get("hashtags") or []
+            # message
+            assistant_message = (data.get("assistant_message") or "")[:500]
+
+            # copy block
+            c = data.get("copy") or {}
+            if isinstance(c, dict):
+                copy_main = c.get("main_copy") or ""
+                copy_cta = c.get("cta") or ""
+                tags = c.get("hashtags") or []
                 if isinstance(tags, list):
-                    copy_tags = " ".join(map(str, tags))
-                copy_cta = copy.get("cta") or ""
-                imgs = copy.get("image_ideas") or []
-                if isinstance(imgs, list):
-                    copy_imgs = " | ".join(map(str, imgs))
+                    copy_hashtags = " ".join(map(str, tags))
+                alts = c.get("alternates") or c.get("openers") or []
+                if isinstance(alts, list):
+                    copy_alternates_joined = " | ".join(map(str, alts))
 
-            # 段落
+            # segments block
             segs = data.get("segments") or []
             if isinstance(segs, list):
                 segments_count = len(segs)
-                for s in segs:
-                    t = (s.get("type") or "").lower()
-                    if t == "hook":
-                        hook = _seg_to_tuple(s)
-                    elif t == "value":
-                        value = _seg_to_tuple(s)
-                    elif t == "cta":
-                        cta = _seg_to_tuple(s)
+
+                def to_seg(s):
+                    return [
+                        s.get("type", ""),
+                        s.get("start_sec", ""),
+                        s.get("end_sec", ""),
+                        s.get("dialog", ""),
+                        s.get("visual", ""),
+                        s.get("cta", ""),
+                    ]
+
+                if len(segs) >= 1: seg1 = to_seg(segs[0])
+                if len(segs) >= 2: seg2 = to_seg(segs[1])
+                if len(segs) >= 3: seg3 = to_seg(segs[2])
+
         except Exception:
+            # keep row with blanks if parsing failed
             pass
 
         writer.writerow([
             _id, created_at, mode, user_input,
-            assistant_message, segments_count,
-            copy_main, copy_alts, copy_tags, copy_cta, copy_imgs,
-            # HOOK
-            *hook,
-            # VALUE
-            *value,
-            # CTA
-            *cta
+            assistant_message,
+            copy_main,
+            copy_cta,
+            copy_hashtags,
+            copy_alternates_joined,
+            segments_count,
+            *seg1, *seg2, *seg3,
         ])
 
     return Response(
         content=out.getvalue(),
         media_type="text/csv",
-        headers={"Content-Disposition": "inline; filename=export_flat.csv"}
-    )
-
+        headers={"Content-Disposition": "inline; filename=export_flat.csv"},
     )
