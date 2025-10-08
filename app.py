@@ -13,6 +13,8 @@ from fastapi.responses import JSONResponse, HTMLResponse, Response, StreamingRes
 DB_PATH = os.getenv("DB_PATH", "/data/script_generation.db")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+KNOWLEDGE_TXT_PATH = os.getenv("KNOWLEDGE_TXT_PATH", "/data/kb.txt")
+GLOBAL_KB_TEXT = ""
 
 # ========= App 與 CORS =========
 app = FastAPI(title="AI Script + Copy Backend")
@@ -24,6 +26,92 @@ app.add_middleware(
     allow_methods=["POST", "OPTIONS", "GET"],
     allow_headers=["*"],
 )
+
+# ========= 引導式問答狀態（記憶體暫存） =========
+QA_SESSIONS: Dict[str, Dict[str, Any]] = {}  # key: session_id
+QA_QUESTIONS = [
+    {"key":"structure","q":"【Q1】請選擇腳本結構（A 三段式 / B 問題解決 / C Before-After / D 教學 / E 敘事 / F 爆點連發）"},
+    {"key":"topic","q":"【Q2】請輸入主題或產品名稱"},
+    {"key":"goal","q":"【Q3】主要目標（吸流量 / 教育 / 轉單 / 品牌）"},
+    {"key":"audience","q":"【Q4】目標受眾（年齡/性別/特質/痛點）"},
+    {"key":"hook","q":"【Q6】開場鉤子類型（問句/反差/同理/數字）＋想放的關鍵詞"},
+    {"key":"cta","q":"【Q7】CTA（關注/收藏 / 留言/私訊 / 購買連結）"}
+]
+
+def qa_reset(session_id: str):
+    QA_SESSIONS[session_id] = {"step": 0, "answers": {}}
+
+def qa_next_question(session_id: str) -> Optional[str]:
+    st = QA_SESSIONS.get(session_id)
+    if not st: return None
+    step = st["step"]
+    if step < len(QA_QUESTIONS):
+        return QA_QUESTIONS[step]["q"]
+    return None
+
+def qa_record_answer(session_id: str, user_text: str):
+    st = QA_SESSIONS.get(session_id)
+    if not st: return
+    step = st["step"]
+    if step < len(QA_QUESTIONS):
+        key = QA_QUESTIONS[step]["key"]
+        st["answers"][key] = user_text
+        st["step"] = step + 1
+
+def compose_brief_from_answers(ans: Dict[str,str]) -> str:
+    labels = {
+        "structure":"結構","topic":"主題","goal":"目標","audience":"受眾",
+        "hook":"鉤子","cta":"CTA"
+    }
+    lines = []
+    for it in QA_QUESTIONS:
+        k = it["key"]
+        if k in ans:
+            lines.append(f"{labels.get(k,k)}：{ans[k]}")
+    return "；".join(lines)
+
+# ========= 簡易 KB 檢索 =========
+def load_kb_text() -> str:
+    path = KNOWLEDGE_TXT_PATH
+    try:
+        if os.path.exists(path):
+            with open(path,"r",encoding="utf-8") as f:
+                return f.read()
+    except Exception:
+        pass
+    return ""
+
+def retrieve_context(query: str, max_chars: int = 1200) -> str:
+    text = GLOBAL_KB_TEXT or ""
+    if not text: 
+        return ""
+    # very simple keyword scoring: keep lines that contain any keyword tokens
+    import re
+    # tokens: words > 1 char (Chinese char included)
+    toks = [t for t in re.split(r'[\s，。；、,.:?!\-\/\[\]()]+', (query or "")) if len(t)>=1]
+    # unique
+    toks = list(dict.fromkeys(toks))
+    lines = text.splitlines()
+    scored = []
+    for i, line in enumerate(lines):
+        score = sum(1 for t in toks if t and t in line)
+        if score>0:
+            scored.append((score, i, line))
+    # take top lines keeping order by appearance
+    scored.sort(key=lambda x:(-x[0], x[1]))
+    selected=[]
+    total=0
+    for _, _, ln in scored:
+        if not ln.strip(): 
+            continue
+        take = ln.strip()
+        if total + len(take) + 1 > max_chars:
+            break
+        selected.append(take)
+        total += len(take) + 1
+    if not selected:
+        return text[:max_chars]
+    return "\n".join(selected)
 
 # ========= DB =========
 def _ensure_db_dir(path: str):
@@ -55,6 +143,10 @@ def init_db():
 def on_startup():
     try:
         init_db()
+        # load KB
+        global GLOBAL_KB_TEXT
+        GLOBAL_KB_TEXT = load_kb_text()
+        print(f"[BOOT] KB loaded from {KNOWLEDGE_TXT_PATH} len={len(GLOBAL_KB_TEXT)}")
         print(f"[BOOT] DB ready at {DB_PATH}")
     except Exception as e:
         print("[BOOT] DB init failed:", e)
@@ -74,6 +166,7 @@ def root_page():
       <p>POST <code>/generate_script</code>（舊流程保留）</p>
       <p>POST <code>/export/xlsx</code> 匯出 Excel；<code>/export/docx</code> 暫停（501）。</p>
       <p>文案模式：回傳物件含 <code>image_ideas</code>（圖片/視覺建議）。</p>
+      <p>🧠 引導式問答：POST <code>/chat_qa</code></p>
     </body></html>
     """
 
@@ -95,20 +188,27 @@ BUILTIN_KB_COPY = """
 """
 
 def load_extra_kb(max_chars=2500) -> str:
-    paths = glob.glob("/data/kb*.txt") + glob.glob("/data/*.kb.txt") + glob.glob("/data/knowledge*.txt")
     chunks, total = [], 0
-    for p in paths:
-        try:
-            t = open(p, "r", encoding="utf-8").read().strip()
-            if not t: continue
-            take = (max_chars - total)
-            seg = t[:take]
-            if seg:
-                chunks.append(f"\n[KB:{os.path.basename(p)}]\n{seg}")
-                total += len(seg)
-            if total >= max_chars: break
-        except Exception:
-            pass
+    # 以 GLOBAL_KB_TEXT 為主（你新放的 /data/kb.txt）
+    if GLOBAL_KB_TEXT:
+        seg = GLOBAL_KB_TEXT[:max_chars]
+        chunks.append(f"\n[KB:global]\n{seg}")
+        total += len(seg)
+    else:
+        # 兼容你舊有的自動掃描 /data/kb*.txt
+        paths = glob.glob("/data/kb*.txt") + glob.glob("/data/*.kb.txt") + glob.glob("/data/knowledge*.txt")
+        for p in paths:
+            try:
+                t = open(p, "r", encoding="utf-8").read().strip()
+                if not t: continue
+                take = (max_chars - total)
+                seg = t[:take]
+                if seg:
+                    chunks.append(f"\n[KB:{os.path.basename(p)}]\n{seg}")
+                    total += len(seg)
+                if total >= max_chars: break
+            except Exception:
+                pass
     return "\n".join(chunks)
 
 EXTRA_KB = load_extra_kb()
@@ -184,10 +284,18 @@ def build_script_prompt(user_input: str, previous_segments: List[Dict[str, Any]]
 """
     prev = json.dumps(previous_segments or [], ensure_ascii=False)
     kb = (BUILTIN_KB_SCRIPT + "\n" + (EXTRA_KB or "")).strip()
+    # 依照輸入再從 KB 擷取相關段落
+    try:
+        kb_ctx_dynamic = retrieve_context(user_input)
+    except Exception:
+        kb_ctx_dynamic = ""
     return f"""
 你是短影音腳本顧問。請根據「使用者輸入」與「已接受段落」延續或重寫，輸出 JSON（禁止額外說明文字）。
 
 {kb}
+
+【KB輔助摘錄】（若空白代表無）
+{kb_ctx_dynamic[:1000]}
 
 使用者輸入：
 {user_input}
@@ -256,6 +364,68 @@ def fallback_copy(user_input: str, topic: Optional[str]) -> Dict[str, Any]:
         "image_ideas":["產品近拍 + 生活情境","品牌色背景大字卡","步驟流程示意圖"]
     }
 
+# ========= 引導式問答 API =========
+@app.post("/chat_qa")
+async def chat_qa(req: Request):
+    data = await req.json()
+    session_id = (data.get("session_id") or "qa").strip() or "qa"
+    user_msg = (data.get("message") or "").strip()
+
+    # 初次進入：建立 session 並送歡迎 + Q1
+    if session_id not in QA_SESSIONS:
+        qa_reset(session_id)
+        q = qa_next_question(session_id)
+        return {
+            "session_id": session_id,
+            "assistant_message": "嗨👋 讓我們一步步生成你的短影音腳本！\n" + (q or ""),
+            "segments": [],
+            "done": False,
+            "error": None
+        }
+
+    # 正常流程：記錄上一題的回答
+    qa_record_answer(session_id, user_msg)
+    next_q = qa_next_question(session_id)
+    if next_q:
+        return {
+            "session_id": session_id,
+            "assistant_message": next_q,
+            "segments": [],
+            "done": False,
+            "error": None
+        }
+
+    # 問答完成 → 組合描述 + 取 KB context → 走原有 build_script_prompt
+    ans = QA_SESSIONS.get(session_id, {}).get("answers", {})
+    brief = compose_brief_from_answers(ans)
+    kb_ctx = retrieve_context(brief) or ""
+    user_input = f"{brief}\n\n【KB輔助摘錄】\n{kb_ctx}"
+
+    # 使用原本的 build_script_prompt 與 Gemini 流程
+    previous_segments = []
+    prompt = build_script_prompt(user_input, previous_segments)
+    try:
+        if use_gemini():
+            out = gemini_generate_text(prompt)
+            j = _ensure_json_block(out)
+            segments = parse_segments(j)
+        else:
+            segments = fallback_segments(user_input, 0)
+    except Exception as e:
+        print("[chat_qa] error:", e)
+        segments = []
+
+    # 清除 session
+    QA_SESSIONS.pop(session_id, None)
+
+    # 回傳
+    return {
+        "session_id": session_id,
+        "assistant_message": "我已根據你的回答生成第一版腳本（可再調整）。",
+        "segments": segments,
+        "done": True,
+        "error": None
+    }
 # ========= /chat_generate =========
 @app.post("/chat_generate")
 async def chat_generate(req: Request):
