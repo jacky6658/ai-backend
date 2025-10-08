@@ -446,3 +446,53 @@ async def export_xlsx(req: Request):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": 'attachment; filename="export.xlsx"'}
     )
+# ========= CSV 下載 & Google Sheet 連動 =========
+import csv
+from fastapi.responses import FileResponse
+
+@app.get("/download/requests_export.csv")
+def download_requests_csv():
+    """匯出資料庫 requests 表為 CSV 檔，方便手動下載或備份"""
+    export_path = "/data/requests_export.csv"
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM requests ORDER BY id DESC")
+    rows = cursor.fetchall()
+    headers = [desc[0] for desc in cursor.description]
+    conn.close()
+
+    with open(export_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+    return FileResponse(
+        export_path,
+        media_type="text/csv",
+        filename="requests_export.csv"
+    )
+
+
+@app.get("/export/google-sheet")
+def export_for_google_sheet(limit: int = 100):
+    """
+    給 Google Sheet 用的簡化匯出。
+    可以在 Google Sheet 裡用：
+      =IMPORTDATA("https://你的網域/export/google-sheet?limit=50")
+    """
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, created_at, user_input, mode FROM requests ORDER BY id DESC LIMIT ?",
+        (limit,)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    from io import StringIO
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["id", "created_at", "user_input", "mode"])
+    for row in rows:
+        writer.writerow(row)
+    return Response(content=output.getvalue(), media_type="text/csv")
