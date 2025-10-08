@@ -19,7 +19,7 @@ COPY app.py /app/
 COPY knowledge_text_loader.py /app/
 
 # 放知識庫進容器
-COPY data/kb_shortvideo_pdf.txt /data/kb.txt
+COPY data/data/kb.txt /data/kb.txt
 
 # 你原本的環境變數
 ENV GEMINI_MODEL=gemini-2.5-flash
