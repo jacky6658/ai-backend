@@ -496,3 +496,88 @@ def export_for_google_sheet(limit: int = 100):
     for row in rows:
         writer.writerow(row)
     return Response(content=output.getvalue(), media_type="text/csv")
+@app.get("/export/google-sheet-flat")
+def export_google_sheet_flat(limit: int = 200):
+    """
+    扁平版 CSV：把常用欄位攤平，Google Sheet 直接讀就乾淨。
+    例：=IMPORTDATA("https://aijobvideobackend.zeabur.app/export/google-sheet-flat?limit=200")
+    """
+    import csv
+    from io import StringIO
+
+    # 1) 安全處理 limit
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 200
+    limit = max(1, min(limit, 2000))  # 1~2000
+
+    # 2) 讀資料（避免 LIMIT ? 綁定問題，這裡用字面量）
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        f"SELECT id, created_at, user_input, mode, response_json "
+        f"FROM requests ORDER BY id DESC LIMIT {limit}"
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    # 3) 準備輸出
+    out = StringIO()
+    writer = csv.writer(out)
+    writer.writerow([
+        "id","created_at","mode","user_input",
+        "assistant_message",
+        "segments_count",
+        "hook_dialog","value_dialog","cta_dialog",
+        "copy_main_copy","copy_hashtags"
+    ])
+
+    for _id, created_at, user_input, mode, resp_json in rows:
+        assistant_message = ""
+        segments_count = ""
+        hook_dialog = value_dialog = cta_dialog = ""
+        copy_main = ""
+        copy_hashtags = ""
+
+        try:
+            data = json.loads(resp_json or "{}")
+            assistant_message = (data.get("assistant_message") or "")[:500]
+
+            segs = data.get("segments") or []
+            if isinstance(segs, list):
+                segments_count = len(segs)
+
+                def find_dialog(t):
+                    tl = str(t).lower()
+                    for s in segs:
+                        if str(s.get("type","")).lower() == tl:
+                            return s.get("dialog","")
+                    return ""
+
+                hook_dialog  = find_dialog("hook")
+                value_dialog = find_dialog("value")
+                cta_dialog   = find_dialog("cta")
+
+            copy = data.get("copy") or {}
+            if isinstance(copy, dict):
+                copy_main = copy.get("main_copy") or ""
+                tags = copy.get("hashtags") or []
+                if isinstance(tags, list):
+                    copy_hashtags = " ".join(map(str, tags))
+        except Exception:
+            # 解析失敗就保持空字串，避免整支掛掉
+            pass
+
+        writer.writerow([
+            _id, created_at, mode, user_input,
+            assistant_message, segments_count,
+            hook_dialog, value_dialog, cta_dialog,
+            copy_main, copy_hashtags
+        ])
+
+    return Response(
+        content=out.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "inline; filename=export_flat.csv"}
+    )
