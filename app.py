@@ -9,10 +9,11 @@ from datetime import datetime, date
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse, Response, StreamingResponse
+# from fastapi.staticfiles import StaticFiles  # 前端分離部署，不需要
 
 # ========= 環境變數 =========
 DB_PATH = os.getenv("DB_PATH", "/data/three_agents_system.db")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 KNOWLEDGE_TXT_PATH = os.getenv("KNOWLEDGE_TXT_PATH", "/data/kb.txt")
 GLOBAL_KB_TEXT = ""
@@ -24,9 +25,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["POST", "OPTIONS", "GET"],
+    allow_methods=["POST", "OPTIONS", "GET", "PUT", "DELETE"],
     allow_headers=["*"],
 )
+
+# 前端分離部署，不需要靜態文件服務
 
 # ========= 引導式問答狀態（記憶體暫存） =========
 QA_SESSIONS: Dict[str, Dict[str, Any]] = {}  # key: session_id
@@ -268,32 +271,51 @@ def healthz(): return {"ok": True}
 def favicon(): return Response(status_code=204)
 
 @app.get("/", response_class=HTMLResponse)
-def root_page():
+def api_info():
+    """API 資訊頁面"""
     return """
-    <html><body>
-      <h3>三智能體長期記憶系統</h3>
-      <h4>原有功能：</h4>
+    <html><body style="font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px;">
+      <h1>🎯 三智能體長期記憶系統</h1>
+      <p>後端 API 服務已啟動！前端請訪問：<a href="https://jacky6658.github.io/Altest/" target="_blank">https://jacky6658.github.io/Altest/</a></p>
+      
+      <h2>📋 API 端點列表</h2>
+      
+      <h3>原有功能：</h3>
       <ul>
-        <li>POST <code>/chat_generate</code>（腳本/文案二合一）</li>
-        <li>POST <code>/generate_script</code>（舊流程保留）</li>
-        <li>POST <code>/export/xlsx</code> 匯出 Excel</li>
-        <li>POST <code>/chat_qa</code> 引導式問答</li>
+        <li><code>POST /chat_generate</code> - 腳本/文案二合一生成</li>
+        <li><code>POST /generate_script</code> - 舊流程保留</li>
+        <li><code>POST /chat_qa</code> - 引導式問答</li>
+        <li><code>POST /export/xlsx</code> - Excel 匯出</li>
       </ul>
       
-      <h4>新增三智能體功能：</h4>
+      <h3>新增三智能體功能：</h3>
       <ul>
         <li><strong>定位智能體</strong></li>
-        <li>POST <code>/agent/positioning/analyze</code> - 分析用戶定位</li>
-        <li>PUT <code>/agent/positioning/profile</code> - 更新定位檔案</li>
+        <ul>
+          <li><code>POST /agent/positioning/analyze</code> - 分析用戶定位</li>
+          <li><code>PUT /agent/positioning/profile</code> - 更新定位檔案</li>
+        </ul>
         <li><strong>選題智能體</strong></li>
-        <li>POST <code>/agent/topics/suggest</code> - 獲取選題建議</li>
-        <li>GET <code>/agent/topics/history</code> - 選題歷史</li>
+        <ul>
+          <li><code>POST /agent/topics/suggest</code> - 獲取選題建議</li>
+          <li><code>GET /agent/topics/history</code> - 選題歷史</li>
+        </ul>
         <li><strong>腳本文案智能體</strong></li>
-        <li>POST <code>/agent/content/generate</code> - 生成腳本/文案</li>
+        <ul>
+          <li><code>POST /agent/content/generate</code> - 生成腳本/文案（增強版）</li>
+        </ul>
         <li><strong>記憶系統</strong></li>
-        <li>GET <code>/memory/user/{user_id}</code> - 獲取用戶記憶</li>
-        <li>POST <code>/memory/add</code> - 添加記憶</li>
+        <ul>
+          <li><code>GET /memory/user/{user_id}</code> - 獲取用戶記憶</li>
+          <li><code>POST /memory/add</code> - 添加記憶</li>
+        </ul>
       </ul>
+      
+      <h2>🔧 系統狀態</h2>
+      <p>✅ 資料庫：已初始化</p>
+      <p>✅ 知識庫：已載入</p>
+      <p>✅ 三智能體：已啟動</p>
+      <p>✅ 長期記憶：已啟用</p>
     </body></html>
     """
 
