@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse, HTMLResponse, Response, StreamingRes
 DB_PATH = os.getenv("DB_PATH", "/data/three_agents_system.db")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-KNOWLEDGE_TXT_PATH = os.getenv("KNOWLEDGE_TXT_PATH", "/data/kb.txt")
+KNOWLEDGE_TXT_PATH = os.getenv("KNOWLEDGE_TXT_PATH", "/data/data/kb.txt")
 GLOBAL_KB_TEXT = ""
 
 # ========= App 與 CORS =========
@@ -795,6 +795,69 @@ def extract_key_insights(text: str, agent_type: str) -> List[str]:
     
     return insights[:3]
 
+# === NEW: 粗略從文字中擷取定位欄位 ===
+def extract_profile_fields(text: str) -> Dict[str, Any]:
+    """非常簡易的關鍵字擷取，從用戶敘述或 AI 回應中抓取定位欄位。"""
+    if not text:
+        return {}
+    t = text.strip()
+    import re
+    fields: Dict[str, Any] = {}
+
+    # 業務類型
+    m = re.search(r"(?:業務類型|行業|產業)[:：]\s*([^\n，。,；;]{2,30})", t)
+    if m: fields["business_type"] = m.group(1).strip()
+
+    # 目標受眾
+    m = re.search(r"(?:目標受眾|受眾|TA)[:：]\s*([^\n]{2,80})", t)
+    if m: fields["target_audience"] = m.group(1).strip()
+
+    # 品牌語氣
+    m = re.search(r"(?:品牌語氣|語氣|口吻)[:：]\s*([^\n，。,；;]{2,30})", t)
+    if m: fields["brand_voice"] = m.group(1).strip()
+
+    # 主要平台
+    m = re.search(r"(?:主要平台|核心平台|平台)[:：]\s*([^\n，。,；;]{2,30})", t)
+    if m: fields["primary_platform"] = m.group(1).strip()
+
+    # 內容目標
+    m = re.search(r"(?:內容目標|目標|目的)[:：]\s*([^\n]{2,80})", t)
+    if m: fields["content_goals"] = m.group(1).strip()
+
+    # 發文頻率
+    m = re.search(r"(?:發文頻率|頻率)[:：]\s*([^\n，。,；;]{2,30})", t)
+    if m: fields["posting_frequency"] = m.group(1).strip()
+
+    return fields
+
+# === NEW: 無模型時的自然回覆（參考資料庫） ===
+def natural_fallback_positioning(user_input: str, user_profile: Optional[Dict], memories: List[Dict]) -> str:
+    """在沒有外部模型時，根據用戶檔案與記憶，生成比較自然的建議文本。"""
+    bp = user_profile or {}
+    biz = bp.get("business_type") or "（未設定）"
+    aud = bp.get("target_audience") or "（未設定）"
+    voice = bp.get("brand_voice") or "（未設定）"
+    platform = bp.get("primary_platform") or "（未設定）"
+
+    insights_lines = []
+    for m in (memories or [])[:3]:
+        insights_lines.append(f"- {m.get('content','').strip()}")
+    insights_block = "\n".join(insights_lines) if insights_lines else "（暫無）"
+
+    return (
+        "🔍 初步分析（根據已知檔案與你的描述）\n\n"
+        f"1) 業務類型：{biz}\n"
+        f"2) 目標受眾：{aud}\n"
+        f"3) 品牌語氣建議：{voice if voice!='（未設定）' else '先以清晰、可信、口語為主，後續再微調'}\n"
+        f"4) 平台策略：優先耕耘 {platform if platform!='（未設定）' else '你最熟悉且受眾集中的平台'}，再輔以次要平台做導流。\n"
+        "5) 內容方向：以痛點切入 + 案例/示範 + 明確 CTA。每週固定欄目（例如：教學/開箱/QA/案例）。\n\n"
+        "🧠 近期洞察：\n"
+        f"{insights_block}\n\n"
+        "✅ 下一步：\n"
+        "- 告訴我你的產品/服務一句話＋主要受眾＋希望達成的目標（例如：轉單/曝光/名單）\n"
+        "- 我會據此補齊定位檔案並給你 2 版內容策略草案"
+    )
+
 # ========= 引導式問答 API =========
 @app.post("/chat_qa")
 async def chat_qa(req: Request):
@@ -1364,6 +1427,226 @@ def export_google_sheet_flat_v2(limit: int = 200):
     )
 
 # ========= 三智能體 API 端點 =========
+# 統一聊天端點（自然對談 + KB + 記憶 + 人設）
+AGENT_PERSONAS = {
+    "positioning": "你是專業的影音定位顧問，語氣專業、清楚但口語，避免制式項目清單。",
+    "topics": "你是專業的爆款短影音選題顧問，善用熱點與使用者定位，給具體可操作建議。",
+    "script": "你是專業的AI腳本撰寫寫手，回覆自然且具體，必要時主動詢問補充資訊。",
+}
+
+def _mem_agent_key(agent_type: str) -> str:
+    if agent_type == "positioning":
+        return "positioning"
+    if agent_type == "topics":
+        return "topic_selection"
+    return "script_copy"
+
+@app.post("/chat")
+async def chat(req: Request):
+    """統一聊天：自然對談，帶入用戶檔案/記憶/知識庫。"""
+    try:
+        data = await req.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="invalid_json")
+
+    user_id = (data.get("user_id") or "").strip()
+    agent_type = (data.get("agent_type") or "script").strip()
+    messages = data.get("messages") or []
+    template_type = (data.get("template_type") or "").strip().upper() or None
+    duration = data.get("duration")
+
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+
+    # 確保用戶存在
+    create_or_get_user(user_id)
+
+    # 讀取檔案與記憶
+    user_profile = get_user_profile(user_id)
+    memories = get_user_memories(user_id, agent_type=_mem_agent_key(agent_type), limit=8)
+
+    # 建會話
+    session_id = data.get("session_id") or create_session(user_id, agent_type)
+
+    # 將最近一則 user 訊息加入訊息表
+    last_user = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            last_user = (m.get("content") or "").strip()
+            break
+    if last_user:
+        add_message(session_id, "user", last_user)
+
+    # 人設與 KB ground
+    persona = AGENT_PERSONAS.get(agent_type, AGENT_PERSONAS["script"])
+    kb_ctx = retrieve_context(last_user) if last_user else ""
+    kb_all = (EXTRA_KB or "").strip()
+
+    # 可選：把模板/時長附加到上下文
+    script_hint = ""
+    if agent_type == "script":
+        if template_type:
+            script_hint += f"\n【指定模板】{template_type}"
+        if duration:
+            try:
+                script_hint += f"\n【指定時長】{int(duration)} 秒"
+            except Exception:
+                pass
+
+    system_ctx = (
+        f"{persona}\n請以自然中文對談，不用制式清單。若能從知識庫或用戶檔案得到答案，請優先結合。\n" 
+        f"【用戶檔案（若空代表未設定）】\n{json.dumps(user_profile or {}, ensure_ascii=False)}\n\n"
+        f"【相關記憶（節選）】\n" + "\n".join([f"- {m.get('content','')}" for m in memories[:5]]) + "\n\n"
+        f"【全域知識摘要（截斷）】\n{kb_all[:1200]}\n\n"
+        f"【KB動態擷取】\n{(kb_ctx or '')[:800]}\n" 
+        f"{script_hint}\n"
+    )
+
+    # 產生回覆
+    if use_gemini():
+        prompt = (
+            system_ctx + "\n---\n" + (last_user or "") + "\n\n請以對談形式回覆，避免重覆使用相同句型。"
+        )
+        ai_response = gemini_generate_text(prompt)
+    else:
+        # 無模型的自然回覆（較快）
+        if agent_type == "positioning":
+            ai_response = natural_fallback_positioning(last_user, user_profile, memories)
+        elif agent_type == "topics":
+            base = last_user or "請提供今日的選題靈感"
+            ai_response = (
+                "以下是依你的定位與近期洞察給的選題方向（可回我要哪個展開）：\n\n"
+                "1) 熱點＋你產品的關聯切入\n"
+                "2) 受眾常見痛點的快速解法\n"
+                "3) 使用前/後對比案例\n"
+                "4) 30 秒微教學 + 行動呼籲\n"
+                "5) 迷你訪談/QA 回覆留言\n\n"
+                f"你剛提到：{base[:80]}… 我建議先從 2) 或 4) 開始。"
+            )
+        else:  # script
+            ai_response = (
+                "了解，我會用自然口吻陪你討論腳本。先說明你的主題、平台與目標，我再給你第一版結構與開場。"
+            )
+
+    add_message(session_id, "assistant", ai_response)
+
+    # 嘗試抽取並更新定位檔案（只針對定位）
+    if agent_type == "positioning":
+        try:
+            draft = {}
+            draft.update(extract_profile_fields(last_user))
+            draft.update(extract_profile_fields(ai_response))
+            draft = {k:v for k,v in draft.items() if v}
+            if draft:
+                update_user_profile(user_id, draft)
+                user_profile = get_user_profile(user_id)
+        except Exception as e:
+            print("[/chat] profile extract failed:", e)
+
+    return {
+        "session_id": session_id,
+        "assistant_message": ai_response,
+        "user_profile": user_profile if agent_type == "positioning" else None,
+        "error": None
+    }
+
+# === NEW: 流式聊天端點 ===
+from fastapi import BackgroundTasks
+
+@app.post("/chat_stream")
+async def chat_stream(req: Request):
+    try:
+        data = await req.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="invalid_json")
+
+    user_id = (data.get("user_id") or "").strip()
+    agent_type = (data.get("agent_type") or "script").strip()
+    messages = data.get("messages") or []
+    template_type = (data.get("template_type") or "").strip().upper() or None
+    duration = data.get("duration")
+
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+
+    create_or_get_user(user_id)
+    user_profile = get_user_profile(user_id)
+    memories = get_user_memories(user_id, agent_type=_mem_agent_key(agent_type), limit=8)
+
+    session_id = data.get("session_id") or create_session(user_id, agent_type)
+
+    last_user = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            last_user = (m.get("content") or "").strip()
+            break
+    if last_user:
+        add_message(session_id, "user", last_user)
+
+    persona = AGENT_PERSONAS.get(agent_type, AGENT_PERSONAS["script"])
+    kb_ctx = retrieve_context(last_user) if last_user else ""
+    kb_all = (EXTRA_KB or "").strip()
+    script_hint = ""
+    if agent_type == "script":
+        if template_type:
+            script_hint += f"\n【指定模板】{template_type}"
+        if duration:
+            try:
+                script_hint += f"\n【指定時長】{int(duration)} 秒"
+            except Exception:
+                pass
+
+    system_ctx = (
+        f"{persona}\n請以自然中文對談，不用制式清單。若能從知識庫或用戶檔案得到答案，請優先結合。\n" 
+        f"【用戶檔案（若空代表未設定）】\n{json.dumps(user_profile or {}, ensure_ascii=False)}\n\n"
+        f"【相關記憶（節選）】\n" + "\n".join([f"- {m.get('content','')}" for m in memories[:5]]) + "\n\n"
+        f"【全域知識摘要（截斷）】\n{kb_all[:1200]}\n\n"
+        f"【KB動態擷取】\n{(kb_ctx or '')[:800]}\n" 
+        f"{script_hint}\n"
+    )
+
+    async def gen():
+        # 簡易切片流：若有模型可逐段送出，否則一次送出自然回覆
+        if use_gemini():
+            full = gemini_generate_text(system_ctx + "\n---\n" + (last_user or ""))
+        else:
+            if agent_type == "positioning":
+                full = natural_fallback_positioning(last_user, user_profile, memories)
+            elif agent_type == "topics":
+                base = last_user or "請提供今日的選題靈感"
+                full = (
+                    "以下是依你的定位與近期洞察給的選題方向（可回我要哪個展開）：\n\n"
+                    "1) 熱點＋你產品的關聯切入\n"
+                    "2) 受眾常見痛點的快速解法\n"
+                    "3) 使用前/後對比案例\n"
+                    "4) 30 秒微教學 + 行動呼籲\n"
+                    "5) 迷你訪談/QA 回覆留言\n\n"
+                    f"你剛提到：{base[:80]}… 我建議先從 2) 或 4) 開始。"
+                )
+            else:
+                full = "了解，我會用自然口吻陪你討論腳本。先說明你的主題、平台與目標，我再給你第一版結構與開場。"
+
+        # 逐段輸出
+        chunk_size = 60
+        for i in range(0, len(full), chunk_size):
+            yield full[i:i+chunk_size]
+        # 完成後寫入訊息
+        add_message(session_id, "assistant", full)
+
+        # 定位：嘗試更新檔案
+        if agent_type == "positioning":
+            try:
+                draft = {}
+                draft.update(extract_profile_fields(last_user))
+                draft.update(extract_profile_fields(full))
+                draft = {k:v for k,v in draft.items() if v}
+                if draft:
+                    update_user_profile(user_id, draft)
+            except Exception:
+                pass
+
+    return StreamingResponse(gen(), media_type="text/plain")
+
 
 # 定位智能體
 @app.post("/agent/positioning/analyze")
@@ -1391,11 +1674,11 @@ async def positioning_analyze(req: Request):
         # 生成分析
         analysis_context = positioning_agent_analyze(user_input, user_profile, memories)
         
-        # 調用 AI 生成回應
+        # 調用 AI 生成回應（無模型時提供自然回覆）
         if use_gemini():
             ai_response = gemini_generate_text(analysis_context)
         else:
-            ai_response = "AI服務暫時不可用，請稍後再試。"
+            ai_response = natural_fallback_positioning(user_input, user_profile, memories)
         
         add_message(session_id, "assistant", ai_response)
         
@@ -1404,6 +1687,20 @@ async def positioning_analyze(req: Request):
             key_insights = extract_key_insights(ai_response, "positioning")
             for insight in key_insights:
                 add_memory(user_id, "positioning", "insight", insight, importance_score=7)
+
+        # 從用戶輸入與 AI 回應中嘗試擷取定位欄位，更新檔案（草稿）
+        try:
+            draft_fields = {}
+            draft_fields.update(extract_profile_fields(user_input))
+            draft_fields.update(extract_profile_fields(ai_response))
+            # 過濾空值
+            draft_fields = {k:v for k,v in draft_fields.items() if v}
+            if draft_fields:
+                update_user_profile(user_id, draft_fields)
+                # 重新讀取最新檔案
+                user_profile = get_user_profile(user_id)
+        except Exception as _e:
+            print("[Positioning] extract_profile_fields failed:", _e)
         
         return {
             "session_id": session_id,
