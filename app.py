@@ -4,20 +4,21 @@ import json
 import glob
 import sqlite3
 from typing import List, Optional, Any, Dict
+from datetime import datetime, date
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse, Response, StreamingResponse
 
 # ========= 環境變數 =========
-DB_PATH = os.getenv("DB_PATH", "/data/script_generation.db")
+DB_PATH = os.getenv("DB_PATH", "/data/three_agents_system.db")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 KNOWLEDGE_TXT_PATH = os.getenv("KNOWLEDGE_TXT_PATH", "/data/kb.txt")
 GLOBAL_KB_TEXT = ""
 
 # ========= App 與 CORS =========
-app = FastAPI(title="AI Script + Copy Backend")
+app = FastAPI(title="Three AI Agents System with Long-term Memory")
 
 app.add_middleware(
     CORSMiddleware,
@@ -122,6 +123,8 @@ def init_db():
     _ensure_db_dir(DB_PATH)
     conn = get_conn()
     cur = conn.cursor()
+    
+    # 原有表格
     cur.execute("""
         CREATE TABLE IF NOT EXISTS requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,6 +136,117 @@ def init_db():
             response_json TEXT
         )
     """)
+    
+    # 新增：三智能體系統表格
+    # 1. 用戶基本資訊表
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            email TEXT,
+            name TEXT,
+            platform_preferences TEXT,
+            language_preference TEXT DEFAULT 'zh-TW',
+            timezone TEXT DEFAULT 'Asia/Taipei',
+            status TEXT DEFAULT 'active'
+        )
+    """)
+    
+    # 2. 用戶定位檔案表
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            business_type TEXT,
+            target_audience TEXT,
+            brand_voice TEXT,
+            content_goals TEXT,
+            primary_platform TEXT,
+            secondary_platforms TEXT,
+            posting_frequency TEXT,
+            preferred_topics TEXT,
+            content_styles TEXT,
+            video_duration_preference TEXT,
+            competitors TEXT,
+            unique_value_proposition TEXT,
+            current_followers INTEGER DEFAULT 0,
+            engagement_rate REAL DEFAULT 0.0,
+            FOREIGN KEY (user_id) REFERENCES users(user_id),
+            UNIQUE(user_id)
+        )
+    """)
+    
+    # 3. 會話記錄表
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            agent_type TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'active',
+            context_summary TEXT,
+            key_insights TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        )
+    """)
+    
+    # 4. 對話記錄表
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            metadata TEXT,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+        )
+    """)
+    
+    # 5. 智能體記憶表
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS agent_memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            agent_type TEXT NOT NULL,
+            memory_type TEXT NOT NULL,
+            content TEXT NOT NULL,
+            importance_score INTEGER DEFAULT 5,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_accessed DATETIME DEFAULT CURRENT_TIMESTAMP,
+            access_count INTEGER DEFAULT 1,
+            tags TEXT,
+            related_memories TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        )
+    """)
+    
+    # 6. 選題建議表
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS topic_suggestions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            suggested_date DATE NOT NULL,
+            topics TEXT NOT NULL,
+            reasoning TEXT,
+            user_feedback TEXT,
+            used_count INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(user_id),
+            UNIQUE(user_id, suggested_date)
+        )
+    """)
+    
+    # 建立索引
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_agent ON sessions(user_id, agent_type)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_user_agent ON agent_memories(user_id, agent_type)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_importance ON agent_memories(importance_score DESC)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_topic_suggestions_user_date ON topic_suggestions(user_id, suggested_date)")
+    
     conn.commit()
     conn.close()
 
@@ -157,12 +271,29 @@ def favicon(): return Response(status_code=204)
 def root_page():
     return """
     <html><body>
-      <h3>AI Backend OK</h3>
-      <p>POST <code>/chat_generate</code>（腳本/文案二合一）</p>
-      <p>POST <code>/generate_script</code>（舊流程保留）</p>
-      <p>POST <code>/export/xlsx</code> 匯出 Excel；<code>/export/docx</code> 暫停（501）。</p>
-      <p>文案模式：回傳物件含 <code>image_ideas</code>（圖片/視覺建議）。</p>
-      <p>🧠 引導式問答：POST <code>/chat_qa</code></p>
+      <h3>三智能體長期記憶系統</h3>
+      <h4>原有功能：</h4>
+      <ul>
+        <li>POST <code>/chat_generate</code>（腳本/文案二合一）</li>
+        <li>POST <code>/generate_script</code>（舊流程保留）</li>
+        <li>POST <code>/export/xlsx</code> 匯出 Excel</li>
+        <li>POST <code>/chat_qa</code> 引導式問答</li>
+      </ul>
+      
+      <h4>新增三智能體功能：</h4>
+      <ul>
+        <li><strong>定位智能體</strong></li>
+        <li>POST <code>/agent/positioning/analyze</code> - 分析用戶定位</li>
+        <li>PUT <code>/agent/positioning/profile</code> - 更新定位檔案</li>
+        <li><strong>選題智能體</strong></li>
+        <li>POST <code>/agent/topics/suggest</code> - 獲取選題建議</li>
+        <li>GET <code>/agent/topics/history</code> - 選題歷史</li>
+        <li><strong>腳本文案智能體</strong></li>
+        <li>POST <code>/agent/content/generate</code> - 生成腳本/文案</li>
+        <li><strong>記憶系統</strong></li>
+        <li>GET <code>/memory/user/{user_id}</code> - 獲取用戶記憶</li>
+        <li>POST <code>/memory/add</code> - 添加記憶</li>
+      </ul>
     </body></html>
     """
 
@@ -432,6 +563,215 @@ def fallback_copy(user_input: str, topic: Optional[str]) -> Dict[str, Any]:
         "cta":        "立即點連結 🔗",
         "image_ideas":["產品近拍 + 生活情境","品牌色背景大字卡","步驟流程示意圖"]
     }
+
+# ========= 三智能體系統核心功能 =========
+
+# 用戶管理
+def create_or_get_user(user_id: str, email: str = None, name: str = None) -> Dict:
+    """創建或獲取用戶"""
+    conn = get_conn()
+    conn.row_factory = sqlite3.Row
+    
+    user = conn.execute(
+        "SELECT * FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    
+    if not user:
+        conn.execute(
+            "INSERT INTO users (user_id, email, name) VALUES (?, ?, ?)",
+            (user_id, email, name)
+        )
+        conn.commit()
+        user = conn.execute(
+            "SELECT * FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    
+    conn.close()
+    return dict(user) if user else None
+
+def get_user_profile(user_id: str) -> Optional[Dict]:
+    """獲取用戶定位檔案"""
+    conn = get_conn()
+    conn.row_factory = sqlite3.Row
+    profile = conn.execute(
+        "SELECT * FROM user_profiles WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    conn.close()
+    return dict(profile) if profile else None
+
+def update_user_profile(user_id: str, profile_data: Dict) -> bool:
+    """更新用戶定位檔案"""
+    conn = get_conn()
+    
+    existing = conn.execute(
+        "SELECT id FROM user_profiles WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    
+    if existing:
+        update_fields = []
+        values = []
+        for key, value in profile_data.items():
+            if key != 'user_id' and value is not None:
+                update_fields.append(f"{key} = ?")
+                values.append(json.dumps(value) if isinstance(value, (list, dict)) else str(value))
+        
+        if update_fields:
+            values.append(user_id)
+            sql = f"UPDATE user_profiles SET {', '.join(update_fields)}, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?"
+            conn.execute(sql, values)
+    else:
+        profile_data['user_id'] = user_id
+        fields = list(profile_data.keys())
+        placeholders = ['?' for _ in fields]
+        values = [json.dumps(v) if isinstance(v, (list, dict)) else str(v) for v in profile_data.values()]
+        
+        sql = f"INSERT INTO user_profiles ({', '.join(fields)}) VALUES ({', '.join(placeholders)})"
+        conn.execute(sql, values)
+    
+    conn.commit()
+    conn.close()
+    return True
+
+# 會話管理
+def create_session(user_id: str, agent_type: str) -> str:
+    """創建新會話"""
+    session_id = f"{user_id}_{agent_type}_{int(datetime.now().timestamp())}"
+    conn = get_conn()
+    
+    conn.execute(
+        "INSERT INTO sessions (session_id, user_id, agent_type) VALUES (?, ?, ?)",
+        (session_id, user_id, agent_type)
+    )
+    conn.commit()
+    conn.close()
+    
+    return session_id
+
+def add_message(session_id: str, role: str, content: str, metadata: Dict = None):
+    """添加對話記錄"""
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO messages (session_id, role, content, metadata) VALUES (?, ?, ?, ?)",
+        (session_id, role, content, json.dumps(metadata) if metadata else None)
+    )
+    conn.commit()
+    conn.close()
+
+# 記憶系統
+def add_memory(user_id: str, agent_type: str, memory_type: str, content: str, 
+               importance_score: int = 5, tags: List[str] = None) -> int:
+    """添加記憶"""
+    conn = get_conn()
+    
+    cursor = conn.execute(
+        """INSERT INTO agent_memories 
+           (user_id, agent_type, memory_type, content, importance_score, tags) 
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (user_id, agent_type, memory_type, content, importance_score, 
+         json.dumps(tags) if tags else None)
+    )
+    memory_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    
+    return memory_id
+
+def get_user_memories(user_id: str, agent_type: str = None, memory_type: str = None, 
+                     limit: int = 20) -> List[Dict]:
+    """獲取用戶記憶"""
+    conn = get_conn()
+    conn.row_factory = sqlite3.Row
+    
+    conditions = ["user_id = ?"]
+    params = [user_id]
+    
+    if agent_type:
+        conditions.append("agent_type = ?")
+        params.append(agent_type)
+    
+    if memory_type:
+        conditions.append("memory_type = ?")
+        params.append(memory_type)
+    
+    params.append(limit)
+    
+    sql = f"""SELECT * FROM agent_memories 
+              WHERE {' AND '.join(conditions)} 
+              ORDER BY importance_score DESC, last_accessed DESC 
+              LIMIT ?"""
+    
+    memories = conn.execute(sql, params).fetchall()
+    conn.close()
+    
+    return [dict(memory) for memory in memories]
+
+# 定位智能體
+def positioning_agent_analyze(user_input: str, user_profile: Dict = None, memories: List[Dict] = None) -> str:
+    """定位智能體分析"""
+    context = "你是專業的品牌定位顧問，幫助用戶釐清帳號方向和定位。\n\n"
+    
+    if user_profile:
+        context += f"用戶現有檔案：{json.dumps(user_profile, ensure_ascii=False)}\n\n"
+    
+    if memories:
+        context += f"相關記憶：\n"
+        for memory in memories[:5]:
+            context += f"- {memory['content']}\n"
+        context += "\n"
+    
+    context += f"用戶輸入：{user_input}\n\n"
+    context += """請分析並提供：
+1. 業務類型判斷
+2. 目標受眾分析  
+3. 品牌語氣建議
+4. 內容策略方向
+5. 平台選擇建議
+6. 競爭優勢識別
+
+請以結構化的方式回應，並提出具體可行的建議。"""
+    
+    return context
+
+# 選題智能體
+def topic_selection_agent_generate(user_profile: Dict, memories: List[Dict] = None) -> str:
+    """選題智能體生成建議"""
+    context = f"你是專業的內容選題顧問，為用戶提供每日靈感建議。\n\n"
+    
+    if user_profile:
+        context += f"用戶檔案：\n"
+        context += f"- 業務類型：{user_profile.get('business_type', '未設定')}\n"
+        context += f"- 目標受眾：{user_profile.get('target_audience', '未設定')}\n"
+        context += f"- 品牌語氣：{user_profile.get('brand_voice', '未設定')}\n"
+        context += f"- 主要平台：{user_profile.get('primary_platform', '未設定')}\n\n"
+    
+    if memories:
+        context += f"相關洞察：\n"
+        for memory in memories[:3]:
+            context += f"- {memory['content']}\n"
+        context += "\n"
+    
+    context += """請提供5個具體的內容選題建議，每個選題包含：
+1. 標題/主題
+2. 為什麼適合這個用戶
+3. 預期效果
+4. 創作建議
+5. 相關熱門標籤
+
+考慮當前熱點、季節性、用戶興趣和平台特性。"""
+    
+    return context
+
+def extract_key_insights(text: str, agent_type: str) -> List[str]:
+    """從AI回應中提取關鍵洞察"""
+    insights = []
+    lines = text.split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if len(line) > 20 and any(keyword in line for keyword in ['建議', '應該', '可以', '重點', '關鍵']):
+            insights.append(line)
+    
+    return insights[:3]
 
 # ========= 引導式問答 API =========
 @app.post("/chat_qa")
@@ -1000,3 +1340,399 @@ def export_google_sheet_flat_v2(limit: int = 200):
             "Expires": "0",
         },
     )
+
+# ========= 三智能體 API 端點 =========
+
+# 定位智能體
+@app.post("/agent/positioning/analyze")
+async def positioning_analyze(req: Request):
+    """定位智能體分析用戶定位"""
+    try:
+        data = await req.json()
+        user_id = data.get("user_id")
+        user_input = data.get("user_input", "")
+        
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        
+        # 確保用戶存在
+        create_or_get_user(user_id)
+        
+        # 獲取用戶檔案和相關記憶
+        user_profile = get_user_profile(user_id)
+        memories = get_user_memories(user_id, agent_type="positioning", limit=10)
+        
+        # 創建會話
+        session_id = create_session(user_id, "positioning")
+        add_message(session_id, "user", user_input)
+        
+        # 生成分析
+        analysis_context = positioning_agent_analyze(user_input, user_profile, memories)
+        
+        # 調用 AI 生成回應
+        if use_gemini():
+            ai_response = gemini_generate_text(analysis_context)
+        else:
+            ai_response = "AI服務暫時不可用，請稍後再試。"
+        
+        add_message(session_id, "assistant", ai_response)
+        
+        # 提取關鍵洞察並保存為記憶
+        if ai_response and len(ai_response) > 50:
+            key_insights = extract_key_insights(ai_response, "positioning")
+            for insight in key_insights:
+                add_memory(user_id, "positioning", "insight", insight, importance_score=7)
+        
+        return {
+            "session_id": session_id,
+            "response": ai_response,
+            "user_profile": user_profile,
+            "error": None
+        }
+        
+    except Exception as e:
+        print(f"[Positioning Agent Error] {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal_server_error", "message": str(e)}
+        )
+
+@app.put("/agent/positioning/profile")
+async def update_positioning_profile(req: Request):
+    """更新用戶定位檔案"""
+    try:
+        data = await req.json()
+        user_id = data.get("user_id")
+        profile_data = data.get("profile_data", {})
+        
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        
+        # 確保用戶存在
+        create_or_get_user(user_id)
+        
+        # 更新檔案
+        success = update_user_profile(user_id, profile_data)
+        
+        if success:
+            # 保存檔案更新為記憶
+            add_memory(user_id, "positioning", "profile_update", 
+                      f"用戶檔案已更新：{json.dumps(profile_data, ensure_ascii=False)}", 
+                      importance_score=8)
+        
+        return {
+            "success": success,
+            "message": "檔案更新成功" if success else "檔案更新失敗",
+            "error": None
+        }
+        
+    except Exception as e:
+        print(f"[Profile Update Error] {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal_server_error", "message": str(e)}
+        )
+
+# 選題智能體
+@app.post("/agent/topics/suggest")
+async def topic_suggest(req: Request):
+    """獲取選題建議"""
+    try:
+        data = await req.json()
+        user_id = data.get("user_id")
+        target_date = data.get("target_date")  # YYYY-MM-DD 格式
+        
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        
+        # 確保用戶存在
+        create_or_get_user(user_id)
+        
+        # 解析日期
+        if target_date:
+            try:
+                from datetime import datetime
+                target_date = datetime.strptime(target_date, "%Y-%m-%d").date()
+            except ValueError:
+                from datetime import date
+                target_date = date.today()
+        else:
+            from datetime import date
+            target_date = date.today()
+        
+        # 獲取用戶檔案和相關記憶
+        user_profile = get_user_profile(user_id)
+        memories = get_user_memories(user_id, agent_type="topic_selection", limit=5)
+        
+        # 生成選題建議
+        suggestion_context = topic_selection_agent_generate(user_profile, memories)
+        
+        # 調用 AI 生成選題
+        if use_gemini():
+            ai_response = gemini_generate_text(suggestion_context)
+        else:
+            ai_response = "AI服務暫時不可用，請稍後再試。"
+        
+        # 保存選題建議
+        conn = get_conn()
+        conn.execute(
+            """INSERT OR REPLACE INTO topic_suggestions 
+               (user_id, suggested_date, topics, reasoning) 
+               VALUES (?, ?, ?, ?)""",
+            (user_id, target_date.isoformat(), json.dumps({"suggestions": ai_response}), ai_response)
+        )
+        conn.commit()
+        conn.close()
+        
+        return {
+            "user_id": user_id,
+            "suggested_date": target_date.isoformat(),
+            "suggestions": ai_response,
+            "reasoning": ai_response,
+            "error": None
+        }
+        
+    except Exception as e:
+        print(f"[Topic Selection Error] {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal_server_error", "message": str(e)}
+        )
+
+@app.get("/agent/topics/history")
+async def topic_history(user_id: str, limit: int = 10):
+    """獲取選題歷史"""
+    try:
+        conn = get_conn()
+        conn.row_factory = sqlite3.Row
+        suggestions = conn.execute(
+            "SELECT * FROM topic_suggestions WHERE user_id = ? ORDER BY suggested_date DESC LIMIT ?",
+            (user_id, limit)
+        ).fetchall()
+        conn.close()
+        
+        return {
+            "user_id": user_id,
+            "suggestions": [dict(s) for s in suggestions],
+            "error": None
+        }
+        
+    except Exception as e:
+        print(f"[Topic History Error] {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal_server_error", "message": str(e)}
+        )
+
+# 腳本文案智能體（增強版）
+@app.post("/agent/content/generate")
+async def content_generate(req: Request):
+    """生成腳本或文案（增強版，整合記憶系統）"""
+    try:
+        data = await req.json()
+        user_id = data.get("user_id")
+        user_input = data.get("user_input", "")
+        mode = data.get("mode", "script")  # "script" 或 "copy"
+        template_type = data.get("template_type")
+        duration = data.get("duration")
+        
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        
+        # 確保用戶存在
+        create_or_get_user(user_id)
+        
+        # 獲取用戶檔案和相關記憶
+        user_profile = get_user_profile(user_id)
+        memories = get_user_memories(user_id, agent_type="script_copy", limit=10)
+        
+        # 創建會話
+        session_id = create_session(user_id, "script_copy")
+        add_message(session_id, "user", user_input)
+        
+        # 構建增強的提示詞（整合用戶檔案和記憶）
+        enhanced_input = user_input
+        
+        if user_profile:
+            profile_context = f"""
+【用戶定位檔案】
+- 業務類型：{user_profile.get('business_type', '未設定')}
+- 目標受眾：{user_profile.get('target_audience', '未設定')}
+- 品牌語氣：{user_profile.get('brand_voice', '未設定')}
+- 主要平台：{user_profile.get('primary_platform', '未設定')}
+"""
+            enhanced_input = f"{profile_context}\n\n用戶需求：{user_input}"
+        
+        if memories:
+            memory_context = "\n【相關記憶】\n"
+            for memory in memories[:3]:
+                memory_context += f"- {memory['content']}\n"
+            enhanced_input = f"{enhanced_input}\n\n{memory_context}"
+        
+        # 使用現有的 chat_generate 邏輯，但傳入增強後的輸入
+        enhanced_data = {
+            "user_id": user_id,
+            "session_id": session_id,
+            "messages": [{"role": "user", "content": enhanced_input}],
+            "mode": mode,
+            "template_type": template_type,
+            "duration": duration
+        }
+        
+        # 調用現有的生成邏輯
+        result = await chat_generate_internal(enhanced_data)
+        
+        # 添加記憶
+        if result.get("assistant_message"):
+            add_memory(user_id, "script_copy", "generation", 
+                      f"生成{mode}：{user_input[:100]}...", 
+                      importance_score=6)
+        
+        return result
+        
+    except Exception as e:
+        print(f"[Content Generation Error] {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal_server_error", "message": str(e)}
+        )
+
+# 記憶系統 API
+@app.get("/memory/user/{user_id}")
+async def get_user_memory(user_id: str, agent_type: str = None, memory_type: str = None, limit: int = 20):
+    """獲取用戶記憶"""
+    try:
+        memories = get_user_memories(user_id, agent_type, memory_type, limit)
+        
+        return {
+            "user_id": user_id,
+            "memories": memories,
+            "count": len(memories),
+            "error": None
+        }
+        
+    except Exception as e:
+        print(f"[Memory Retrieval Error] {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal_server_error", "message": str(e)}
+        )
+
+@app.post("/memory/add")
+async def add_memory_endpoint(req: Request):
+    """添加記憶"""
+    try:
+        data = await req.json()
+        user_id = data.get("user_id")
+        agent_type = data.get("agent_type")
+        memory_type = data.get("memory_type")
+        content = data.get("content")
+        importance_score = data.get("importance_score", 5)
+        tags = data.get("tags", [])
+        
+        if not all([user_id, agent_type, memory_type, content]):
+            raise HTTPException(status_code=400, detail="Missing required fields")
+        
+        memory_id = add_memory(user_id, agent_type, memory_type, content, importance_score, tags)
+        
+        return {
+            "memory_id": memory_id,
+            "message": "記憶添加成功",
+            "error": None
+        }
+        
+    except Exception as e:
+        print(f"[Memory Addition Error] {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal_server_error", "message": str(e)}
+        )
+
+# 內部函數：chat_generate 的內部邏輯（供 content_generate 調用）
+async def chat_generate_internal(data: dict):
+    """chat_generate 的內部邏輯，供其他函數調用"""
+    user_id = (data.get("user_id") or "").strip() or "web"
+    messages = data.get("messages") or []
+    previous_segments = data.get("previous_segments") or []
+    topic = (data.get("topic") or "").strip() or None
+
+    explicit_mode = (data.get("mode") or "").strip().lower() or None
+    mode = detect_mode(messages, explicit=explicit_mode)
+
+    dialogue_mode = (data.get("dialogue_mode") or "").strip().lower() or None
+    template_type = (data.get("template_type") or "").strip().upper() or None
+    try:
+        duration = int(data.get("duration")) if data.get("duration") is not None else None
+    except Exception:
+        duration = None
+    knowledge_hint = (data.get("knowledge_hint") or "").strip() or None
+
+    user_input = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            user_input = (m.get("content") or "").strip()
+            break
+
+    hint = SHORT_HINT_COPY if mode == "copy" else SHORT_HINT_SCRIPT
+    if len(user_input) < 6:
+        return {
+            "session_id": data.get("session_id") or "s",
+            "assistant_message": hint,
+            "segments": [],
+            "copy": None,
+            "error": None
+        }
+
+    try:
+        if mode == "copy":
+            prompt = build_copy_prompt(user_input, topic)
+            if use_gemini():
+                out = gemini_generate_text(prompt)
+                j = _ensure_json_block(out)
+                copy = parse_copy(j)
+            else:
+                copy = fallback_copy(user_input, topic)
+
+            resp = {
+                "session_id": data.get("session_id") or "s",
+                "assistant_message": "我先給你第一版完整貼文（可再加要求，我會幫你改得更貼近風格）。",
+                "segments": [],
+                "copy": copy,
+                "error": None
+            }
+
+        else:  # script
+            prompt = build_script_prompt(
+                user_input,
+                previous_segments,
+                template_type=template_type,
+                duration=duration,
+                dialogue_mode=dialogue_mode,
+                knowledge_hint=knowledge_hint,
+            )
+            if use_gemini():
+                out = gemini_generate_text(prompt)
+                j = _ensure_json_block(out)
+                segments = parse_segments(j)
+            else:
+                segments = fallback_segments(user_input, len(previous_segments or []), duration=duration)
+
+            resp = {
+                "session_id": data.get("session_id") or "s",
+                "assistant_message": "我先給你第一版完整腳本（可再加要求，我會幫你改得更貼近風格）。",
+                "segments": segments,
+                "copy": None,
+                "error": None
+            }
+
+        return resp
+
+    except Exception as e:
+        print("[chat_generate_internal] error:", e)
+        return {
+            "session_id": data.get("session_id") or "s",
+            "assistant_message": "伺服器忙碌，稍後再試",
+            "segments": [],
+            "copy": None,
+            "error": "internal_server_error"
+        }
