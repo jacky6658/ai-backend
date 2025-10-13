@@ -729,8 +729,8 @@ def get_user_memories(user_id: str, agent_type: str = None, memory_type: str = N
 
 # 定位智能體
 def positioning_agent_analyze(user_input: str, user_profile: Dict = None, memories: List[Dict] = None) -> str:
-    """定位智能體分析"""
-    context = "你是專業的品牌定位顧問，幫助用戶釐清帳號方向和定位。\n\n"
+    """定位智能體分析 - 提供結構化定位選項"""
+    context = "你是專業的短影音定位顧問，幫助用戶快速建立清晰的帳號定位。\n\n"
     
     if user_profile:
         context += f"用戶現有檔案：{json.dumps(user_profile, ensure_ascii=False)}\n\n"
@@ -758,21 +758,27 @@ def positioning_agent_analyze(user_input: str, user_profile: Dict = None, memori
     if not user_profile or not user_profile.get('posting_frequency'):
         missing_fields.append("發文頻率")
     
-    if missing_fields:
-        context += f"【重要】用戶的定位檔案還缺少以下欄位：{', '.join(missing_fields)}。請在回覆中：\n"
-        context += "1. 先回答用戶的問題\n"
-        context += "2. 然後主動引導用戶提供缺少的資訊\n"
-        context += "3. 在回覆中明確標示「業務類型：」「目標受眾：」等欄位，方便系統自動提取\n\n"
-    
-    context += """請分析並提供：
-1. 業務類型判斷
-2. 目標受眾分析  
-3. 品牌語氣建議
-4. 內容策略方向
-5. 平台選擇建議
-6. 競爭優勢識別
+    context += """【重要】請以結構化方式回應，提供具體的定位選項供用戶選擇：
 
-請以結構化的方式回應，並提出具體可行的建議。"""
+1. 先分析用戶的業務/產品/服務
+2. 提供 2-3 個具體的定位方向選項（每個選項包含：業務類型、目標受眾、品牌語氣、主要平台、內容目標、發文頻率）
+3. 每個選項要簡潔明確，便於用戶快速理解
+4. 在回覆中明確標示「業務類型：」「目標受眾：」等欄位，方便系統自動提取
+5. 最後引導用戶選擇最適合的定位方向
+
+格式範例：
+【定位選項 A】
+業務類型：XXX
+目標受眾：XXX
+品牌語氣：XXX
+主要平台：XXX
+內容目標：XXX
+發文頻率：XXX
+
+【定位選項 B】
+...
+
+請選擇最適合的定位方向（A/B/C），我會幫你完善細節。"""
     
     return context
 
@@ -1884,6 +1890,95 @@ async def get_agent_notes(user_id: str, agent_type: str, memory_type: str = "not
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
+
+# 新增：一鍵生成定位功能
+@app.post("/agent/positioning/generate")
+async def generate_positioning(req: Request):
+    """一鍵生成完整定位檔案"""
+    try:
+        data = await req.json()
+        user_id = data.get("user_id")
+        theme = data.get("theme", "")  # 用戶提供的主題/產品/服務
+        
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        
+        if not theme.strip():
+            raise HTTPException(status_code=400, detail="theme is required")
+        
+        # 確保用戶存在
+        create_or_get_user(user_id)
+        
+        # 獲取現有檔案和記憶
+        user_profile = get_user_profile(user_id)
+        memories = get_user_memories(user_id, agent_type="positioning", limit=5)
+        
+        # 創建會話
+        session_id = create_session(user_id, "positioning")
+        add_message(session_id, "user", f"一鍵生成定位：{theme}")
+        
+        # 構建一鍵生成提示詞
+        context = f"""你是專業的短影音定位顧問，請根據用戶提供的主題「{theme}」生成完整的定位檔案。
+
+請分析這個主題並提供：
+1. 業務類型：具體的行業分類
+2. 目標受眾：明確的受眾畫像（年齡、職業、痛點、需求）
+3. 品牌語氣：適合的溝通風格
+4. 主要平台：最適合的短影音平台
+5. 內容目標：具體要達成的效果
+6. 發文頻率：建議的更新頻率
+
+請以結構化格式回應，每個欄位都要具體明確，便於系統自動提取。
+
+格式：
+業務類型：[具體分類]
+目標受眾：[詳細描述]
+品牌語氣：[風格特點]
+主要平台：[平台名稱]
+內容目標：[具體目標]
+發文頻率：[頻率建議]"""
+        
+        # 調用 AI 生成定位
+        if use_gemini():
+            ai_response = gemini_generate_text(context)
+        else:
+            # 無模型時的範例回覆
+            ai_response = f"""根據「{theme}」主題，我為你生成以下定位：
+
+業務類型：{theme}相關服務
+目標受眾：對{theme}有興趣的潛在客戶
+品牌語氣：專業親切
+主要平台：抖音/小紅書
+內容目標：建立專業形象，吸引潛在客戶
+發文頻率：每週2-3次"""
+        
+        add_message(session_id, "assistant", ai_response)
+        
+        # 提取定位欄位並更新檔案
+        extracted_fields = extract_profile_fields(ai_response)
+        if extracted_fields:
+            update_user_profile(user_id, extracted_fields)
+            # 重新讀取最新檔案
+            user_profile = get_user_profile(user_id)
+        
+        # 保存 AI 回應為筆記
+        if ai_response and len(ai_response) > 50:
+            add_memory(user_id, "positioning", "note", ai_response, importance_score=8)
+        
+        return {
+            "session_id": session_id,
+            "response": ai_response,
+            "user_profile": user_profile,
+            "extracted_fields": extracted_fields,
+            "error": None
+        }
+        
+    except Exception as e:
+        print(f"[Generate Positioning Error] {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal_server_error", "message": str(e)}
+        )
 
 # 選題智能體
 @app.post("/agent/topics/suggest")
