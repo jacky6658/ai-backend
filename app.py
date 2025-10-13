@@ -730,7 +730,7 @@ def get_user_memories(user_id: str, agent_type: str = None, memory_type: str = N
 # 定位智能體
 def positioning_agent_analyze(user_input: str, user_profile: Dict = None, memories: List[Dict] = None) -> str:
     """定位智能體分析 - 提供結構化定位選項"""
-    context = "你是專業的短影音定位顧問，幫助用戶快速建立清晰的帳號定位。\n\n"
+    context = "你是專業的短影音定位顧問，專門服務台灣市場，幫助用戶快速建立清晰的帳號定位。\n\n"
     
     if user_profile:
         context += f"用戶現有檔案：{json.dumps(user_profile, ensure_ascii=False)}\n\n"
@@ -764,14 +764,15 @@ def positioning_agent_analyze(user_input: str, user_profile: Dict = None, memori
 2. 提供 2-3 個具體的定位方向選項（每個選項包含：業務類型、目標受眾、品牌語氣、主要平台、內容目標、發文頻率）
 3. 每個選項要簡潔明確，便於用戶快速理解
 4. 在回覆中明確標示「業務類型：」「目標受眾：」等欄位，方便系統自動提取
-5. 最後提供 1-2 個具體的後續問題，引導用戶繼續對話
+5. 平台推薦請專注於台灣用戶常用平台：Instagram Reels、TikTok、YouTube Shorts、Facebook Reels
+6. 最後提供 1-2 個具體的後續問題，引導用戶繼續對話
 
 格式範例：
 【定位選項 A】
 業務類型：XXX
 目標受眾：XXX
 品牌語氣：XXX
-主要平台：XXX
+主要平台：Instagram Reels（台灣用戶最活躍）
 內容目標：XXX
 發文頻率：XXX
 
@@ -1921,15 +1922,17 @@ async def generate_positioning(req: Request):
         add_message(session_id, "user", f"一鍵生成定位：{theme}")
         
         # 構建一鍵生成提示詞
-        context = f"""你是專業的短影音定位顧問，請根據用戶提供的主題「{theme}」生成完整的定位檔案。
+        context = f"""你是專業的短影音定位顧問，專門服務台灣市場，請根據用戶提供的主題「{theme}」生成完整的定位檔案。
 
 請分析這個主題並提供：
 1. 業務類型：具體的行業分類
-2. 目標受眾：明確的受眾畫像（年齡、職業、痛點、需求）
-3. 品牌語氣：適合的溝通風格
-4. 主要平台：最適合的短影音平台
+2. 目標受眾：明確的台灣受眾畫像（年齡、職業、痛點、需求）
+3. 品牌語氣：適合台灣用戶的溝通風格
+4. 主要平台：台灣最適合的短影音平台（推薦：Instagram Reels、TikTok、YouTube Shorts、Facebook Reels）
 5. 內容目標：具體要達成的效果
 6. 發文頻率：建議的更新頻率
+
+【重要】平台推薦請專注於台灣用戶常用的平台，避免推薦B站、小紅書等大陸平台。
 
 請以結構化格式回應，每個欄位都要具體明確，便於系統自動提取。
 
@@ -1949,9 +1952,9 @@ async def generate_positioning(req: Request):
             ai_response = f"""根據「{theme}」主題，我為你生成以下定位：
 
 業務類型：{theme}相關服務
-目標受眾：對{theme}有興趣的潛在客戶
+目標受眾：對{theme}有興趣的台灣潛在客戶
 品牌語氣：專業親切
-主要平台：抖音/小紅書
+主要平台：Instagram Reels
 內容目標：建立專業形象，吸引潛在客戶
 發文頻率：每週2-3次"""
         
