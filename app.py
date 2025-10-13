@@ -764,7 +764,7 @@ def positioning_agent_analyze(user_input: str, user_profile: Dict = None, memori
 2. 提供 2-3 個具體的定位方向選項（每個選項包含：業務類型、目標受眾、品牌語氣、主要平台、內容目標、發文頻率）
 3. 每個選項要簡潔明確，便於用戶快速理解
 4. 在回覆中明確標示「業務類型：」「目標受眾：」等欄位，方便系統自動提取
-5. 最後引導用戶選擇最適合的定位方向
+5. 最後提供 1-2 個具體的後續問題，引導用戶繼續對話
 
 格式範例：
 【定位選項 A】
@@ -778,7 +778,10 @@ def positioning_agent_analyze(user_input: str, user_profile: Dict = None, memori
 【定位選項 B】
 ...
 
-請選擇最適合的定位方向（A/B/C），我會幫你完善細節。"""
+💡 接下來你可以：
+1. 選擇最適合的定位方向（A/B/C），我會幫你完善細節
+2. 告訴我你的品牌想要傳達什麼形象和語氣？
+3. 你還有其他想了解的定位問題嗎？"""
     
     return context
 
