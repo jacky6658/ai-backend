@@ -490,15 +490,28 @@ def build_script_prompt(
         mode_line = "語氣偏引導，逐步釐清要素後直接給出完整分段；"
 
     return f"""
-你是短影音腳本顧問。{mode_line}請根據「使用者輸入」與「已接受段落」延續或重寫，輸出 JSON（禁止額外說明文字）。
+你是專業的短影音腳本顧問，專門服務台灣市場。{mode_line}請根據「使用者輸入」與「已接受段落」延續或重寫，輸出 JSON（禁止額外說明文字）。
 
+📋 回應格式要求：
+• 使用emoji作為分點符號，讓內容更易讀
+• 段落分明，重點突出
+• 提供具體實作方式
+
+🎯 腳本生成原則：
 【選擇的模板】{tmpl or "（未指定）"}：{tmpl_text}
 【時長要求】{int(duration) if duration else "（未指定，預設 30）"} 秒。{duration_note}
 
+📚 短影音知識庫：
 {kb}
 
 【KB輔助摘錄】（若空白代表無）
 {kb_ctx_dynamic[:1000]}
+
+💡 台灣市場特色：
+• 平台推薦：Instagram Reels、TikTok、YouTube Shorts、Facebook Reels
+• 內容風格：生活化、親切、實用
+• 節奏要求：2-3秒換畫面，節奏緊湊
+• Hook原則：0-5秒直給結論，用大字卡與強情緒表情
 
 使用者輸入：
 {user_input}
@@ -760,29 +773,41 @@ def positioning_agent_analyze(user_input: str, user_profile: Dict = None, memori
     
     context += """【重要】請以結構化方式回應，提供具體的定位選項供用戶選擇：
 
-1. 先分析用戶的業務/產品/服務
-2. 提供 2-3 個具體的定位方向選項（每個選項包含：業務類型、目標受眾、品牌語氣、主要平台、內容目標、發文頻率）
-3. 每個選項要簡潔明確，便於用戶快速理解
-4. 在回覆中明確標示「業務類型：」「目標受眾：」等欄位，方便系統自動提取
-5. 平台推薦請專注於台灣用戶常用平台：Instagram Reels、TikTok、YouTube Shorts、Facebook Reels
-6. 最後提供 1-2 個具體的後續問題，引導用戶繼續對話
+📋 回應格式要求：
+• 使用emoji作為分點符號，讓內容更易讀
+• 段落分明，重點突出
+• 提供具體實作方式
+• 在回覆中明確標示「業務類型：」「目標受眾：」等欄位，方便系統自動提取
 
-格式範例：
-【定位選項 A】
-業務類型：XXX
-目標受眾：XXX
-品牌語氣：XXX
-主要平台：Instagram Reels（台灣用戶最活躍）
-內容目標：XXX
-發文頻率：XXX
+🎯 分析步驟：
+1️⃣ 先分析用戶的業務/產品/服務
+2️⃣ 提供 2-3 個具體的定位方向選項
+3️⃣ 每個選項包含完整6個欄位
+4️⃣ 平台推薦專注於台灣用戶常用平台：Instagram Reels、TikTok、YouTube Shorts、Facebook Reels
+5️⃣ 提供具體實作建議
+6️⃣ 最後提供 1-2 個後續問題引導
 
-【定位選項 B】
+📝 格式範例：
+【🎯 定位選項 A】
+📊 業務類型：XXX
+👥 目標受眾：XXX  
+🎭 品牌語氣：XXX
+📱 主要平台：Instagram Reels（台灣用戶最活躍）
+🎯 內容目標：XXX
+⏰ 發文頻率：XXX
+
+💡 實作建議：
+• 具體的內容策略
+• 平台操作要點
+• 預期效果
+
+【🎯 定位選項 B】
 ...
 
-💡 接下來你可以：
-1. 選擇最適合的定位方向（A/B/C），我會幫你完善細節
-2. 告訴我你的品牌想要傳達什麼形象和語氣？
-3. 你還有其他想了解的定位問題嗎？"""
+🤔 接下來你可以：
+1️⃣ 選擇最適合的定位方向（A/B/C），我會幫你完善細節
+2️⃣ 告訴我你的品牌想要傳達什麼形象和語氣？
+3️⃣ 你還有其他想了解的定位問題嗎？"""
     
     return context
 
@@ -804,14 +829,25 @@ def topic_selection_agent_generate(user_profile: Dict, memories: List[Dict] = No
             context += f"- {memory['content']}\n"
         context += "\n"
     
-    context += """請提供5個具體的內容選題建議，每個選題包含：
-1. 標題/主題
-2. 為什麼適合這個用戶
-3. 預期效果
-4. 創作建議
-5. 相關熱門標籤
+    context += """📋 回應格式要求：
+• 使用emoji作為分點符號，讓內容更易讀
+• 段落分明，重點突出
+• 提供具體實作方式
 
-考慮當前熱點、季節性、用戶興趣和平台特性。"""
+🎯 請提供5個具體的內容選題建議，每個選題包含：
+
+📝 選題結構：
+1️⃣ 標題/主題
+2️⃣ 為什麼適合這個用戶
+3️⃣ 預期效果
+4️⃣ 創作建議
+5️⃣ 相關熱門標籤
+
+💡 實作要點：
+• 考慮當前熱點、季節性、用戶興趣和平台特性
+• 提供具體的拍攝建議
+• 包含Hook、Value、CTA結構
+• 適合台灣用戶的內容風格"""
     
     return context
 
@@ -1742,13 +1778,26 @@ async def chat_stream(req: Request):
                     add_memory(user_id, "positioning", "note", note[:800], importance_score=6)
             except Exception:
                 pass
-        # 選題：把回覆存成筆記
+        # 選題：把回覆存成筆記並保存選題建議
         elif agent_type == "topics":
             try:
                 note = (full or "").strip()
                 if note:
                     add_memory(user_id, "topic_selection", "note", note[:800], importance_score=6)
-            except Exception:
+                    
+                    # 保存選題建議到資料庫
+                    from datetime import date
+                    conn = get_conn()
+                    conn.execute(
+                        """INSERT OR REPLACE INTO topic_suggestions 
+                           (user_id, suggested_date, topics, reasoning) 
+                           VALUES (?, ?, ?, ?)""",
+                        (user_id, date.today().isoformat(), json.dumps({"suggestions": note}), note)
+                    )
+                    conn.commit()
+                    conn.close()
+            except Exception as e:
+                print(f"[Topics Save Error] {e}")
                 pass
         # 腳本：把回覆存成筆記
         elif agent_type == "script":
@@ -2196,6 +2245,115 @@ async def add_memory_endpoint(req: Request):
         
     except Exception as e:
         print(f"[Memory Addition Error] {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal_server_error", "message": str(e)}
+        )
+
+# 新增：一鍵生成腳本功能
+@app.post("/agent/script/generate")
+async def generate_script_one_click(req: Request):
+    """一鍵生成腳本功能"""
+    try:
+        data = await req.json()
+        user_id = data.get("user_id")
+        theme = data.get("theme", "")  # 用戶提供的主題/文字
+        template_type = data.get("template_type", "A")  # 預設三段式
+        duration = data.get("duration", 30)  # 預設30秒
+        
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        
+        if not theme.strip():
+            raise HTTPException(status_code=400, detail="theme is required")
+        
+        # 確保用戶存在
+        create_or_get_user(user_id)
+        
+        # 獲取用戶檔案和相關記憶
+        user_profile = get_user_profile(user_id)
+        memories = get_user_memories(user_id, agent_type="script_copy", limit=10)
+        
+        # 創建會話
+        session_id = create_session(user_id, "script_copy")
+        add_message(session_id, "user", f"一鍵生成腳本：{theme}")
+        
+        # 構建一鍵生成提示詞
+        context = f"""你是專業的短影音腳本顧問，專門服務台灣市場。請根據用戶提供的主題「{theme}」生成完整的腳本。
+
+📋 回應格式要求：
+• 使用emoji作為分點符號，讓內容更易讀
+• 段落分明，重點突出
+• 提供具體實作方式
+
+🎯 腳本生成原則：
+【模板】{template_type}：{TEMPLATE_GUIDE.get(template_type, "三段式")}
+【時長】{duration} 秒
+【平台】Instagram Reels、TikTok、YouTube Shorts、Facebook Reels
+
+📚 短影音知識庫：
+{BUILTIN_KB_SCRIPT}
+
+💡 台灣市場特色：
+• 內容風格：生活化、親切、實用
+• 節奏要求：2-3秒換畫面，節奏緊湊
+• Hook原則：0-5秒直給結論，用大字卡與強情緒表情
+• 語氣：堅定、直給結論，避免口癖贅字
+
+請生成完整的腳本，包含Hook、Value、CTA結構，並以JSON格式輸出。
+
+JSON格式：
+{{
+  "segments":[
+    {{"type":"hook","start_sec":0,"end_sec":5,"camera":"CU","dialog":"...","visual":"...","cta":""}},
+    {{"type":"value","start_sec":5,"end_sec":25,"camera":"MS","dialog":"...","visual":"...","cta":""}},
+    {{"type":"cta","start_sec":25,"end_sec":30,"camera":"WS","dialog":"...","visual":"...","cta":"..."}}
+  ]
+}}"""
+        
+        # 調用 AI 生成腳本
+        if use_gemini():
+            ai_response = gemini_generate_text(context)
+        else:
+            # 無模型時的範例回覆
+            ai_response = f"""根據「{theme}」主題，我為你生成以下腳本：
+
+{{
+  "segments":[
+    {{"type":"hook","start_sec":0,"end_sec":5,"camera":"CU","dialog":"你知道{theme}的秘密嗎？","visual":"大字卡+驚訝表情","cta":""}},
+    {{"type":"value","start_sec":5,"end_sec":25,"camera":"MS","dialog":"今天我要分享{theme}的實用技巧，讓你輕鬆掌握！","visual":"示範畫面","cta":""}},
+    {{"type":"cta","start_sec":25,"end_sec":30,"camera":"WS","dialog":"想要更多{theme}技巧，記得關注我！","visual":"關注按鈕","cta":"點關注"}}
+  ]
+}}"""
+        
+        add_message(session_id, "assistant", ai_response)
+        
+        # 解析腳本
+        try:
+            if use_gemini():
+                segments = parse_segments(ai_response)
+            else:
+                # 解析範例回覆
+                import json
+                data = json.loads(ai_response)
+                segments = data.get("segments", [])
+        except Exception as e:
+            print(f"[Script Parse Error] {e}")
+            segments = []
+        
+        # 保存腳本生成為筆記
+        if ai_response and len(ai_response) > 50:
+            add_memory(user_id, "script_copy", "note", ai_response, importance_score=8)
+        
+        return {
+            "session_id": session_id,
+            "assistant_message": "🚀 一鍵生成完成！我為你生成了完整的腳本。",
+            "segments": segments,
+            "error": None
+        }
+        
+    except Exception as e:
+        print(f"[One-Click Script Generation Error] {e}")
         return JSONResponse(
             status_code=500,
             content={"error": "internal_server_error", "message": str(e)}
