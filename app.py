@@ -1605,10 +1605,27 @@ async def chat_stream(req: Request):
         f"{script_hint}\n"
     )
 
+    # 取得最近對話以增強上下文連貫
+    def get_recent_messages(session_id: str, limit: int = 8):
+        try:
+            conn = get_conn()
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+            conn.close()
+            return list(reversed([dict(r) for r in rows]))
+        except Exception:
+            return []
+
+    recent_msgs = get_recent_messages(session_id, 8)
+
     async def gen():
         # 簡易切片流：若有模型可逐段送出，否則一次送出自然回覆
         if use_gemini():
-            full = gemini_generate_text(system_ctx + "\n---\n" + (last_user or ""))
+            convo = "\n".join([f"{m['role']}: {m['content']}" for m in recent_msgs])
+            full = gemini_generate_text(system_ctx + "\n---\n" + (convo or (last_user or "")))
         else:
             if agent_type == "positioning":
                 full = natural_fallback_positioning(last_user, user_profile, memories)
@@ -1633,7 +1650,7 @@ async def chat_stream(req: Request):
         # 完成後寫入訊息
         add_message(session_id, "assistant", full)
 
-        # 定位：嘗試更新檔案
+        # 定位：嘗試更新檔案並把回覆摘要存成筆記
         if agent_type == "positioning":
             try:
                 draft = {}
@@ -1642,6 +1659,26 @@ async def chat_stream(req: Request):
                 draft = {k:v for k,v in draft.items() if v}
                 if draft:
                     update_user_profile(user_id, draft)
+                # 存成「note」型記憶，供前端右側筆記本顯示
+                note = (full or "").strip()
+                if note:
+                    add_memory(user_id, "positioning", "note", note[:800], importance_score=6)
+            except Exception:
+                pass
+        # 選題：把回覆存成筆記
+        elif agent_type == "topics":
+            try:
+                note = (full or "").strip()
+                if note:
+                    add_memory(user_id, "topic_selection", "note", note[:800], importance_score=6)
+            except Exception:
+                pass
+        # 腳本：把回覆存成筆記
+        elif agent_type == "script":
+            try:
+                note = (full or "").strip()
+                if note:
+                    add_memory(user_id, "script_copy", "note", note[:800], importance_score=6)
             except Exception:
                 pass
 
@@ -1751,6 +1788,35 @@ async def update_positioning_profile(req: Request):
             status_code=500,
             content={"error": "internal_server_error", "message": str(e)}
         )
+
+# 新增：取得用戶定位檔案與筆記（供前端右側同步顯示）
+@app.get("/agent/positioning/profile")
+async def get_positioning_profile(user_id: str, notes_limit: int = 10):
+    try:
+        profile = get_user_profile(user_id)
+        notes = get_user_memories(user_id, agent_type="positioning", memory_type="note", limit=notes_limit)
+        return {
+            "user_id": user_id,
+            "profile": profile or {},
+            "notes": notes,
+            "error": None
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
+
+# 新增：通用筆記查詢 API
+@app.get("/agent/notes")
+async def get_agent_notes(user_id: str, agent_type: str, memory_type: str = "note", limit: int = 10):
+    try:
+        notes = get_user_memories(user_id, agent_type=agent_type, memory_type=memory_type, limit=limit)
+        return {
+            "user_id": user_id,
+            "agent_type": agent_type,
+            "notes": notes,
+            "error": None
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
 
 # 選題智能體
 @app.post("/agent/topics/suggest")
