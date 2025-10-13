@@ -490,28 +490,24 @@ def build_script_prompt(
         mode_line = "語氣偏引導，逐步釐清要素後直接給出完整分段；"
 
     return f"""
-你是專業的短影音腳本顧問，專門服務台灣市場。{mode_line}請根據「使用者輸入」與「已接受段落」延續或重寫，輸出 JSON（禁止額外說明文字）。
+根據使用者輸入生成短影音腳本。{mode_line}
 
-📋 回應格式要求：
-• 使用emoji作為分點符號，讓內容更易讀
-• 段落分明，重點突出
-• 提供具體實作方式
+🎯 腳本參數：
+• 模板：{tmpl or "（未指定）"} - {tmpl_text}
+• 時長：{int(duration) if duration else "（未指定，預設 30）"} 秒
+• 平台：Instagram Reels、TikTok、YouTube Shorts、Facebook Reels
 
-🎯 腳本生成原則：
-【選擇的模板】{tmpl or "（未指定）"}：{tmpl_text}
-【時長要求】{int(duration) if duration else "（未指定，預設 30）"} 秒。{duration_note}
-
-📚 短影音知識庫：
+📚 知識庫：
 {kb}
 
 【KB輔助摘錄】（若空白代表無）
 {kb_ctx_dynamic[:1000]}
 
 💡 台灣市場特色：
-• 平台推薦：Instagram Reels、TikTok、YouTube Shorts、Facebook Reels
 • 內容風格：生活化、親切、實用
 • 節奏要求：2-3秒換畫面，節奏緊湊
 • Hook原則：0-5秒直給結論，用大字卡與強情緒表情
+• 語氣：堅定、直給結論，避免口癖贅字
 
 使用者輸入：
 {user_input}
@@ -519,7 +515,7 @@ def build_script_prompt(
 已接受段落：
 {prev}
 
-只回傳 JSON：
+直接輸出JSON格式，不要任何開場白或說明文字：
 {fewshot}
 """
 
@@ -829,12 +825,7 @@ def topic_selection_agent_generate(user_profile: Dict, memories: List[Dict] = No
             context += f"- {memory['content']}\n"
         context += "\n"
     
-    context += """📋 回應格式要求：
-• 使用emoji作為分點符號，讓內容更易讀
-• 段落分明，重點突出
-• 提供具體實作方式
-
-🎯 請提供5個具體的內容選題建議，每個選題包含：
+    context += """提供5個具體的內容選題建議，每個選題包含：
 
 📝 選題結構：
 1️⃣ 標題/主題
@@ -847,7 +838,9 @@ def topic_selection_agent_generate(user_profile: Dict, memories: List[Dict] = No
 • 考慮當前熱點、季節性、用戶興趣和平台特性
 • 提供具體的拍攝建議
 • 包含Hook、Value、CTA結構
-• 適合台灣用戶的內容風格"""
+• 適合台灣用戶的內容風格
+
+直接輸出選題建議，不要任何開場白或說明文字。"""
     
     return context
 
@@ -2279,19 +2272,14 @@ async def generate_script_one_click(req: Request):
         add_message(session_id, "user", f"一鍵生成腳本：{theme}")
         
         # 構建一鍵生成提示詞
-        context = f"""你是專業的短影音腳本顧問，專門服務台灣市場。請根據用戶提供的主題「{theme}」生成完整的腳本。
+        context = f"""根據主題「{theme}」生成短影音腳本。
 
-📋 回應格式要求：
-• 使用emoji作為分點符號，讓內容更易讀
-• 段落分明，重點突出
-• 提供具體實作方式
+🎯 腳本參數：
+• 模板：{template_type} - {TEMPLATE_GUIDE.get(template_type, "三段式")}
+• 時長：{duration} 秒
+• 平台：Instagram Reels、TikTok、YouTube Shorts、Facebook Reels
 
-🎯 腳本生成原則：
-【模板】{template_type}：{TEMPLATE_GUIDE.get(template_type, "三段式")}
-【時長】{duration} 秒
-【平台】Instagram Reels、TikTok、YouTube Shorts、Facebook Reels
-
-📚 短影音知識庫：
+📚 知識庫：
 {BUILTIN_KB_SCRIPT}
 
 💡 台灣市場特色：
@@ -2300,9 +2288,8 @@ async def generate_script_one_click(req: Request):
 • Hook原則：0-5秒直給結論，用大字卡與強情緒表情
 • 語氣：堅定、直給結論，避免口癖贅字
 
-請生成完整的腳本，包含Hook、Value、CTA結構，並以JSON格式輸出。
+直接輸出JSON格式，不要任何開場白或說明文字：
 
-JSON格式：
 {{
   "segments":[
     {{"type":"hook","start_sec":0,"end_sec":5,"camera":"CU","dialog":"...","visual":"...","cta":""}},
@@ -2316,9 +2303,7 @@ JSON格式：
             ai_response = gemini_generate_text(context)
         else:
             # 無模型時的範例回覆
-            ai_response = f"""根據「{theme}」主題，我為你生成以下腳本：
-
-{{
+            ai_response = f"""{{
   "segments":[
     {{"type":"hook","start_sec":0,"end_sec":5,"camera":"CU","dialog":"你知道{theme}的秘密嗎？","visual":"大字卡+驚訝表情","cta":""}},
     {{"type":"value","start_sec":5,"end_sec":25,"camera":"MS","dialog":"今天我要分享{theme}的實用技巧，讓你輕鬆掌握！","visual":"示範畫面","cta":""}},
