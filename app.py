@@ -1867,9 +1867,15 @@ async def positioning_analyze(req: Request):
         
     except Exception as e:
         print(f"[Positioning Agent Error] {e}")
+        import traceback
+        traceback.print_exc()
         return JSONResponse(
             status_code=500,
-            content={"error": "internal_server_error", "message": str(e)}
+            content={
+                "error": "internal_server_error", 
+                "message": "伺服器內部錯誤，請稍後再試",
+                "details": str(e) if "DEBUG" in os.environ else "Internal server error"
+            }
         )
 
 @app.put("/agent/positioning/profile")
