@@ -741,6 +741,11 @@ def positioning_agent_analyze(user_input: str, user_profile: Dict = None, memori
     """定位智能體分析 - 提供結構化定位選項"""
     context = "你是專業的短影音定位顧問，專門服務台灣市場，幫助用戶快速建立清晰的帳號定位。\n\n"
     
+    # 加入知識庫內容
+    kb_context = retrieve_context(user_input) or ""
+    if kb_context:
+        context += f"【知識庫參考】\n{kb_context}\n\n"
+    
     if user_profile:
         context += f"用戶現有檔案：{json.dumps(user_profile, ensure_ascii=False)}\n\n"
     
@@ -767,20 +772,21 @@ def positioning_agent_analyze(user_input: str, user_profile: Dict = None, memori
     if not user_profile or not user_profile.get('posting_frequency'):
         missing_fields.append("發文頻率")
     
-    context += """【重要】請以結構化方式回應，提供具體的定位選項供用戶選擇：
+    context += """【重要】請基於知識庫內容，以結構化方式回應，提供具體的定位選項供用戶選擇：
 
 📋 回應格式要求：
 • 使用emoji作為分點符號，讓內容更易讀
 • 段落分明，重點突出
 • 提供具體實作方式
 • 在回覆中明確標示「業務類型：」「目標受眾：」等欄位，方便系統自動提取
+• 基於知識庫的流量/轉換邏輯、平台策略、內容結構等專業建議
 
 🎯 分析步驟：
 1️⃣ 先分析用戶的業務/產品/服務
 2️⃣ 提供 2-3 個具體的定位方向選項
 3️⃣ 每個選項包含完整6個欄位
 4️⃣ 平台推薦專注於台灣用戶常用平台：Instagram Reels、TikTok、YouTube Shorts、Facebook Reels
-5️⃣ 提供具體實作建議
+5️⃣ 提供具體實作建議（基於知識庫的拍攝、剪輯、內容策略）
 6️⃣ 最後提供 1-2 個後續問題引導
 
 📝 格式範例：
@@ -793,8 +799,8 @@ def positioning_agent_analyze(user_input: str, user_profile: Dict = None, memori
 ⏰ 發文頻率：XXX
 
 💡 實作建議：
-• 具體的內容策略
-• 平台操作要點
+• 具體的內容策略（基於知識庫的流量型/轉換型配比）
+• 平台操作要點（拍攝技巧、剪輯節奏、標題鉤子）
 • 預期效果
 
 【🎯 定位選項 B】
@@ -1600,7 +1606,12 @@ async def chat(req: Request):
                 pass
 
     system_ctx = (
-        f"{persona}\n請以自然中文對談，不用制式清單。若能從知識庫或用戶檔案得到答案，請優先結合。\n" 
+        f"{persona}\n請以自然中文對談，不用制式清單。若能從知識庫或用戶檔案得到答案，請優先結合。\n\n"
+        f"【重要格式要求】\n"
+        f"• 使用emoji作為分點符號，讓內容更易讀\n"
+        f"• 段落分明，重點突出\n"
+        f"• 基於知識庫內容提供專業建議\n"
+        f"• 回應結構：📝 主要觀點 → 💡 具體建議 → ✨ 實作要點 → 🎯 行動指引\n\n"
         f"【用戶檔案（若空代表未設定）】\n{json.dumps(user_profile or {}, ensure_ascii=False)}\n\n"
         f"【相關記憶（節選）】\n" + "\n".join([f"- {m.get('content','')}" for m in memories[:5]]) + "\n\n"
         f"【全域知識摘要（截斷）】\n{kb_all[:1200]}\n\n"
@@ -1611,7 +1622,7 @@ async def chat(req: Request):
     # 產生回覆
     if use_gemini():
         prompt = (
-            system_ctx + "\n---\n" + (last_user or "") + "\n\n請以對談形式回覆，避免重覆使用相同句型。"
+            system_ctx + "\n---\n" + (last_user or "") + "\n\n請以對談形式回覆，避免重覆使用相同句型。使用emoji分段，讓內容更易讀。"
         )
         ai_response = gemini_generate_text(prompt)
     else:
@@ -1858,10 +1869,38 @@ async def positioning_analyze(req: Request):
         except Exception as _e:
             print("[Positioning] extract_profile_fields failed:", _e)
         
+        # 生成結構化的定位摘要（包含執行建議）
+        positioning_summary = ""
+        tone_guidelines = ""
+        execution_suggestions = ""
+        
+        if ai_response:
+            # 簡單解析AI回應，提取關鍵信息
+            lines = ai_response.split('\n')
+            for line in lines:
+                line = line.strip()
+                if '業務類型：' in line or '目標受眾：' in line or '品牌語氣：' in line:
+                    positioning_summary += line + "\n"
+                elif '語氣' in line and ('專業' in line or '親切' in line or '幽默' in line or '權威' in line):
+                    tone_guidelines = line
+                elif '實作建議' in line or '執行' in line or '建議' in line:
+                    execution_suggestions += line + "\n"
+        
+        # 如果沒有提取到足夠信息，使用默認值
+        if not positioning_summary:
+            positioning_summary = "基於您的描述，建議建立專業的短影音定位策略。"
+        if not tone_guidelines:
+            tone_guidelines = "使用專業術語，保持客觀理性，強調數據和事實。"
+        if not execution_suggestions:
+            execution_suggestions = "建議採用流量型與轉換型內容 7:3 配比，每週發布 3-5 次，專注於 Instagram Reels 平台。"
+        
         return {
             "session_id": session_id,
             "response": ai_response,
             "user_profile": user_profile,
+            "positioning_summary": positioning_summary,
+            "tone_guidelines": tone_guidelines,
+            "execution_suggestions": execution_suggestions,
             "error": None
         }
         
