@@ -538,7 +538,12 @@ def verify_admin_session_cookie(cookie_val: str) -> str | None:
 async def google_start(request: Request, next: str | None = "/"):
     if not _OAUTH_READY:
         return JSONResponse(status_code=501, content={"error": "oauth_not_configured"})
-    return await oauth.google.authorize_redirect(request, redirect_uri=OAUTH_REDIRECT_URI, state=next or "/")
+    return await oauth.google.authorize_redirect(
+        request,
+        redirect_uri=OAUTH_REDIRECT_URI,
+        state=next or "/",
+        prompt="select_account",
+    )
 
 @app.get("/auth/google/callback")
 async def google_callback(request: Request):
@@ -554,7 +559,7 @@ async def google_callback(request: Request):
         create_or_get_user(user_id, email=email, name=name)
         token_val = create_session_cookie(user_id)
         resp = RedirectResponse(url=request.query_params.get("state") or "/")
-        resp.set_cookie("session", token_val, httponly=True, secure=True, samesite="lax", max_age=7*24*3600)
+        resp.set_cookie("session", token_val, httponly=True, secure=True, samesite="none", max_age=7*24*3600)
         return resp
     except Exception as e:
         print("[OAuth Callback Error]", e)
