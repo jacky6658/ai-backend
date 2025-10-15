@@ -572,6 +572,10 @@ async def google_callback(request: Request):
             except Exception:
                 idinfo = {}
         sub = (idinfo or {}).get("sub"); email = (idinfo or {}).get("email"); name = (idinfo or {}).get("name") or (email.split("@")[0] if email else "user")
+        # 最後備援：若缺少 sub 但有 email，使用 email 雜湊生成穩定 ID
+        if not sub and email:
+            import hashlib
+            sub = hashlib.sha256(email.encode("utf-8")).hexdigest()[:24]
         if not sub:
             return JSONResponse(status_code=400, content={"error": "invalid_google_response"})
         user_id = f"g_{sub}"
