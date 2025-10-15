@@ -306,6 +306,32 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_topic_suggestions_user_date ON topic_suggestions(user_id, suggested_date)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_requests_user_time ON requests(user_id, created_at DESC)")
 
+    # 用戶點數與訂單（簡化）
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_credits (
+            user_id TEXT PRIMARY KEY,
+            balance INTEGER DEFAULT 0,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            order_type TEXT NOT NULL,
+            amount INTEGER DEFAULT 0,
+            plan TEXT,
+            status TEXT DEFAULT 'paid',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            paid_at DATETIME
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_time ON orders(user_id, created_at DESC)")
+
     # 管理操作稽核表
     cur.execute(
         """
@@ -1767,6 +1793,28 @@ async def admin_users(req: Request):
         "users_auth": [dict(a) for a in auths],
     }
 
+@app.get("/admin/users_full")
+async def admin_users_full(req: Request, limit: int = 500):
+    if not _check_admin(req):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 500
+    limit = max(1, min(limit, 2000))
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    users = conn.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    auths = conn.execute("SELECT user_id, username, email, phone, created_at FROM users_auth ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    credits = conn.execute("SELECT * FROM user_credits").fetchall()
+    orders = conn.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    conn.close()
+    return {
+        "users": [dict(u) for u in users],
+        "users_auth": [dict(a) for a in auths],
+        "credits": [dict(c) for c in credits],
+        "orders": [dict(o) for o in orders],
+    }
+
 @app.get("/admin/usage")
 async def admin_usage(req: Request, limit: int = 30):
     if not _check_admin(req):
@@ -1980,6 +2028,19 @@ async def admin_analytics(req: Request):
         # agent 分佈（sessions）
         by_agent_rows = conn.execute("SELECT agent_type, COUNT(1) AS c FROM sessions GROUP BY agent_type").fetchall()
         by_agent = { r["agent_type"]: r["c"] for r in by_agent_rows }
+        # 近7日 agent 使用次數（依 sessions.created_at）
+        agent_daily_rows = conn.execute(
+            """
+            SELECT strftime('%Y-%m-%d', created_at) AS d, agent_type, COUNT(1) AS c
+            FROM sessions
+            WHERE date(created_at) >= date('now','localtime','-6 day')
+            GROUP BY d, agent_type
+            ORDER BY d ASC
+            """
+        ).fetchall()
+        agent_daily = {}
+        for r in agent_daily_rows:
+            agent_daily.setdefault(r["d"], {})[r["agent_type"]] = r["c"]
         # 訊息總數/今日
         total_messages = conn.execute("SELECT COUNT(1) AS c FROM messages").fetchone()["c"]
         today_messages = conn.execute("SELECT COUNT(1) AS c FROM messages WHERE date(timestamp) = date('now','localtime')").fetchone()["c"]
@@ -1993,6 +2054,7 @@ async def admin_analytics(req: Request):
             "by_agent": by_agent,
             "total_messages": total_messages,
             "today_messages": today_messages,
+            "agent_daily": agent_daily,
         }
     except Exception as e:
         try: conn.close()
