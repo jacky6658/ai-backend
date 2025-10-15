@@ -432,6 +432,7 @@ def api_info():
 
 # ========= Email/帳號 註冊 / 登入 / 會話 =========
 from fastapi import Body
+from fastapi import Form
 
 @app.post("/auth/signup")
 async def auth_signup(req: Request):
@@ -490,6 +491,33 @@ async def auth_login(req: Request):
         httponly=True, secure=True, samesite="none", max_age=7*24*3600
     )
     return resp
+
+# 前端跨網域第三方 Cookie 可能被瀏覽器阻擋，提供彈窗版登入：
+# 以第一方情境設定 session，最後回傳頁面自動通知 opener 並關閉
+@app.post("/auth/login_popup", response_class=HTMLResponse)
+async def auth_login_popup(identifier: str = Form(...), password: str = Form(...)):
+    if not identifier or not password:
+        return HTMLResponse("<p>missing fields</p>", status_code=400)
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT user_id, password_hash FROM users_auth WHERE username=? OR email=?",
+        (identifier, identifier)
+    ).fetchone()
+    conn.close()
+    if not row or row["password_hash"] != hash_password(password):
+        return HTMLResponse("<script>window.close()</script>", status_code=401)
+    token = create_session_cookie(row["user_id"])
+    html = f"""
+<!DOCTYPE html><meta charset=\"utf-8\" />
+<script>
+  try {{
+    document.cookie = "session={token}; Path=/; SameSite=None; Secure; HttpOnly";
+  }} catch (_e) {{}}
+  try {{ if (window.opener) window.opener.postMessage('login_ok','*'); }} catch(_e) {{}}
+  window.close();
+</script>
+"""
+    return HTMLResponse(html)
 
 @app.get("/me")
 def me(session: str | None = Cookie(default=None)):
@@ -558,10 +586,18 @@ async def google_callback(request: Request):
         return JSONResponse(status_code=501, content={"error": "oauth_not_configured"})
     try:
         token = await oauth.google.authorize_access_token(request)
+        try:
+            print("[OAuth] token keys:", sorted(list((token or {}).keys())))
+        except Exception:
+            pass
         # 主要路徑：使用 id_token 解析
         idinfo = None
         try:
             idinfo = await oauth.google.parse_id_token(request, token)
+            try:
+                print("[OAuth] id_token parsed, keys:", sorted(list((idinfo or {}).keys())))
+            except Exception:
+                pass
         except Exception:
             idinfo = None
         # 後備路徑：若無 id_token，改呼叫 userinfo 端點
@@ -569,14 +605,47 @@ async def google_callback(request: Request):
             try:
                 resp = await oauth.google.get("userinfo", token=token)
                 idinfo = resp.json() if resp is not None else {}
+                try:
+                    print("[OAuth] userinfo keys:", sorted(list((idinfo or {}).keys())))
+                except Exception:
+                    pass
             except Exception:
                 idinfo = {}
+            # 進一步後備：直接以 access_token 打 OIDC userinfo 端點
+            try:
+                import httpx
+                at = (token or {}).get("access_token")
+                if at and (not idinfo or not idinfo.get("sub")):
+                    async with httpx.AsyncClient(timeout=8) as client:
+                        r = await client.get(
+                            "https://openidconnect.googleapis.com/v1/userinfo",
+                            headers={"Authorization": f"Bearer {at}"},
+                        )
+                        try:
+                            print("[OAuth] direct userinfo status:", r.status_code)
+                        except Exception:
+                            pass
+                        if r.status_code == 200:
+                            idinfo = r.json()
+                            try:
+                                print("[OAuth] direct userinfo keys:", sorted(list((idinfo or {}).keys())))
+                            except Exception:
+                                pass
+            except Exception as _e:
+                try:
+                    print("[OAuth] direct userinfo error:", _e)
+                except Exception:
+                    pass
         sub = (idinfo or {}).get("sub"); email = (idinfo or {}).get("email"); name = (idinfo or {}).get("name") or (email.split("@")[0] if email else "user")
         # 最後備援：若缺少 sub 但有 email，使用 email 雜湊生成穩定 ID
         if not sub and email:
             import hashlib
             sub = hashlib.sha256(email.encode("utf-8")).hexdigest()[:24]
         if not sub:
+            try:
+                print("[OAuth] missing sub/email. idinfo keys:", sorted(list((idinfo or {}).keys())))
+            except Exception:
+                pass
             return JSONResponse(status_code=400, content={"error": "invalid_google_response"})
         user_id = f"g_{sub}"
         create_or_get_user(user_id, email=email, name=name)
