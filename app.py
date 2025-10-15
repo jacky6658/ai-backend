@@ -477,7 +477,7 @@ async def auth_login(req: Request):
     resp = JSONResponse({"ok": True})
     resp.set_cookie(
         "session", token,
-        httponly=True, secure=True, samesite="lax", max_age=7*24*3600
+        httponly=True, secure=True, samesite="none", max_age=7*24*3600
     )
     return resp
 
@@ -1321,15 +1321,10 @@ async def chat_generate(req: Request):
             user_input = (m.get("content") or "").strip()
             break
 
+    # 若輸入過短，也直接嘗試生成（避免制式提示打斷對話）
     hint = SHORT_HINT_COPY if mode == "copy" else SHORT_HINT_SCRIPT
     if len(user_input) < 6:
-        return {
-            "session_id": data.get("session_id") or "s",
-            "assistant_message": hint,
-            "segments": [],
-            "copy": None,
-            "error": None
-        }
+        user_input = f"（使用者提示較短）請主動追問必要資訊並先給出初步建議。\n提示：{user_input or '請先幫我開始'}"
 
     try:
         if mode == "copy":
@@ -2123,7 +2118,7 @@ async def admin_login(req: Request):
     token = create_admin_session_cookie(username)
     resp = JSONResponse({"ok": True})
     # Cookie 屬性：HttpOnly+Secure+SameSite=Lax，存活 12 小時
-    resp.set_cookie("admin_session", token, httponly=True, secure=True, samesite="lax", max_age=12*3600)
+    resp.set_cookie("admin_session", token, httponly=True, secure=True, samesite="none", max_age=12*3600)
     return resp
 
 @app.post("/admin/logout")
@@ -3023,15 +3018,10 @@ async def chat_generate_internal(data: dict):
             user_input = (m.get("content") or "").strip()
             break
 
+    # 輸入過短時，仍持續對話而非回傳制式提示
     hint = SHORT_HINT_COPY if mode == "copy" else SHORT_HINT_SCRIPT
     if len(user_input) < 6:
-        return {
-            "session_id": data.get("session_id") or "s",
-            "assistant_message": hint,
-            "segments": [],
-            "copy": None,
-            "error": None
-        }
+        user_input = f"（使用者提示較短）請主動追問關鍵條件並先給出方向性建議。\n提示：{user_input or '開始'}"
 
     try:
         if mode == "copy":
