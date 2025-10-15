@@ -53,7 +53,11 @@ except Exception as _e:
 app = FastAPI(title="Three AI Agents System with Long-term Memory")
 
 # 動態設定 CORS：若需要帶 Cookie 就不能使用 "*"
-ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://jacky6658.github.io,https://jacky6658.github.io/Altest/,http://localhost:3000,https://video.aijob.com.tw").split(",")
+# 預設白名單包含 GitHub Pages、Zeabur 前端子網域、正式站子網域與本機
+ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS",
+    "https://jacky6658.github.io,https://jacky6658.github.io/Altest/,http://localhost:3000,https://video.aijob.com.tw,https://aijobvideo.zeabur.app,https://aijob.com.tw"
+).split(",")
 ORIGINS = [o.strip().rstrip("/") for o in ORIGINS if o.strip()]
 
 app.add_middleware(
