@@ -2130,6 +2130,46 @@ async function login(){
 </html>
 """
 
+# === Admin Login/Logout ===
+@app.post("/admin/login")
+async def admin_login(req: Request):
+    try:
+        data = await req.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "bad_request"})
+    username = (data.get("username") or "").strip()
+    password = (data.get("password") or "").strip()
+    if not ADMIN_USER or not ADMIN_PASSWORD:
+        return JSONResponse(status_code=500, content={"error": "admin_not_configured", "message": "尚未設定 ADMIN_USER/ADMIN_PASSWORD"})
+    if username != ADMIN_USER or password != ADMIN_PASSWORD:
+        return JSONResponse(status_code=401, content={"error": "invalid_credentials", "message": "帳號或密碼錯誤"})
+    token = create_admin_session_cookie(username)
+    resp = JSONResponse({"ok": True})
+    # Cookie 屬性：HttpOnly+Secure+SameSite=Lax，存活 12 小時
+    resp.set_cookie("admin_session", token, httponly=True, secure=True, samesite="lax", max_age=12*3600)
+    return resp
+
+@app.post("/admin/logout")
+async def admin_logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie("admin_session")
+    return resp
+
+@app.get("/admin/healthz")
+async def admin_healthz(req: Request):
+    has_session = False
+    try:
+        c = req.cookies.get("admin_session")
+        has_session = bool(c and verify_admin_session_cookie(c))
+    except Exception:
+        has_session = False
+    return {
+        "ok": True,
+        "admin_ready": bool(ADMIN_USER and ADMIN_PASSWORD),
+        "oauth_ready": bool('_OAUTH_READY' in globals() and _OAUTH_READY),
+        "has_admin_session": has_session,
+    }
+
 # ========= 三智能體 API 端點 =========
 # 統一聊天端點（自然對談 + KB + 記憶 + 人設）
 AGENT_PERSONAS = {
