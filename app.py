@@ -558,8 +558,20 @@ async def google_callback(request: Request):
         return JSONResponse(status_code=501, content={"error": "oauth_not_configured"})
     try:
         token = await oauth.google.authorize_access_token(request)
-        idinfo = await oauth.google.parse_id_token(request, token)
-        sub = idinfo.get("sub"); email = idinfo.get("email"); name = idinfo.get("name") or (email.split("@")[0] if email else "user")
+        # 主要路徑：使用 id_token 解析
+        idinfo = None
+        try:
+            idinfo = await oauth.google.parse_id_token(request, token)
+        except Exception:
+            idinfo = None
+        # 後備路徑：若無 id_token，改呼叫 userinfo 端點
+        if not idinfo or not idinfo.get("sub"):
+            try:
+                resp = await oauth.google.get("userinfo", token=token)
+                idinfo = resp.json() if resp is not None else {}
+            except Exception:
+                idinfo = {}
+        sub = (idinfo or {}).get("sub"); email = (idinfo or {}).get("email"); name = (idinfo or {}).get("name") or (email.split("@")[0] if email else "user")
         if not sub:
             return JSONResponse(status_code=400, content={"error": "invalid_google_response"})
         user_id = f"g_{sub}"
