@@ -22,6 +22,11 @@ KNOWLEDGE_TXT_PATH = os.getenv("KNOWLEDGE_TXT_PATH", "/data/data/kb.txt")
 GLOBAL_KB_TEXT = ""
 SESSION_SECRET = os.getenv("SESSION_SECRET", "change-me-session-secret")
 session_signer = URLSafeSerializer(SESSION_SECRET, salt="session")
+admin_session_signer = URLSafeSerializer(SESSION_SECRET, salt="admin_session")
+
+# Admin 帳號（請以環境變數設定）
+ADMIN_USER = os.getenv("ADMIN_USER")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
 # Google OAuth2（可選）
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
@@ -162,6 +167,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            user_id TEXT,
             user_input TEXT,
             mode TEXT,
             messages_json TEXT,
@@ -169,6 +175,10 @@ def init_db():
             response_json TEXT
         )
     """)
+    try:
+        cur.execute("ALTER TABLE requests ADD COLUMN user_id TEXT")
+    except Exception:
+        pass
     
     # 新增：三智能體系統表格
     # 1. 用戶基本資訊表
@@ -294,6 +304,22 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_user_agent ON agent_memories(user_id, agent_type)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_importance ON agent_memories(importance_score DESC)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_topic_suggestions_user_date ON topic_suggestions(user_id, suggested_date)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_requests_user_time ON requests(user_id, created_at DESC)")
+
+    # 管理操作稽核表
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS admin_audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            action TEXT NOT NULL,
+            admin_token_hash TEXT,
+            target_user_id TEXT,
+            details TEXT
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_action_time ON admin_audit_logs(action, created_at DESC)")
     
     conn.commit()
     conn.close()
@@ -454,6 +480,16 @@ def verify_session_cookie(cookie_val: str) -> str | None:
     try:
         data = session_signer.loads(cookie_val)
         return data.get("uid")
+    except BadSignature:
+        return None
+
+def create_admin_session_cookie(username: str) -> str:
+    return admin_session_signer.dumps({"adm": username, "ts": int(datetime.now().timestamp())})
+
+def verify_admin_session_cookie(cookie_val: str) -> str | None:
+    try:
+        data = admin_session_signer.loads(cookie_val)
+        return data.get("adm")
     except BadSignature:
         return None
 
@@ -1312,8 +1348,9 @@ async def chat_generate(req: Request):
             conn = get_conn()
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO requests (user_input, mode, messages_json, previous_segments_json, response_json) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO requests (user_id, user_input, mode, messages_json, previous_segments_json, response_json) VALUES (?, ?, ?, ?, ?, ?)",
                 (
+                    user_id,
                     user_input, mode,
                     json.dumps(messages, ensure_ascii=False),
                     json.dumps(previous_segments, ensure_ascii=False),
@@ -1707,10 +1744,15 @@ def export_google_sheet_flat_v2(limit: int = 200):
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # 可選，若未設置則不驗證
 
 def _check_admin(req: Request):
-    if not ADMIN_TOKEN:
+    # 先看是否有有效 admin session cookie
+    adm_cookie = req.cookies.get("admin_session")
+    if adm_cookie and verify_admin_session_cookie(adm_cookie):
         return True
+    # 其次允許 token（自動化工具/備援）
     tok = req.headers.get("x-admin-token") or req.query_params.get("token")
-    return tok == ADMIN_TOKEN
+    if ADMIN_TOKEN and tok == ADMIN_TOKEN:
+        return True
+    return False
 
 @app.get("/admin/users")
 async def admin_users(req: Request):
@@ -1793,8 +1835,194 @@ async def admin_usage_csv(req: Request, limit: int = 1000):
         w.writerow([r["id"], r["created_at"], r["mode"], r["user_input"]])
     return Response(content=s.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=usage.csv"})
 
+@app.get("/admin/users_auth")
+async def admin_users_auth(req: Request, limit: int = 1000):
+    if not _check_admin(req):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 1000
+    limit = max(1, min(limit, 5000))
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        f"SELECT id, user_id, username, email, phone, created_at, updated_at FROM users_auth ORDER BY created_at DESC LIMIT {limit}"
+    ).fetchall()
+    conn.close()
+    return {"users_auth": [dict(r) for r in rows]}
+
+@app.post("/admin/user/reset_password")
+async def admin_reset_password(req: Request):
+    if not _check_admin(req):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    data = await req.json()
+    user_id = (data.get("user_id") or "").strip()
+    identifier = (data.get("identifier") or "").strip()  # username 或 email
+    new_password = (data.get("new_password") or "").strip()
+    if not new_password or len(new_password) < 6:
+        return JSONResponse(status_code=400, content={"error": "weak_password", "message": "密碼至少 6 碼"})
+    if not user_id and not identifier:
+        return JSONResponse(status_code=400, content={"error": "missing_identifier"})
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    try:
+        if user_id:
+            row = conn.execute("SELECT id, user_id, username, email FROM users_auth WHERE user_id=?", (user_id,)).fetchone()
+        else:
+            row = conn.execute("SELECT id, user_id, username, email FROM users_auth WHERE username=? OR email=?", (identifier, identifier)).fetchone()
+        if not row:
+            conn.close()
+            return JSONResponse(status_code=404, content={"error": "user_not_found"})
+        conn.execute("UPDATE users_auth SET password_hash=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (hash_password(new_password), row["id"]))
+        # 稽核記錄
+        try:
+            _tok = req.headers.get("x-admin-token") or req.query_params.get("token") or ""
+            admin_hash = hashlib.sha256(_tok.encode("utf-8")).hexdigest() if _tok else None
+            conn.execute(
+                "INSERT INTO admin_audit_logs (action, admin_token_hash, target_user_id, details) VALUES (?, ?, ?, ?)",
+                ("reset_password", admin_hash, row["user_id"], json.dumps({"username": row["username"], "email": row["email"]}, ensure_ascii=False))
+            )
+        except Exception as _e:
+            print("[audit] write failed:", _e)
+        conn.commit(); conn.close()
+        return {"ok": True}
+    except Exception as e:
+        try: conn.close()
+        except Exception: pass
+        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
+
+@app.get("/admin/requests_full")
+async def admin_requests_full(req: Request, limit: int = 200, user_id: str | None = None, mode: str | None = None, date_from: str | None = None, date_to: str | None = None):
+    if not _check_admin(req):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 200
+    limit = max(1, min(limit, 2000))
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    conditions = []
+    params = []
+    if user_id:
+        conditions.append("user_id = ?"); params.append(user_id)
+    if mode:
+        conditions.append("mode = ?"); params.append(mode)
+    if date_from:
+        conditions.append("date(created_at) >= date(?)"); params.append(date_from)
+    if date_to:
+        conditions.append("date(created_at) <= date(?)"); params.append(date_to)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    rows = conn.execute(
+        f"SELECT id, created_at, user_id, mode, user_input, response_json FROM requests {where} ORDER BY id DESC LIMIT {limit}",
+        params,
+    ).fetchall()
+    conn.close()
+    return {"items": [dict(r) for r in rows]}
+
+@app.get("/admin/messages")
+async def admin_messages(req: Request, user_id: str | None = None, session_id: str | None = None, limit: int = 200):
+    if not _check_admin(req):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 200
+    limit = max(1, min(limit, 2000))
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    try:
+        conditions = []
+        params = []
+        if user_id:
+            conditions.append("s.user_id = ?"); params.append(user_id)
+        if session_id:
+            conditions.append("m.session_id = ?"); params.append(session_id)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        rows = conn.execute(
+            f"""
+            SELECT m.id, m.session_id, s.user_id, s.agent_type, m.role, m.content, m.timestamp
+            FROM messages m
+            LEFT JOIN sessions s ON s.session_id = m.session_id
+            {where}
+            ORDER BY m.id DESC
+            LIMIT {limit}
+            """,
+            params,
+        ).fetchall()
+        conn.close()
+        return {"items": [dict(r) for r in rows]}
+    except Exception as e:
+        try: conn.close()
+        except Exception: pass
+        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
+
+@app.get("/admin/analytics")
+async def admin_analytics(req: Request):
+    if not _check_admin(req):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    try:
+        total_users = conn.execute("SELECT COUNT(1) AS c FROM users").fetchone()["c"]
+        total_requests = conn.execute("SELECT COUNT(1) AS c FROM requests").fetchone()["c"]
+        # 今日請求
+        today = conn.execute("SELECT COUNT(1) AS c FROM requests WHERE date(created_at) = date('now','localtime')").fetchone()["c"]
+        # 近7日
+        last7 = conn.execute(
+            """
+            SELECT strftime('%Y-%m-%d', created_at) AS d, COUNT(1) AS c
+            FROM requests
+            WHERE date(created_at) >= date('now','localtime','-6 day')
+            GROUP BY d ORDER BY d ASC
+            """
+        ).fetchall()
+        last7d = [{"date": r["d"], "count": r["c"]} for r in last7]
+        # 模式分佈
+        by_mode_rows = conn.execute("SELECT COALESCE(mode,'') AS mode, COUNT(1) AS c FROM requests GROUP BY COALESCE(mode,'')").fetchall()
+        by_mode = { (r["mode"] or ""): r["c"] for r in by_mode_rows }
+        # agent 分佈（sessions）
+        by_agent_rows = conn.execute("SELECT agent_type, COUNT(1) AS c FROM sessions GROUP BY agent_type").fetchall()
+        by_agent = { r["agent_type"]: r["c"] for r in by_agent_rows }
+        # 訊息總數/今日
+        total_messages = conn.execute("SELECT COUNT(1) AS c FROM messages").fetchone()["c"]
+        today_messages = conn.execute("SELECT COUNT(1) AS c FROM messages WHERE date(timestamp) = date('now','localtime')").fetchone()["c"]
+        conn.close()
+        return {
+            "total_users": total_users,
+            "total_requests": total_requests,
+            "today_requests": today,
+            "last7d": last7d,
+            "by_mode": by_mode,
+            "by_agent": by_agent,
+            "total_messages": total_messages,
+            "today_messages": today_messages,
+        }
+    except Exception as e:
+        try: conn.close()
+        except Exception: pass
+        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
+
 @app.get("/admin", response_class=HTMLResponse)
-async def admin_page():
+async def admin_page(admin_session: str | None = Cookie(default=None)):
+    if not (admin_session and verify_admin_session_cookie(admin_session)):
+        # 簡易登入頁
+        return HTMLResponse(content="""
+<!DOCTYPE html>
+<html lang=\"zh-Hant\"><head><meta charset=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/><title>AIJob 管理登入</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,'Noto Sans TC',sans-serif;margin:40px;color:#111;background:#f6f7fb}
+.card{max-width:360px;margin:0 auto;border:1px solid #e5e7eb;border-radius:12px;background:#fff;padding:16px}
+input,button{width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:8px;margin-top:10px}
+button{background:#111;color:#fff}
+.muted{color:#6b7280;font-size:12px;margin-top:8px}
+</style></head><body>
+<div class=\"card\"><h2>AIJob 管理登入</h2>
+<input id=\"u\" placeholder=\"帳號\"><input id=\"p\" placeholder=\"密碼\" type=\"password\">
+<button onclick=\"login()\">登入</button>
+<div class=\"muted\">僅限管理者使用。登入後將建立安全的管理 Session。</div></div>
+<script>
+async function login(){
+  const r = await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.getElementById('u').value,password:document.getElementById('p').value})});
+  const j = await r.json(); if(j&&j.ok){ location.href='/admin'; } else { alert(j.message||'登入失敗'); }
+}
+</script></body></html>
+""", status_code=200)
     return """
 <!DOCTYPE html>
 <html lang=\"zh-Hant\">
