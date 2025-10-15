@@ -538,12 +538,19 @@ def verify_admin_session_cookie(cookie_val: str) -> str | None:
 async def google_start(request: Request, next: str | None = "/"):
     if not _OAUTH_READY:
         return JSONResponse(status_code=501, content={"error": "oauth_not_configured"})
-    return await oauth.google.authorize_redirect(
+    resp = await oauth.google.authorize_redirect(
         request,
         redirect_uri=OAUTH_REDIRECT_URI,
         state=next or "/",
-        prompt="select_account",
+        prompt="consent select_account",
+        max_age=0,
     )
+    # 確保不被站內既有 session 影響，先清除使用者 session cookie
+    try:
+        resp.delete_cookie("session")
+    except Exception:
+        pass
+    return resp
 
 @app.get("/auth/google/callback")
 async def google_callback(request: Request):
