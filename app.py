@@ -1703,6 +1703,205 @@ def export_google_sheet_flat_v2(limit: int = 200):
         },
     )
 
+# ========= Admin APIs（簡易狀態與用戶列表） =========
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # 可選，若未設置則不驗證
+
+def _check_admin(req: Request):
+    if not ADMIN_TOKEN:
+        return True
+    tok = req.headers.get("x-admin-token") or req.query_params.get("token")
+    return tok == ADMIN_TOKEN
+
+@app.get("/admin/users")
+async def admin_users(req: Request):
+    if not _check_admin(req):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    users = conn.execute("SELECT user_id, email, name, created_at, updated_at, status FROM users ORDER BY created_at DESC LIMIT 500").fetchall()
+    auths = conn.execute("SELECT user_id, username, email, phone, created_at FROM users_auth ORDER BY created_at DESC LIMIT 500").fetchall()
+    conn.close()
+    return {
+        "users": [dict(u) for u in users],
+        "users_auth": [dict(a) for a in auths],
+    }
+
+@app.get("/admin/usage")
+async def admin_usage(req: Request, limit: int = 30):
+    if not _check_admin(req):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 30
+    limit = max(1, min(limit, 500))
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    total_requests = conn.execute("SELECT COUNT(1) AS c FROM requests").fetchone()["c"]
+    latest = conn.execute(
+        f"SELECT id, created_at, user_input, mode FROM requests ORDER BY id DESC LIMIT {limit}"
+    ).fetchall()
+    conn.close()
+    return {
+        "total_requests": total_requests,
+        "latest": [dict(r) for r in latest],
+    }
+
+@app.get("/admin/users.csv")
+async def admin_users_csv(req: Request):
+    if not _check_admin(req):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    users = conn.execute("SELECT user_id, email, name, created_at, updated_at, status FROM users ORDER BY created_at DESC").fetchall()
+    auths = conn.execute("SELECT user_id, username, email AS auth_email, phone, created_at AS auth_created FROM users_auth ORDER BY created_at DESC").fetchall()
+    conn.close()
+
+    from io import StringIO
+    s = StringIO()
+    import csv
+    w = csv.writer(s)
+    w.writerow(["user_id","email","name","created_at","updated_at","status","username","auth_email","phone","auth_created"])
+    # 以 user_id 關聯（此處簡化：逐筆合併，若無對應則留空）
+    auth_map = {a["user_id"]: a for a in auths}
+    for u in users:
+        a = auth_map.get(u["user_id"]) or {}
+        w.writerow([
+            u["user_id"], u["email"], u["name"], u["created_at"], u["updated_at"], u["status"],
+            a.get("username",""), a.get("auth_email",""), a.get("phone",""), a.get("auth_created",""),
+        ])
+    return Response(content=s.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=users.csv"})
+
+@app.get("/admin/usage.csv")
+async def admin_usage_csv(req: Request, limit: int = 1000):
+    if not _check_admin(req):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 1000
+    limit = max(1, min(limit, 5000))
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        f"SELECT id, created_at, user_input, mode FROM requests ORDER BY id DESC LIMIT {limit}"
+    ).fetchall()
+    conn.close()
+
+    from io import StringIO
+    s = StringIO()
+    import csv
+    w = csv.writer(s)
+    w.writerow(["id","created_at","mode","user_input"])
+    for r in rows:
+        w.writerow([r["id"], r["created_at"], r["mode"], r["user_input"]])
+    return Response(content=s.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=usage.csv"})
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page():
+    return """
+<!DOCTYPE html>
+<html lang=\"zh-Hant\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>後台管理</title>
+  <style>
+    body{font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, 'Noto Sans TC', sans-serif;margin:32px;color:#111}
+    .wrap{max-width:1200px;margin:0 auto}
+    .card{border:1px solid #e5e7eb;border-radius:10px;padding:16px;margin-bottom:20px}
+    input,button{padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px}
+    table{border-collapse:collapse;width:100%}
+    th,td{border:1px solid #e5e7eb;padding:8px;text-align:left}
+    th{background:#f8fafc}
+    .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  </style>
+</head>
+<body>
+  <div class=\"wrap\">
+    <h1>管理後台</h1>
+    <div class=\"card row\">
+      <label>Admin Token：<input id=\"admTok\" placeholder=\"可留空（若後端未設定）\" style=\"width:280px\"></label>
+      <button onclick=\"saveTok()\">儲存</button>
+      <a id=\"dlUsers\" href=\"#\" style=\"margin-left:auto\">下載 Users CSV</a>
+      <a id=\"dlUsage\" href=\"#\" style=\"margin-left:8px\">下載 Usage CSV</a>
+    </div>
+    <div class=\"card\">
+      <div class=\"row\">
+        <strong>使用者</strong>
+        <input id=\"qUser\" placeholder=\"搜尋 email / username / user_id\" style=\"flex:1\" oninput=\"renderUsers()\">
+        <button onclick=\"loadAll()\">重新載入</button>
+      </div>
+      <div style=\"overflow:auto;max-height:360px\">
+        <table id=\"tblUsers\"><thead><tr>
+          <th>user_id</th><th>email</th><th>name</th><th>username</th><th>phone</th><th>created_at</th>
+        </tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+    <div class=\"card\">
+      <div class=\"row\">
+        <strong>最近請求</strong>
+        <input id=\"qReq\" placeholder=\"關鍵字（user_input / mode）\" style=\"flex:1\" oninput=\"renderReq()\">
+      </div>
+      <div style=\"overflow:auto;max-height:360px\">
+        <table id=\"tblReq\"><thead><tr>
+          <th>id</th><th>created_at</th><th>mode</th><th>user_input</th>
+        </tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const $ = s => document.querySelector(s);
+    function tok(){ return localStorage.getItem('ADMIN_TOKEN')||'' }
+    function saveTok(){ localStorage.setItem('ADMIN_TOKEN',$('#admTok').value||''); setupLinks(); loadAll(); }
+    function setupLinks(){
+      const t = tok();
+      $('#admTok').value = t;
+      const q = t ? ('?token='+encodeURIComponent(t)) : '';
+      $('#dlUsers').href = '/admin/users.csv'+q;
+      $('#dlUsage').href = '/admin/usage.csv'+q;
+    }
+    let users=[], authMap={}; let latest=[];
+    async function loadAll(){
+      const t = tok();
+      const hdr = t? {'x-admin-token':t} : {};
+      const u = await fetch('/admin/users', {headers: hdr}).then(r=>r.json());
+      users = (u.users||[]);
+      // 合併 auth 欄位
+      const ua = u.users_auth||[]; authMap={}; ua.forEach(a=>authMap[a.user_id]=a);
+      const g = await fetch('/admin/usage?limit=200', {headers: hdr}).then(r=>r.json());
+      latest = g.latest||[];
+      renderUsers(); renderReq(); setupLinks();
+    }
+    function renderUsers(){
+      const q = ($('#qUser').value||'').toLowerCase();
+      const tb = $('#tblUsers tbody'); tb.innerHTML='';
+      users.filter(u=>{
+        const a = authMap[u.user_id]||{};
+        const hay = [u.user_id,u.email,u.name,a.username,a.phone].join(' ').toLowerCase();
+        return !q || hay.includes(q);
+      }).slice(0,500).forEach(u=>{
+        const a = authMap[u.user_id]||{};
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${u.user_id}</td><td>${u.email||''}</td><td>${u.name||''}</td><td>${a.username||''}</td><td>${a.phone||''}</td><td>${u.created_at||''}</td>`;
+        tb.appendChild(tr);
+      });
+    }
+    function renderReq(){
+      const q = ($('#qReq').value||'').toLowerCase();
+      const tb = $('#tblReq tbody'); tb.innerHTML='';
+      latest.filter(r=>{
+        const hay = [r.user_input,r.mode].join(' ').toLowerCase();
+        return !q || hay.includes(q);
+      }).forEach(r=>{
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${r.id}</td><td>${r.created_at}</td><td>${r.mode}</td><td>${(r.user_input||'').slice(0,200)}</td>`;
+        tb.appendChild(tr);
+      });
+    }
+    setupLinks(); loadAll();
+  </script>
+</body>
+</html>
+"""
+
 # ========= 三智能體 API 端點 =========
 # 統一聊天端點（自然對談 + KB + 記憶 + 人設）
 AGENT_PERSONAS = {
