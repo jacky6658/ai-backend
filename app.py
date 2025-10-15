@@ -8,6 +8,7 @@ from datetime import datetime, date
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse, Response, StreamingResponse, RedirectResponse
 from fastapi import Cookie
 from itsdangerous import URLSafeSerializer, BadSignature
@@ -66,6 +67,15 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["POST", "OPTIONS", "GET", "PUT", "DELETE"],
     allow_headers=["*"],
+)
+
+# OAuth 需要 Starlette SessionMiddleware；使用獨立 cookie 名稱避免與本系統 session 混淆
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET,
+    session_cookie="oauth_session",
+    same_site="none",
+    https_only=True,
 )
 
 # 前端分離部署，不需要靜態文件服務
