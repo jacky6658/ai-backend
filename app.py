@@ -1,4 +1,4 @@
-# app.py# app.py
+# app.py
 import os
 import json
 import glob
@@ -8,7 +8,10 @@ from datetime import datetime, date
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, HTMLResponse, Response, StreamingResponse, RedirectResponse
+from fastapi import Cookie
+from itsdangerous import URLSafeSerializer, BadSignature
+import hashlib
 # from fastapi.staticfiles import StaticFiles  # 前端分離部署，不需要
 
 # ========= 環境變數 =========
@@ -17,13 +20,40 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 KNOWLEDGE_TXT_PATH = os.getenv("KNOWLEDGE_TXT_PATH", "/data/data/kb.txt")
 GLOBAL_KB_TEXT = ""
+SESSION_SECRET = os.getenv("SESSION_SECRET", "change-me-session-secret")
+session_signer = URLSafeSerializer(SESSION_SECRET, salt="session")
+
+# Google OAuth2（可選）
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "https://aijobvideobackend.zeabur.app/auth/google/callback")
+try:
+    from authlib.integrations.starlette_client import OAuth
+    oauth = OAuth()
+    if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
+        oauth.register(
+            name="google",
+            server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            client_kwargs={"scope": "openid email profile"},
+        )
+    _OAUTH_READY = True
+except Exception as _e:
+    print("[OAuth] not enabled:", _e)
+    oauth = None
+    _OAUTH_READY = False
 
 # ========= App 與 CORS =========
 app = FastAPI(title="Three AI Agents System with Long-term Memory")
 
+# 動態設定 CORS：若需要帶 Cookie 就不能使用 "*"
+ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://jacky6658.github.io,https://jacky6658.github.io/Altest/,http://localhost:3000,https://video.aijob.com.tw").split(",")
+ORIGINS = [o.strip().rstrip("/") for o in ORIGINS if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ORIGINS,
     allow_credentials=True,
     allow_methods=["POST", "OPTIONS", "GET", "PUT", "DELETE"],
     allow_headers=["*"],
@@ -153,6 +183,21 @@ def init_db():
             language_preference TEXT DEFAULT 'zh-TW',
             timezone TEXT DEFAULT 'Asia/Taipei',
             status TEXT DEFAULT 'active'
+        )
+    """)
+
+    # 新增：Email/帳號登入表（本地帳號）
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users_auth (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            username TEXT UNIQUE,
+            email TEXT,
+            phone TEXT,
+            password_hash TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(user_id)
         )
     """)
     
@@ -318,6 +363,126 @@ def api_info():
       <p>✅ 長期記憶：已啟用</p>
     </body></html>
     """
+
+# ========= Email/帳號 註冊 / 登入 / 會話 =========
+from fastapi import Body
+
+@app.post("/auth/signup")
+async def auth_signup(req: Request):
+    data = await req.json()
+    phone = (data.get("phone") or "").strip()
+    email = (data.get("email") or "").strip()
+    username = (data.get("username") or "").strip()
+    password = (data.get("password") or "").strip()
+    if not all([email, username, password, phone]):
+        raise HTTPException(status_code=400, detail="missing_fields")
+
+    user_id = f"u_{hashlib.md5((email+username).encode()).hexdigest()[:12]}"
+
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    try:
+        # 建立 users（若不存在）
+        u = conn.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not u:
+            conn.execute(
+                "INSERT INTO users (user_id, email, name) VALUES (?, ?, ?)",
+                (user_id, email, username)
+            )
+        # 建立 users_auth
+        conn.execute(
+            "INSERT INTO users_auth (user_id, username, email, phone, password_hash) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, email, phone, hash_password(password))
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(status_code=409, detail="user_exists")
+    conn.close()
+    return {"ok": True, "user_id": user_id}
+
+@app.post("/auth/login")
+async def auth_login(req: Request):
+    data = await req.json()
+    identifier = (data.get("identifier") or "").strip()
+    password = (data.get("password") or "").strip()
+    if not identifier or not password:
+        raise HTTPException(status_code=400, detail="missing_fields")
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT user_id, password_hash FROM users_auth WHERE username=? OR email=?",
+        (identifier, identifier)
+    ).fetchone()
+    conn.close()
+    if not row or row["password_hash"] != hash_password(password):
+        raise HTTPException(status_code=401, detail="invalid_credentials")
+
+    # 設置 Session Cookie
+    token = create_session_cookie(row["user_id"])
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(
+        "session", token,
+        httponly=True, secure=True, samesite="lax", max_age=7*24*3600
+    )
+    return resp
+
+@app.get("/me")
+def me(session: str | None = Cookie(default=None)):
+    uid = verify_session_cookie(session) if session else None
+    if not uid:
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    u = conn.execute("SELECT user_id, email, name FROM users WHERE user_id=?", (uid,)).fetchone()
+    conn.close()
+    if not u:
+        return JSONResponse(status_code=404, content={"error": "user_not_found"})
+    return {"id": u["user_id"], "email": u["email"], "name": u["name"]}
+
+@app.post("/logout")
+def logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie("session")
+    return resp
+
+# ========= Auth Helpers =========
+def hash_password(password: str) -> str:
+    return hashlib.sha256((password or "").encode("utf-8")).hexdigest()
+
+def create_session_cookie(user_id: str) -> str:
+    return session_signer.dumps({"uid": user_id, "ts": int(datetime.now().timestamp())})
+
+def verify_session_cookie(cookie_val: str) -> str | None:
+    try:
+        data = session_signer.loads(cookie_val)
+        return data.get("uid")
+    except BadSignature:
+        return None
+
+# ========= Google OAuth2 Endpoints =========
+@app.get("/auth/google/start")
+async def google_start(request: Request, next: str | None = "/"):
+    if not _OAUTH_READY:
+        return JSONResponse(status_code=501, content={"error": "oauth_not_configured"})
+    return await oauth.google.authorize_redirect(request, redirect_uri=OAUTH_REDIRECT_URI, state=next or "/")
+
+@app.get("/auth/google/callback")
+async def google_callback(request: Request):
+    if not _OAUTH_READY:
+        return JSONResponse(status_code=501, content={"error": "oauth_not_configured"})
+    try:
+        token = await oauth.google.authorize_access_token(request)
+        idinfo = await oauth.google.parse_id_token(request, token)
+        sub = idinfo.get("sub"); email = idinfo.get("email"); name = idinfo.get("name") or (email.split("@")[0] if email else "user")
+        if not sub:
+            return JSONResponse(status_code=400, content={"error": "invalid_google_response"})
+        user_id = f"g_{sub}"
+        create_or_get_user(user_id, email=email, name=name)
+        token_val = create_session_cookie(user_id)
+        resp = RedirectResponse(url=request.query_params.get("state") or "/")
+        resp.set_cookie("session", token_val, httponly=True, secure=True, samesite="lax", max_age=7*24*3600)
+        return resp
+    except Exception as e:
+        print("[OAuth Callback Error]", e)
+        return JSONResponse(status_code=500, content={"error": "oauth_failed"})
 
 # ========= 內建知識庫 =========
 BUILTIN_KB_SCRIPT = """
