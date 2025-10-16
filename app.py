@@ -1405,7 +1405,7 @@ async def chat_generate(req: Request):
     except Exception:
         raise HTTPException(status_code=422, detail="invalid_json")
 
-    user_id = (data.get("user_id") or "").strip() or "web"
+    user_id = (data.get("user_id") or "").strip() or get_anon_user_id(req)
     messages = data.get("messages") or []
     previous_segments = data.get("previous_segments") or []
     topic = (data.get("topic") or "").strip() or None
@@ -2252,9 +2252,20 @@ async def admin_healthz(req: Request):
 # ========= 三智能體 API 端點 =========
 # 統一聊天端點（自然對談 + KB + 記憶 + 人設）
 AGENT_PERSONAS = {
-    "positioning": "你是專業的影音定位顧問，語氣專業、清楚但口語，避免制式項目清單。",
-    "topics": "你是專業的爆款短影音選題顧問，善用熱點與使用者定位，給具體可操作建議。",
-    "script": "你是專業的AI腳本撰寫寫手，回覆自然且具體，必要時主動詢問補充資訊。",
+    "positioning": (
+        "你是專業的短影音定位顧問。所有回覆必須優先結合已知知識庫(KB)與用戶檔案，避免空泛內容。"
+        "與用戶對談請採『少量輸出 + 反問引導』的節奏，一次只推進 1~2 個重點，"
+        "並聚焦在：業務類型定位、目標受眾、品牌形象定位、平台策略建議、內容目標設定、發文頻率。"
+        "回覆須具體、可執行、含金量高。"
+    ),
+    "topics": (
+        "你是專業的爆款短影音選題顧問。優先根據 KB 與用戶定位，提供可直接實作的選題建議，"
+        "避免大眾化冗長清單，必要時反問 1 個關鍵條件再給 3~5 條具體選題。"
+    ),
+    "script": (
+        "你是專業的短影音腳本寫手。優先根據 KB 與用戶檔案產出可拍攝的分段腳本，"
+        "不足時先以 1~2 句反問補足關鍵條件再生成，保持精煉、可落地。"
+    ),
 }
 
 def _mem_agent_key(agent_type: str) -> str:
@@ -2286,7 +2297,7 @@ async def chat(req: Request):
 
     # 讀取檔案與記憶
     user_profile = get_user_profile(user_id)
-    memories = get_user_memories(user_id, agent_type=_mem_agent_key(agent_type), limit=8)
+    memories_all = get_user_memories(user_id, agent_type=_mem_agent_key(agent_type), limit=20)
 
     # 建會話
     session_id = data.get("session_id") or create_session(user_id, agent_type)
@@ -2319,12 +2330,12 @@ async def chat(req: Request):
     system_ctx = (
         f"{persona}\n請以自然中文對談，不用制式清單。若能從知識庫或用戶檔案得到答案，請優先結合。\n\n"
         f"【重要格式要求】\n"
-        f"• 使用emoji作為分點符號，讓內容更易讀\n"
-        f"• 段落分明，重點突出\n"
+        f"• 使用emoji作為分點符號，讓內容更易讀；每次最多 5~8 行\n"
+        f"• 優先給出可執行建議，若條件不足先反問 1~2 個關鍵問題\n"
         f"• 基於知識庫內容提供專業建議\n"
         f"• 回應結構：📝 主要觀點 → 💡 具體建議 → ✨ 實作要點 → 🎯 行動指引\n\n"
         f"【用戶檔案（若空代表未設定）】\n{json.dumps(user_profile or {}, ensure_ascii=False)}\n\n"
-        f"【相關記憶（節選）】\n" + "\n".join([f"- {m.get('content','')}" for m in memories[:5]]) + "\n\n"
+        f"【相關記憶（節選）】\n" + "\n".join([f"- {m.get('content','')}" for m in memories_all[:5]]) + "\n\n"
         f"【全域知識摘要（截斷）】\n{kb_all[:1200]}\n\n"
         f"【KB動態擷取】\n{(kb_ctx or '')[:800]}\n" 
         f"{script_hint}\n"
@@ -2339,7 +2350,7 @@ async def chat(req: Request):
     else:
         # 無模型的自然回覆（較快）
         if agent_type == "positioning":
-            ai_response = natural_fallback_positioning(last_user, user_profile, memories)
+            ai_response = natural_fallback_positioning(last_user, user_profile, memories_all)
         elif agent_type == "topics":
             base = last_user or "請提供今日的選題靈感"
             ai_response = (
@@ -2371,12 +2382,15 @@ async def chat(req: Request):
         except Exception as e:
             print("[/chat] profile extract failed:", e)
 
-    return {
+    result_obj = {
         "session_id": session_id,
         "assistant_message": ai_response,
         "user_profile": user_profile if agent_type == "positioning" else None,
         "error": None
     }
+    if agent_type == "positioning" and 'positioning_summary_text' in locals() and positioning_summary_text:
+        result_obj["positioning_summary"] = positioning_summary_text
+    return result_obj
 
 # === NEW: 流式聊天端點 ===
 from fastapi import BackgroundTasks
@@ -2388,7 +2402,7 @@ async def chat_stream(req: Request):
     except Exception:
         raise HTTPException(status_code=422, detail="invalid_json")
 
-    user_id = (data.get("user_id") or "").strip()
+    user_id = (data.get("user_id") or "").strip() or get_anon_user_id(req)
     agent_type = (data.get("agent_type") or "script").strip()
     messages = data.get("messages") or []
     template_type = (data.get("template_type") or "").strip().upper() or None
@@ -2399,7 +2413,7 @@ async def chat_stream(req: Request):
 
     create_or_get_user(user_id)
     user_profile = get_user_profile(user_id)
-    memories = get_user_memories(user_id, agent_type=_mem_agent_key(agent_type), limit=8)
+    memories_all = get_user_memories(user_id, agent_type=_mem_agent_key(agent_type), limit=20)
 
     session_id = data.get("session_id") or create_session(user_id, agent_type)
 
@@ -2427,7 +2441,7 @@ async def chat_stream(req: Request):
     system_ctx = (
         f"{persona}\n請以自然中文對談，不用制式清單。若能從知識庫或用戶檔案得到答案，請優先結合。\n" 
         f"【用戶檔案（若空代表未設定）】\n{json.dumps(user_profile or {}, ensure_ascii=False)}\n\n"
-        f"【相關記憶（節選）】\n" + "\n".join([f"- {m.get('content','')}" for m in memories[:5]]) + "\n\n"
+        f"【相關記憶（節選）】\n" + "\n".join([f"- {m.get('content','')}" for m in memories_all[:5]]) + "\n\n"
         f"【全域知識摘要（截斷）】\n{kb_all[:1200]}\n\n"
         f"【KB動態擷取】\n{(kb_ctx or '')[:800]}\n" 
         f"{script_hint}\n"
@@ -2456,7 +2470,7 @@ async def chat_stream(req: Request):
             full = gemini_generate_text(system_ctx + "\n---\n" + (convo or (last_user or "")))
         else:
             if agent_type == "positioning":
-                full = natural_fallback_positioning(last_user, user_profile, memories)
+                full = natural_fallback_positioning(last_user, user_profile, memories_all)
             elif agent_type == "topics":
                 base = last_user or "請提供今日的選題靈感"
                 full = (
@@ -2881,7 +2895,7 @@ async def content_generate(req: Request):
     """生成腳本或文案（增強版，整合記憶系統）"""
     try:
         data = await req.json()
-        user_id = data.get("user_id")
+        user_id = data.get("user_id") or get_anon_user_id(req)
         user_input = data.get("user_input", "")
         mode = data.get("mode", "script")  # "script" 或 "copy"
         template_type = data.get("template_type")
@@ -3183,6 +3197,44 @@ async def chat_generate_internal(data: dict):
             "copy": None,
             "error": "internal_server_error"
         }
+
+# 匿名用戶 ID（未登入時避免跨裝置/跨 IP 互相污染記憶）
+def get_anon_user_id(req: Request) -> str:
+    try:
+        ip = (req.client.host if req and req.client else '0.0.0.0')
+        ua = (req.headers.get('user-agent') or 'ua')[:40]
+        h = hashlib.sha256(f"{ip}|{ua}".encode('utf-8')).hexdigest()[:16]
+        from datetime import date
+        d = date.today().isoformat()
+        return f"anon_{h}_{d}"
+    except Exception:
+        return "anon_web"
+
+# 依目前問題挑選最相關記憶，避免回覆偏離當下上下文
+def select_relevant_memories(query: str, memories: list[dict], k: int = 5) -> list[dict]:
+    try:
+        if not memories:
+            return []
+        q = (query or '').strip()
+        if not q:
+            return memories[:k]
+        import re
+        toks = [t for t in re.split(r"[\s，。；、,.:?!\-\/\[\]()]+", q) if len(t) >= 2]
+        toks = list(dict.fromkeys(toks))
+        scored = []
+        for m in memories:
+            txt = (m.get('content') or '').lower()
+            score = 0
+            for t in toks:
+                if t and t.lower() in txt:
+                    score += 1
+            # 額外加權：較新的/較重要的
+            score = score * 10 + int(m.get('importance_score') or 0)
+            scored.append((score, m))
+        scored.sort(key=lambda x: -x[0])
+        return [m for _, m in scored[:k]]
+    except Exception:
+        return memories[:k]
 
 # 啟動服務器
 if __name__ == "__main__":
