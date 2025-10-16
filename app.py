@@ -2101,18 +2101,30 @@ async def admin_add_credits(req: Request):
     credits = data.get("credits", 0)
     reason = (data.get("reason") or "管理員充值").strip()
 
-    if not identifier or credits <= 0:
-        return JSONResponse(status_code=400, content={"error": "missing_fields"})
+    if not identifier and not user_id:
+        return JSONResponse(status_code=400, content={"error": "missing_fields", "message": "請提供用戶ID或email"})
+    
+    if credits <= 0:
+        return JSONResponse(status_code=400, content={"error": "invalid_credits", "message": "充值點數必須大於0"})
 
     conn = get_conn(); conn.row_factory = sqlite3.Row
     try:
         # 查找用戶
-        row = conn.execute(
-            "SELECT user_id, username, email FROM users_auth WHERE username = ? OR email = ?",
-            (identifier, identifier)
-        ).fetchone()
+        if user_id:
+            # 直接使用user_id查找
+            row = conn.execute(
+                "SELECT user_id, username, email FROM users_auth WHERE user_id = ?",
+                (user_id,)
+            ).fetchone()
+        else:
+            # 使用identifier查找
+            row = conn.execute(
+                "SELECT user_id, username, email FROM users_auth WHERE username = ? OR email = ?",
+                (identifier, identifier)
+            ).fetchone()
+        
         if not row:
-            return JSONResponse(status_code=404, content={"error": "user_not_found"})
+            return JSONResponse(status_code=404, content={"error": "user_not_found", "message": "找不到指定的用戶"})
 
         user_id = row["user_id"]
         
