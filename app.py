@@ -346,6 +346,38 @@ def init_db():
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_time ON orders(user_id, created_at DESC)")
 
+    # 訂閱方案表
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subscription_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            price INTEGER NOT NULL,
+            credits INTEGER NOT NULL,
+            duration_days INTEGER DEFAULT 30,
+            is_active BOOLEAN DEFAULT 1,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    # 用戶訂閱記錄
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            plan_id INTEGER NOT NULL,
+            status TEXT DEFAULT 'active',
+            start_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+            end_date DATETIME,
+            auto_renew BOOLEAN DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (plan_id) REFERENCES subscription_plans (id)
+        )
+        """
+    )
+
     # 管理操作稽核表
     cur.execute(
         """
@@ -2057,6 +2089,218 @@ async def admin_reset_password(req: Request):
         except Exception: pass
         return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
 
+@app.post("/admin/user/add_credits")
+async def admin_add_credits(req: Request):
+    """管理員為用戶充值點數"""
+    if not _check_admin(req):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    
+    data = await req.json()
+    user_id = (data.get("user_id") or "").strip()
+    identifier = (data.get("identifier") or "").strip()  # username 或 email
+    credits = data.get("credits", 0)
+    reason = (data.get("reason") or "管理員充值").strip()
+
+    if not identifier or credits <= 0:
+        return JSONResponse(status_code=400, content={"error": "missing_fields"})
+
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    try:
+        # 查找用戶
+        row = conn.execute(
+            "SELECT user_id, username, email FROM users_auth WHERE username = ? OR email = ?",
+            (identifier, identifier)
+        ).fetchone()
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "user_not_found"})
+
+        user_id = row["user_id"]
+        
+        # 獲取當前點數餘額
+        credit_row = conn.execute(
+            "SELECT balance FROM user_credits WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+        
+        current_balance = credit_row["balance"] if credit_row else 0
+        new_balance = current_balance + credits
+
+        # 更新或插入點數記錄
+        conn.execute(
+            """INSERT INTO user_credits (user_id, balance, updated_at) 
+               VALUES (?, ?, CURRENT_TIMESTAMP) 
+               ON CONFLICT(user_id) DO UPDATE SET 
+               balance = ?, updated_at = CURRENT_TIMESTAMP""",
+            (user_id, new_balance, new_balance)
+        )
+
+        # 記錄訂單
+        conn.execute(
+            """INSERT INTO orders (user_id, order_type, amount, status, description, created_at) 
+               VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+            (user_id, "admin_credit", credits, "completed", reason)
+        )
+
+        # 稽核記錄
+        try:
+            _tok = req.headers.get("x-admin-token") or req.query_params.get("token") or ""
+            admin_hash = hashlib.sha256(_tok.encode("utf-8")).hexdigest() if _tok else None
+            conn.execute(
+                "INSERT INTO admin_audit_logs (action, admin_token_hash, target_user_id, details) VALUES (?, ?, ?, ?)",
+                ("add_credits", admin_hash, user_id, json.dumps({
+                    "username": row["username"], 
+                    "email": row["email"],
+                    "credits_added": credits,
+                    "old_balance": current_balance,
+                    "new_balance": new_balance,
+                    "reason": reason
+                }, ensure_ascii=False))
+            )
+        except Exception as _e:
+            print("[audit] write failed:", _e)
+        
+        conn.commit(); conn.close()
+        return {
+            "ok": True, 
+            "user_id": user_id,
+            "credits_added": credits,
+            "old_balance": current_balance,
+            "new_balance": new_balance
+        }
+
+    except Exception as e:
+        conn.close()
+        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
+
+@app.get("/admin/user/{user_id}/credits")
+async def admin_get_user_credits(user_id: str, req: Request):
+    """查看用戶點數餘額"""
+    if not _check_admin(req):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    try:
+        # 獲取用戶信息
+        user_row = conn.execute(
+            "SELECT user_id, username, email FROM users_auth WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+        
+        if not user_row:
+            return JSONResponse(status_code=404, content={"error": "user_not_found"})
+
+        # 獲取點數餘額
+        credit_row = conn.execute(
+            "SELECT balance, updated_at FROM user_credits WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+        
+        # 獲取訂單記錄
+        orders = conn.execute(
+            "SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 20",
+            (user_id,)
+        ).fetchall()
+        
+        conn.close()
+        
+        return {
+            "user_id": user_id,
+            "username": user_row["username"],
+            "email": user_row["email"],
+            "balance": credit_row["balance"] if credit_row else 0,
+            "updated_at": credit_row["updated_at"] if credit_row else None,
+            "orders": [dict(o) for o in orders]
+        }
+
+    except Exception as e:
+        conn.close()
+        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
+
+@app.get("/api/plans")
+async def get_subscription_plans():
+    """獲取訂閱方案列表"""
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    try:
+        plans = conn.execute(
+            "SELECT * FROM subscription_plans WHERE is_active = 1 ORDER BY price ASC"
+        ).fetchall()
+        conn.close()
+        return {"plans": [dict(p) for p in plans]}
+    except Exception as e:
+        conn.close()
+        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
+
+@app.post("/api/purchase")
+async def purchase_plan(req: Request):
+    """購買訂閱方案"""
+    try:
+        data = await req.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid_json"})
+    
+    user_id = (data.get("user_id") or "").strip()
+    plan_id = data.get("plan_id")
+    payment_method = (data.get("payment_method") or "manual").strip()
+    
+    if not user_id or not plan_id:
+        return JSONResponse(status_code=400, content={"error": "missing_fields"})
+    
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    try:
+        # 獲取方案信息
+        plan = conn.execute(
+            "SELECT * FROM subscription_plans WHERE id = ? AND is_active = 1",
+            (plan_id,)
+        ).fetchone()
+        
+        if not plan:
+            return JSONResponse(status_code=404, content={"error": "plan_not_found"})
+        
+        # 創建訂單
+        order_id = conn.execute(
+            """INSERT INTO orders (user_id, order_type, amount, plan, status, payment_method, created_at, paid_at) 
+               VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
+            (user_id, "subscription", plan["credits"], plan["name"], "paid", payment_method)
+        ).lastrowid
+        
+        # 充值點數
+        credit_row = conn.execute(
+            "SELECT balance FROM user_credits WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+        
+        current_balance = credit_row["balance"] if credit_row else 0
+        new_balance = current_balance + plan["credits"]
+        
+        conn.execute(
+            """INSERT INTO user_credits (user_id, balance, updated_at) 
+               VALUES (?, ?, CURRENT_TIMESTAMP) 
+               ON CONFLICT(user_id) DO UPDATE SET 
+               balance = ?, updated_at = CURRENT_TIMESTAMP""",
+            (user_id, new_balance, new_balance)
+        )
+        
+        # 記錄訂閱
+        conn.execute(
+            """INSERT INTO user_subscriptions (user_id, plan_id, status, start_date, end_date) 
+               VALUES (?, ?, ?, CURRENT_TIMESTAMP, datetime('now', '+{} days'))""",
+            (user_id, plan_id, "active", plan["duration_days"])
+        )
+        
+        conn.commit(); conn.close()
+        
+        return {
+            "ok": True,
+            "order_id": order_id,
+            "plan_name": plan["name"],
+            "credits_added": plan["credits"],
+            "new_balance": new_balance
+        }
+        
+    except Exception as e:
+        conn.close()
+        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
+
 @app.get("/admin/requests_full")
 async def admin_requests_full(req: Request, limit: int = 200, user_id: str | None = None, mode: str | None = None, date_from: str | None = None, date_to: str | None = None):
     if not _check_admin(req):
@@ -3235,6 +3479,16 @@ def select_relevant_memories(query: str, memories: list[dict], k: int = 5) -> li
         return [m for _, m in scored[:k]]
     except Exception:
         return memories[:k]
+
+# ========= 點數系統整合 =========
+try:
+    from .points_integration import integrate_points_system
+    integrate_points_system(app)
+    print("✅ AI Points System integrated successfully")
+except ImportError as e:
+    print(f"⚠️  AI Points System not available: {e}")
+except Exception as e:
+    print(f"❌ Failed to integrate AI Points System: {e}")
 
 # 啟動服務器
 if __name__ == "__main__":
