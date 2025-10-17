@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from typing import List, Optional
 import json
-from .points_system import points_system, PointReason
+from points_system import points_system, PointReason
 
 # 創建路由器
 points_router = APIRouter(prefix="/points", tags=["points"])
@@ -210,12 +210,12 @@ async def admin_expire_sweep(req: Request):
 # ========== 輔助函數 ==========
 
 def get_user_id_from_request(req: Request) -> Optional[str]:
-    """從請求中獲取用戶ID（需要根據您的認證系統調整）"""
+    """從請求中獲取用戶ID（配合現有認證系統）"""
     # 方法1: 從session cookie
     session_cookie = req.cookies.get("session")
     if session_cookie:
         try:
-            from .app import session_signer  # 假設您有這個
+            from app import session_signer
             data = session_signer.loads(session_cookie)
             return data.get("user_id")
         except:
@@ -226,17 +226,17 @@ def get_user_id_from_request(req: Request) -> Optional[str]:
     if auth_header and auth_header.startswith("Bearer "):
         token = auth_header.split(" ")[1]
         # 這裡需要根據您的JWT實現解析token
-        # return parse_jwt_token(token)
         pass
     
     # 方法3: 從查詢參數（臨時方案）
     return req.query_params.get("user_id")
 
 def check_admin_permission(req: Request) -> bool:
-    """檢查管理員權限（需要根據您的管理員系統調整）"""
-    # 這裡需要根據您的管理員認證系統實現
+    """檢查管理員權限（配合現有管理員系統）"""
+    import os
     admin_token = req.headers.get("x-admin-token")
-    return admin_token == "your_admin_token"  # 替換為實際的token檢查
+    expected_token = os.getenv("ADMIN_TOKEN")
+    return admin_token == expected_token
 
 # ========== 定時任務 ==========
 

@@ -57,6 +57,10 @@ app = FastAPI(title="Three AI Agents System with Long-term Memory")
 from chat_stream import router as chat_stream_router
 app.include_router(chat_stream_router)
 
+# 掛載點數系統
+from points_integration import integrate_points_system
+integrate_points_system(app)
+
 # 動態設定 CORS：若需要帶 Cookie 就不能使用 "*"
 # 預設白名單包含 GitHub Pages、Zeabur 前端子網域、正式站子網域與本機
 ORIGINS = os.getenv(

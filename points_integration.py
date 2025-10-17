@@ -4,8 +4,8 @@ AI Points Integration - 點數系統整合到主應用
 """
 
 from fastapi import FastAPI
-from .points_routes import register_points_routes
-from .points_system import points_system
+from points_routes import register_points_routes
+from points_system import points_system
 import asyncio
 from datetime import datetime, timedelta
 
@@ -114,7 +114,7 @@ async def points_middleware(request, call_next):
 # 工具函數
 def add_points_to_user(user_id: str, points: int, reason: str = "gift"):
     """為用戶添加點數（管理員用）"""
-    from .points_system import PointReason
+    from points_system import PointReason
     points_system.add_points(
         user_id=user_id,
         points=points,
