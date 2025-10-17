@@ -28,15 +28,27 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 驗證安裝
 RUN python -c "import fastapi; print('FastAPI version:', fastapi.__version__)"
 
-# 複製測試應用
-COPY app_test.py /app/app.py
+# 複製應用程式碼
+COPY app.py /app/
+COPY chat_stream.py /app/
+COPY knowledge_text_loader.py /app/
+COPY points_system.py /app/
+COPY points_routes.py /app/
+COPY points_integration.py /app/
+
+# 複製 admin 資料夾
+COPY admin/ /app/admin/
+
+# 放知識庫進容器
+COPY data/kb.txt /data/kb.txt
 
 # 建立必要目錄
 RUN mkdir -p /data && chmod 777 /data
 
 # 設定環境變數
-ENV DB_PATH=/data/test.db
+ENV DB_PATH=/data/three_agents_system.db
 ENV GEMINI_MODEL=gemini-2.5-flash
+ENV KNOWLEDGE_TXT_PATH=/data/kb.txt
 
 EXPOSE 8080
 
