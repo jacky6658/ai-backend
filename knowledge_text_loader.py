@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Simple knowledge text loader + retriever
-- Reads from env KNOWLEDGE_TXT_PATH (default: /data/kb.txt)
+- Reads from env KNOWLEDGE_TXT_PATH (default: /data/data/kb.txt)
 - If not found, will try to concatenate /data/kb*.txt and /data/*.txt
 - Provides:
     load_knowledge_text(force: bool=False) -> str
@@ -36,15 +36,15 @@ def _read_file(path: str) -> str:
 
 def _gather_all_text() -> str:
     """Try the env path first; if not found, concatenate candidates under /data."""
-    env_path = os.getenv("KNOWLEDGE_TXT_PATH", "/data/kb.txt")
+    env_path = os.getenv("KNOWLEDGE_TXT_PATH", "/data/data/kb.txt")
     if os.path.exists(env_path):
         t = _read_file(env_path)
         if t.strip():
             return t
 
     buf = []
-    # prefer kb*.txt first
-    for pattern in ("/data/kb*.txt", "/data/*.txt"):
+    # prefer kb*.txt first, including nested directories
+    for pattern in ("/data/data/kb*.txt", "/data/kb*.txt", "/data/*.txt"):
         for p in sorted(glob.glob(pattern)):
             try:
                 # skip obviously non-knowledge files
@@ -198,4 +198,3 @@ def retrieve_context(query: str, k: int = 3, max_chars: int = 1200) -> str:
         used += len(chunk) + 2
 
     return "\n---\n".join(picked)
-

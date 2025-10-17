@@ -19,14 +19,18 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 複製程式碼
 COPY app.py /app/
+COPY chat_stream.py /app/
 COPY knowledge_text_loader.py /app/
+COPY points_system.py /app/
+COPY points_routes.py /app/
+COPY points_integration.py /app/
 
-# 放知識庫進容器（改成正確路徑）
-COPY data/data/kb.txt /data/kb.txt
+# 放知識庫進容器
+COPY kb.txt /data/kb.txt
 
 # 設定環境變數
 ENV GEMINI_MODEL=gemini-2.5-flash
-ENV DB_PATH=/data/script_generation.db
+ENV DB_PATH=/data/three_agents_system.db
 ENV KNOWLEDGE_TXT_PATH=/data/kb.txt
 
 EXPOSE 8080

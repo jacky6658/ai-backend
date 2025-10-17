@@ -1,0 +1,872 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AIJob短影音智能-管理後台</title>
+  <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,'Noto Sans TC',sans-serif;margin:24px;color:#111;background:#fafafa}
+    .wrap{max-width:1200px;margin:0 auto}
+    .grid{display:grid;grid-template-columns:1fr;gap:16px}
+    @media (min-width:960px){.grid{grid-template-columns:1fr 1fr}}
+    .card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px}
+    .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    input,button,select{padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;background:#fff}
+    button.primary{background:#111;color:#fff;border-color:#111}
+    table{border-collapse:collapse;width:100%}
+    th,td{border:1px solid #e5e7eb;padding:8px;text-align:left;vertical-align:top;font-size:13px}
+    th{background:#f8fafc}
+    .muted{color:#6b7280}
+    .right{margin-left:auto}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono','Courier New',monospace}
+    
+    /* 日/夜模式 */
+    body.dark{background:#0f172a;color:#e5e7eb}
+    .dark .card{background:#0b1220;border-color:#1f2937}
+    .dark input,.dark button,.dark select{background:#111827;color:#e5e7eb;border-color:#374151}
+    .dark th,.dark td{border-color:#1f2937}
+    .dark th{background:#0f172a}
+    .dark .muted{color:#9ca3af}
+    .dark .barWrap{background:#111827;border-color:#374151}
+    
+    /* 儀表板樣式 */
+    .kpiGrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    @media (min-width:960px){.kpiGrid{grid-template-columns:repeat(4,1fr)}}
+    .kpiCard{border:1px solid #e5e7eb;border-radius:12px;padding:12px}
+    .kpi-title{font-size:12px;color:#6b7280;margin-bottom:6px}
+    .kpi-value{font-size:28px;font-weight:700}
+    .barWrap{display:flex;height:12px;border-radius:999px;overflow:hidden;background:#f3f4f6;border:1px solid #e5e7eb;margin-top:8px}
+    .bar{height:100%;background:#2563eb}
+    .bar2{height:100%;background:#10b981}
+    
+    /* 彩色 KPI */
+    .kpi-blue{background:linear-gradient(180deg,#e8f0ff,#f5f8ff)}
+    .kpi-green{background:linear-gradient(180deg,#e7f8f1,#f3fbf7)}
+    .kpi-purple{background:linear-gradient(180deg,#efe9ff,#f7f4ff)}
+    .kpi-amber{background:linear-gradient(180deg,#fff3d6,#fff8e8)}
+    .dark .kpi-blue{background:linear-gradient(180deg,#0b1a3a,#0f234d)}
+    .dark .kpi-green{background:linear-gradient(180deg,#0d2a21,#123528)}
+    .dark .kpi-purple{background:linear-gradient(180deg,#1a0f3a,#23124d)}
+    .dark .kpi-amber{background:linear-gradient(180deg,#3a2a0b,#4d3612)}
+    
+    /* 導航選單樣式 */
+    .admin-nav{background:#fff;border:1px solid #e5e7eb;border-radius:12px;margin-bottom:16px;overflow:hidden}
+    .dark .admin-nav{background:#0b1220;border-color:#1f2937}
+    .nav-container{display:flex;flex-wrap:wrap;gap:0}
+    .nav-item{display:flex;align-items:center;gap:8px;padding:12px 16px;border:none;background:none;cursor:pointer;transition:all 0.2s;border-right:1px solid #e5e7eb;color:#6b7280;font-size:14px;flex:1;min-width:120px;justify-content:center}
+    .dark .nav-item{border-right-color:#1f2937;color:#9ca3af}
+    .nav-item:last-child{border-right:none}
+    .nav-item:hover{background:#f8fafc;color:#111}
+    .dark .nav-item:hover{background:#1f2937;color:#e5e7eb}
+    .nav-item.active{background:#111;color:#fff;font-weight:500}
+    .dark .nav-item.active{background:#3b82f6;color:#fff}
+    .nav-icon{font-size:16px}
+    .nav-text{font-weight:500}
+    
+    /* 頁面內容區域 */
+    .page-content{display:none}
+    .page-content.active{display:block}
+    
+    /* 響應式導航 */
+    @media (max-width:768px){
+      .nav-container{flex-direction:column}
+      .nav-item{border-right:none;border-bottom:1px solid #e5e7eb;min-width:auto;justify-content:flex-start}
+      .dark .nav-item{border-bottom-color:#1f2937}
+      .nav-item:last-child{border-bottom:none}
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1 style="margin:0 0 16px 0">AIJob短影音智能-管理後台</h1>
+    
+    <!-- 導航選單 -->
+    <nav class="admin-nav">
+      <div class="nav-container">
+        <button class="nav-item active" data-page="dashboard">
+          <span class="nav-icon">📊</span>
+          <span class="nav-text">總儀表板</span>
+        </button>
+        <button class="nav-item" data-page="users">
+          <span class="nav-icon">👥</span>
+          <span class="nav-text">用戶管理</span>
+        </button>
+        <button class="nav-item" data-page="usage">
+          <span class="nav-icon">📈</span>
+          <span class="nav-text">使用統計</span>
+        </button>
+        <button class="nav-item" data-page="credits">
+          <span class="nav-icon">💰</span>
+          <span class="nav-text">點數管理</span>
+        </button>
+        <button class="nav-item" data-page="requests">
+          <span class="nav-icon">📝</span>
+          <span class="nav-text">請求記錄</span>
+        </button>
+        <button class="nav-item" data-page="messages">
+          <span class="nav-icon">💬</span>
+          <span class="nav-text">訊息記錄</span>
+        </button>
+        <button class="nav-item" data-page="analytics">
+          <span class="nav-icon">📊</span>
+          <span class="nav-text">數據分析</span>
+        </button>
+        <button class="nav-item" data-page="audit">
+          <span class="nav-icon">🔍</span>
+          <span class="nav-text">稽核日誌</span>
+        </button>
+      </div>
+    </nav>
+
+    <div class="card row">
+      <label>API Base：<input id="apiBase" placeholder="例如：https://aijobvideobackend.zeabur.app" style="width:360px"></label>
+      <label>Admin Token：<input id="admTok" placeholder="若後端未設定可留空" style="width:260px"></label>
+      <button class="primary" onclick="saveConfig()">儲存</button>
+      <button id="themeBtn" title="切換日/夜">切換日/夜</button>
+      <a id="dlUsers" href="#" class="right">下載 Users CSV</a>
+      <a id="dlUsage" href="#" style="margin-left:8px">下載 Usage CSV</a>
+    </div>
+
+    <!-- 總儀表板頁面 -->
+    <div class="page-content active" id="dashboard-page">
+      <div class="card" id="dashboard">
+        <div class="row">
+          <strong>儀表板</strong>
+          <span class="muted">即時統計（依最新載入資料）</span>
+          <button class="right" onclick="loadAll()">重新整理</button>
+        </div>
+        <div class="kpiGrid" style="margin-top:10px">
+          <div class="kpiCard kpi-blue">
+            <div class="kpi-title">總使用者數</div>
+            <div class="kpi-value" id="kpiUsers">-</div>
+          </div>
+          <div class="kpiCard kpi-green">
+            <div class="kpi-title">總請求數</div>
+            <div class="kpi-value" id="kpiTotalReq">-</div>
+          </div>
+          <div class="kpiCard kpi-purple">
+            <div class="kpi-title">今日請求數</div>
+            <div class="kpi-value" id="kpiToday">-</div>
+          </div>
+          <div class="kpiCard kpi-amber">
+            <div class="kpi-title">近7日請求</div>
+            <div class="kpi-value" id="kpi7d">-</div>
+          </div>
+        </div>
+
+        <div class="grid" style="margin-top:12px">
+          <div class="card" style="padding:12px">
+            <div class="row"><strong>功能使用分布</strong></div>
+            <canvas id="modeChart" width="260" height="160" style="background:transparent"></canvas>
+            <canvas id="agentChart" width="260" height="160" style="background:transparent"></canvas>
+            <div class="row" style="margin-top:6px"><span class="muted">mode：</span><span id="lblMode" class="mono"></span><span class="muted" style="margin-left:8px">agent：</span><span id="lblAgent" class="mono"></span></div>
+          </div>
+          <div class="card" style="padding:12px">
+            <div class="row"><strong>近7日趨勢</strong><span class="muted">每日請求</span></div>
+            <canvas id="trendCanvas" width="500" height="120" style="width:100%;height:120px"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 用戶管理頁面 -->
+    <div class="page-content" id="users-page">
+      <div class="grid">
+        <div class="card">
+          <div class="row">
+            <strong>帳號管理</strong>
+            <button class="right" onclick="loadUsersAuth()">重新載入</button>
+          </div>
+          <div class="row" style="margin-top:8px;gap:8px">
+            <input id="qAuth" placeholder="搜尋 username / email / user_id" style="flex:1">
+            <input id="rpUserId" placeholder="user_id" style="width:120px">
+            <input id="rpPass" placeholder="新密碼（至少6碼）" type="password" style="width:220px">
+            <button onclick="resetPassword()">重設密碼</button>
+          </div>
+          <div style="overflow:auto;max-height:300px;margin-top:10px">
+            <table id="tblAuth"><thead><tr>
+              <th>id</th><th>user_id</th><th>username</th><th>email</th><th>phone</th><th>created_at</th>
+            </tr></thead><tbody></tbody></table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="row">
+            <strong>用戶列表</strong>
+            <input id="qUser" placeholder="搜尋 email / username / user_id" class="right" style="flex:1" oninput="renderUsers()">
+            <button onclick="loadAll()">重新載入</button>
+          </div>
+          <div style="overflow:auto;max-height:420px;margin-top:10px">
+            <table id="tblUsers"><thead><tr>
+              <th>user_id</th><th>email</th><th>name</th><th>username</th><th>phone</th><th>has_password</th><th>created_at</th>
+            </tr></thead><tbody></tbody></table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 使用統計頁面 -->
+    <div class="page-content" id="usage-page">
+      <div class="card">
+        <div class="row">
+          <strong>使用統計</strong>
+          <span class="muted">用戶使用情況分析</span>
+          <button class="right" onclick="loadUsage()">重新載入</button>
+        </div>
+        <div class="row" style="margin-top:8px;gap:8px">
+          <label>顯示數量：
+            <select id="usageLimit">
+              <option>30</option>
+              <option selected>100</option>
+              <option>200</option>
+            </select>
+          </label>
+          <input id="qReq" placeholder="關鍵字（user_input / mode）" class="right" style="flex:1" oninput="renderReq()">
+        </div>
+        <div class="muted" id="reqSummary" style="margin:8px 0 0 0"></div>
+        <div style="overflow:auto;max-height:420px;margin-top:10px">
+          <table id="tblReq"><thead><tr>
+            <th>id</th><th>created_at</th><th>mode</th><th>user_input</th>
+          </tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+    </div>
+
+    <!-- 點數管理頁面 -->
+    <div class="page-content" id="credits-page">
+      <div class="card">
+        <div class="row"><strong>用戶點數 / 訂單</strong><button class="right" onclick="loadUsersFull()">重新載入</button></div>
+        <div class="grid" style="margin-top:8px">
+          <div class="card" style="padding:12px">
+            <div class="row"><strong>Credits</strong></div>
+            <div id="creditsList" class="mono" style="max-height:240px;overflow:auto"></div>
+          </div>
+          <div class="card" style="padding:12px">
+            <div class="row"><strong>Orders</strong></div>
+            <div id="ordersList" class="mono" style="max-height:240px;overflow:auto"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 用戶充值功能 -->
+      <div class="card">
+        <div class="row"><strong>💰 用戶充值管理</strong></div>
+        <div style="margin-top:12px; padding:12px; background:#f8f9fa; border-radius:8px;">
+          <div class="grid" style="grid-template-columns:1fr 1fr; gap:12px;">
+            <div>
+              <label style="display:block; margin-bottom:4px; font-weight:500;">用戶識別</label>
+              <input type="text" id="creditUserInput" placeholder="用戶ID 或 Email" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:4px;">
+            </div>
+            <div>
+              <label style="display:block; margin-bottom:4px; font-weight:500;">充值點數</label>
+              <input type="number" id="creditAmountInput" placeholder="輸入點數" min="1" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:4px;">
+            </div>
+          </div>
+          <div style="margin-top:8px;">
+            <label style="display:block; margin-bottom:4px; font-weight:500;">充值原因</label>
+            <input type="text" id="creditReasonInput" placeholder="管理員充值" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:4px;">
+          </div>
+          <div style="margin-top:12px; display:flex; gap:8px;">
+            <button onclick="addUserCredits()" style="background:#28a745; color:white; border:none; padding:8px 16px; border-radius:4px; cursor:pointer;">💳 立即充值</button>
+            <button onclick="checkUserCredits()" style="background:#17a2b8; color:white; border:none; padding:8px 16px; border-radius:4px; cursor:pointer;">🔍 查看餘額</button>
+          </div>
+          <div id="creditResult" style="margin-top:12px; padding:8px; border-radius:4px; display:none;"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 請求記錄頁面 -->
+    <div class="page-content" id="requests-page">
+      <div class="card">
+        <div class="row">
+          <strong>請求記錄</strong>
+          <span class="muted">詳細請求記錄與分析</span>
+          <button class="right" onclick="loadUsage()">重新載入</button>
+        </div>
+        <div class="row" style="margin-top:8px;gap:8px">
+          <label>顯示數量：
+            <select id="usageLimit">
+              <option>30</option>
+              <option selected>100</option>
+              <option>200</option>
+            </select>
+          </label>
+          <input id="qReq" placeholder="關鍵字（user_input / mode）" class="right" style="flex:1" oninput="renderReq()">
+        </div>
+        <div class="muted" id="reqSummary" style="margin:8px 0 0 0"></div>
+        <div style="overflow:auto;max-height:420px;margin-top:10px">
+          <table id="tblReq"><thead><tr>
+            <th>id</th><th>created_at</th><th>mode</th><th>user_input</th>
+          </tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+    </div>
+
+    <!-- 訊息記錄頁面 -->
+    <div class="page-content" id="messages-page">
+      <div class="card">
+        <div class="row">
+          <strong>訊息記錄</strong>
+          <span class="muted">AI對話訊息記錄</span>
+          <button class="right" onclick="loadInspect()">重新載入</button>
+        </div>
+        <div class="row" style="margin-top:8px;gap:8px">
+          <input id="fUserId" placeholder="user_id" style="margin-left:auto">
+          <input id="fSessionId" placeholder="session_id">
+          <input id="fDateFrom" placeholder="起始日期 YYYY-MM-DD">
+          <input id="fDateTo" placeholder="結束日期 YYYY-MM-DD">
+          <select id="fMode"><option value="">mode(全部)</option><option>script</option><option>copy</option></select>
+          <select id="fAgent"><option value="">agent(全部)</option><option>positioning</option><option>topics</option><option>script</option></select>
+          <button onclick="loadInspect()">查詢</button>
+          <button onclick="downloadJSON()">下載JSON</button>
+          <button onclick="downloadCSV()">下載CSV</button>
+        </div>
+        <div class="grid" style="margin-top:10px">
+          <div class="card" style="padding:12px">
+            <div class="row"><strong>Messages</strong></div>
+            <div id="msgList" style="max-height:260px;overflow:auto" class="mono"></div>
+          </div>
+          <div class="card" style="padding:12px">
+            <div class="row"><strong>Requests (full)</strong></div>
+            <div id="reqFullList" style="max-height:260px;overflow:auto" class="mono"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 數據分析頁面 -->
+    <div class="page-content" id="analytics-page">
+      <div class="card">
+        <div class="row">
+          <strong>數據分析</strong>
+          <span class="muted">深度數據分析與洞察</span>
+          <button class="right" onclick="loadAnalytics()">重新載入</button>
+        </div>
+        <div class="grid" style="margin-top:12px">
+          <div class="card" style="padding:12px">
+            <div class="row"><strong>功能使用分布</strong></div>
+            <canvas id="modeChart" width="260" height="160" style="background:transparent"></canvas>
+            <canvas id="agentChart" width="260" height="160" style="background:transparent"></canvas>
+          </div>
+          <div class="card" style="padding:12px">
+            <div class="row"><strong>近7日趨勢</strong><span class="muted">每日請求</span></div>
+            <canvas id="trendCanvas" width="500" height="120" style="width:100%;height:120px"></canvas>
+          </div>
+        </div>
+        <div class="row" style="margin-top:6px"><span class="muted">mode：</span><span id="lblMode" class="mono"></span><span class="muted" style="margin-left:8px">agent：</span><span id="lblAgent" class="mono"></span></div>
+      </div>
+    </div>
+
+    <!-- 稽核日誌頁面 -->
+    <div class="page-content" id="audit-page">
+      <div class="card">
+        <div class="row">
+          <strong>稽核日誌</strong>
+          <span class="muted">管理員操作記錄</span>
+          <button class="right" onclick="loadAuditLogs()">重新載入</button>
+        </div>
+        <div style="overflow:auto;max-height:500px;margin-top:10px">
+          <div id="auditLogs" class="mono" style="padding:8px;background:#f8f9fa;border-radius:4px;"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <strong>Google Sheet 連動</strong>
+        <span class="muted">（可複製為 `=IMPORTDATA(API_BASE & "/export/google-sheet-flat-v2?limit=500")`）</span>
+      </div>
+      <div class="mono" id="gsExample" style="margin-top:8px;font-size:13px"></div>
+    </div>
+  </div>
+
+  <script>
+    // 複製原有的完整JavaScript功能
+    const $ = s => document.querySelector(s);
+    function applyTheme(dark){
+      if (dark){ document.body.classList.add('dark'); } else { document.body.classList.remove('dark'); }
+      localStorage.setItem('ADMIN_DARK', dark? '1':'0');
+      try{ renderDashboard(); }catch(_){ }
+    }
+    (function initTheme(){
+      const dark = localStorage.getItem('ADMIN_DARK') === '1';
+      applyTheme(dark);
+      const btn = document.getElementById('themeBtn');
+      if (btn){ btn.addEventListener('click', ()=> applyTheme(!document.body.classList.contains('dark'))); }
+    })();
+    function getConfig(){
+      return {
+        base: localStorage.getItem('ADMIN_API_BASE') || (location.hostname==='localhost' ? 'http://localhost:8080' : 'https://aijobvideobackend.zeabur.app'),
+        tok: localStorage.getItem('ADMIN_TOKEN') || ''
+      }
+    }
+    function applyConfig(){
+      const cfg = getConfig();
+      $('#apiBase').value = cfg.base;
+      $('#admTok').value = cfg.tok;
+      const q = cfg.tok ? ('?token='+encodeURIComponent(cfg.tok)) : '';
+      $('#dlUsers').href = cfg.base + '/admin/users.csv' + q;
+      $('#dlUsage').href = cfg.base + '/admin/usage.csv' + q;
+      $('#gsExample').textContent = '=IMPORTDATA("' + cfg.base + '/export/google-sheet-flat-v2?limit=500")';
+    }
+    function saveConfig(){
+      const base = ($('#apiBase').value||'').trim();
+      const tok = ($('#admTok').value||'').trim();
+      if (base){ localStorage.setItem('ADMIN_API_BASE', base) }
+      localStorage.setItem('ADMIN_TOKEN', tok)
+      applyConfig();
+      loadAll();
+    }
+
+    let users=[], authMap={}; let latest=[]; let totalRequests=0; let usersAuth=[]; let analytics=null; let lastInspect={messages:[], requests:[]};
+    let credits=[], orders=[];
+
+    async function loadAll(){
+      await Promise.all([loadUsers(), loadUsage(), loadAnalytics()]);
+    }
+    async function loadUsers(){
+      const {base, tok} = getConfig();
+      const hdr = tok? {'x-admin-token':tok} : {};
+      const res = await fetch(base + '/admin/users', {headers: hdr});
+      const u = await res.json();
+      users = (u.users||[]); const ua = u.users_auth||[]; authMap={}; ua.forEach(a=>authMap[a.user_id]=a);
+      renderUsers(); applyConfig();
+    }
+    async function loadUsage(){
+      const {base, tok} = getConfig();
+      const hdr = tok? {'x-admin-token':tok} : {};
+      const limit = Number($('#usageLimit').value||100);
+      const res = await fetch(base + '/admin/usage?limit=' + encodeURIComponent(limit), {headers: hdr});
+      const g = await res.json();
+      latest = g.latest||[]; totalRequests = g.total_requests||0;
+      $('#reqSummary').textContent = '總請求數：' + totalRequests + '，本次顯示：' + latest.length;
+      renderReq(); renderDashboard(); applyConfig();
+    }
+
+    async function loadAnalytics(){
+      const {base, tok} = getConfig();
+      const hdr = tok? {'x-admin-token':tok} : {};
+      const res = await fetch(base + '/admin/analytics', {headers: hdr});
+      analytics = await res.json();
+      try{ renderDashboard(); }catch(_){ }
+    }
+
+    async function loadUsersFull(){
+      const {base, tok} = getConfig();
+      const hdr = tok? {'x-admin-token':tok} : {};
+      const data = await fetch(base + '/admin/users_full', {headers: hdr}).then(r=>r.json());
+      credits = data.credits||[]; orders = data.orders||[];
+      renderBilling();
+    }
+
+    function renderUsers(){
+      const q = ($('#qUser').value||'').toLowerCase();
+      const tb = $('#tblUsers tbody'); tb.innerHTML='';
+      users.filter(u=>{
+        const a = authMap[u.user_id]||{};
+        const hay = [u.user_id,u.email,u.name,a.username,a.phone].join(' ').toLowerCase();
+        return !q || hay.includes(q);
+      }).slice(0,500).forEach(u=>{
+        const a = authMap[u.user_id]||{};
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${u.user_id}</td><td>${u.email||''}</td><td>${u.name||''}</td><td>${a.username||''}</td><td>${a.phone||''}</td><td>${a.has_password? 'Yes':'No'}</td><td>${u.created_at||''}</td>`;
+        tb.appendChild(tr);
+      });
+    }
+
+    function renderReq(){
+      const q = ($('#qReq').value||'').toLowerCase();
+      const tb = $('#tblReq tbody'); tb.innerHTML='';
+      latest.filter(r=>{
+        const hay = [r.user_input,r.mode].join(' ').toLowerCase();
+        return !q || hay.includes(q);
+      }).forEach(r=>{
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${r.id}</td><td>${r.created_at}</td><td>${r.mode}</td><td>${(r.user_input||'').slice(0,300)}</td>`;
+        tb.appendChild(tr);
+      });
+    }
+
+    function parseTime(s){
+      if (!s) return new Date();
+      let d = new Date(s);
+      if (isNaN(d)) d = new Date((s||'').replace(' ', 'T'));
+      if (isNaN(d)) {
+        try{
+          const [datePart,timePart] = (s||'').split(' ');
+          const [y,m,dd] = datePart.split('-').map(Number);
+          const [hh,mm,ss] = (timePart||'0:0:0').split(':').map(Number);
+          d = new Date(y, (m||1)-1, dd||1, hh||0, mm||0, ss||0);
+        }catch(_){ d = new Date(); }
+      }
+      return d;
+    }
+
+    function renderDashboard(){
+      const a = analytics||{};
+      // KPI 數字（優先用 /admin/analytics）
+      $('#kpiUsers').textContent = String(a.total_users ?? users.length ?? 0);
+      $('#kpiTotalReq').textContent = String(a.total_requests ?? totalRequests ?? 0);
+
+      const now = new Date();
+      const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const start7d = new Date(startToday.getTime() - 6*24*3600*1000);
+
+      const byDay = {};
+      if (a.last7d && Array.isArray(a.last7d)){
+        for (const it of a.last7d){ byDay[it.date] = it.count; }
+      } else {
+        for (const r of latest){
+          const t = parseTime(r.created_at);
+          const key = t.getFullYear()+'-'+String(t.getMonth()+1).padStart(2,'0')+'-'+String(t.getDate()).padStart(2,'0');
+          byDay[key] = (byDay[key]||0)+1;
+        }
+      }
+      $('#kpiToday').textContent = String(a.today_requests ?? 0);
+      $('#kpi7d').textContent = String(Object.values(byDay).reduce((s,v)=>s+v,0));
+
+      // 模式與智能體分佈
+      const modeData = a.by_mode || {}; // e.g. {script:100, copy:60}
+      const agentData = a.by_agent || {}; // e.g. {positioning:20, topics:10, script:30}
+      drawPieOrBar('modeChart', modeData);
+      drawPieOrBar('agentChart', agentData);
+      $('#lblMode').textContent = JSON.stringify(modeData);
+      $('#lblAgent').textContent = JSON.stringify(agentData);
+
+      // 近7日趨勢
+      const days=[]; for(let i=6;i>=0;i--){ const d=new Date(startToday.getTime()-i*24*3600*1000); const key=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); days.push({key, val: byDay[key]||0}); }
+      drawTrend(days);
+    }
+
+    function drawTrend(points){
+      const c = document.getElementById('trendCanvas'); if (!c) return;
+      const ctx = c.getContext('2d');
+      const W = c.width, H = c.height;
+      ctx.clearRect(0,0,W,H);
+      const dark = document.body.classList.contains('dark');
+      // 軸線
+      ctx.strokeStyle = dark? '#1f2937' : '#e5e7eb'; ctx.lineWidth = 1;
+      for(let i=0;i<4;i++){ const y = H-10 - i*((H-30)/3); ctx.beginPath(); ctx.moveTo(35, y); ctx.lineTo(W-10, y); ctx.stroke(); }
+      // 資料
+      const maxV = Math.max(1, ...points.map(p=>p.val));
+      const dx = (W-60)/(points.length-1);
+      ctx.strokeStyle = dark? '#38bdf8' : '#2563eb'; ctx.lineWidth = 2; ctx.beginPath();
+      points.forEach((p,idx)=>{
+        const x = 35 + idx*dx;
+        const y = H-10 - (p.val/maxV)*(H-30);
+        if(idx===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      });
+      ctx.stroke();
+      // 點與標籤
+      ctx.fillStyle = dark? '#38bdf8' : '#2563eb';
+      points.forEach((p,idx)=>{
+        const x = 35 + idx*dx;
+        const y = H-10 - (p.val/maxV)*(H-30);
+        ctx.beginPath(); ctx.arc(x,y,3,0,Math.PI*2); ctx.fill();
+      });
+    }
+
+    function drawPieOrBar(canvasId, data){
+      const c = document.getElementById(canvasId); if(!c) return;
+      const ctx = c.getContext('2d');
+      const W = c.width, H = c.height; ctx.clearRect(0,0,W,H);
+      const dark = document.body.classList.contains('dark');
+      const keys = Object.keys(data||{}); const vals = keys.map(k=>data[k]||0);
+      const total = vals.reduce((s,v)=>s+v,0) || 1;
+      // 若項目<=3 用圓餅，否則用直條
+      if (keys.length<=3){
+        let start=0; const colors=['#2563eb','#10b981','#f59e0b','#8b5cf6','#ef4444'];
+        keys.forEach((k,i)=>{
+          const ang = (vals[i]/total)*Math.PI*2; ctx.beginPath(); ctx.moveTo(W/2,H/2); ctx.fillStyle=colors[i%colors.length]; ctx.arc(W/2,H/2, Math.min(W,H)/2-8, start, start+ang); ctx.closePath(); ctx.fill(); start+=ang;
+        });
+      } else {
+        const bw = W/keys.length; const maxV = Math.max(1, ...vals);
+        keys.forEach((k,i)=>{
+          const h = (vals[i]/maxV)*(H-20); const x = i*bw; const y = H-10-h;
+          ctx.fillStyle = dark? '#374151' : '#e5e7eb'; ctx.fillRect(x+2, y, bw-4, h);
+        });
+      }
+    }
+
+    function renderBilling(){
+      const cDiv = document.getElementById('creditsList');
+      const oDiv = document.getElementById('ordersList');
+      if (cDiv){
+        cDiv.innerHTML = (credits||[]).map(x=>`<div>${x.user_id}: balance=${x.balance} (upd:${x.updated_at||''})</div>`).join('');
+      }
+      if (oDiv){
+        oDiv.innerHTML = (orders||[]).map(x=>`<div>#${x.id} ${x.user_id} ${x.order_type} ${x.amount} ${x.plan||''} [${x.status}] ${x.created_at}</div>`).join('');
+      }
+    }
+
+    // 用戶充值功能
+    async function addUserCredits(){
+      const userInput = document.getElementById('creditUserInput').value.trim();
+      const amountInput = document.getElementById('creditAmountInput').value.trim();
+      const reasonInput = document.getElementById('creditReasonInput').value.trim() || '管理員充值';
+      const resultDiv = document.getElementById('creditResult');
+      
+      if (!userInput || !amountInput) {
+        showCreditResult('請填寫用戶識別和充值點數', 'error');
+        return;
+      }
+      
+      const amount = parseInt(amountInput);
+      if (isNaN(amount) || amount <= 0) {
+        showCreditResult('充值點數必須是大於0的數字', 'error');
+        return;
+      }
+      
+      // 確認操作
+      if (!confirm(`確認為用戶 "${userInput}" 充值 ${amount} 點數嗎？`)) {
+        return;
+      }
+      
+      try {
+        const {base, tok} = getConfig();
+        const response = await fetch(base + '/admin/user/add_credits', {
+          method: 'POST',
+          headers: {
+            'x-admin-token': tok,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            identifier: userInput,
+            credits: amount,
+            reason: reasonInput
+          })
+        });
+        
+        const data = await response.json();
+        
+        if (response.ok) {
+          showCreditResult(
+            `✅ 充值成功！<br/>
+             👤 用戶ID: ${data.user_id}<br/>
+             💰 充值點數: +${data.credits_added}<br/>
+             📊 原餘額: ${data.old_balance}<br/>
+             📊 新餘額: ${data.new_balance}`, 
+            'success'
+          );
+          
+          // 清空表單
+          document.getElementById('creditUserInput').value = '';
+          document.getElementById('creditAmountInput').value = '';
+          document.getElementById('creditReasonInput').value = '';
+          
+          // 重新載入數據
+          loadUsersFull();
+        } else {
+          showCreditResult(`❌ 充值失敗: ${data.error || '未知錯誤'}`, 'error');
+        }
+      } catch (error) {
+        showCreditResult(`❌ 請求失敗: ${error.message}`, 'error');
+      }
+    }
+    
+    async function checkUserCredits(){
+      const userInput = document.getElementById('creditUserInput').value.trim();
+      const resultDiv = document.getElementById('creditResult');
+      
+      if (!userInput) {
+        showCreditResult('請輸入用戶ID或Email', 'error');
+        return;
+      }
+      
+      try {
+        const {base, tok} = getConfig();
+        const response = await fetch(base + '/admin/user/' + encodeURIComponent(userInput) + '/credits', {
+          headers: {'x-admin-token': tok}
+        });
+        
+        const data = await response.json();
+        
+        if (response.ok) {
+          showCreditResult(
+            `👤 用戶: ${data.username} (${data.email})<br/>
+             💰 當前點數餘額: ${data.balance}<br/>
+             📅 最後更新: ${data.updated_at || 'N/A'}`, 
+            'info'
+          );
+        } else {
+          showCreditResult(`❌ 查詢失敗: ${data.error || '用戶不存在'}`, 'error');
+        }
+      } catch (error) {
+        showCreditResult(`❌ 請求失敗: ${error.message}`, 'error');
+      }
+    }
+    
+    function showCreditResult(message, type){
+      const resultDiv = document.getElementById('creditResult');
+      resultDiv.style.display = 'block';
+      resultDiv.innerHTML = message;
+      
+      // 根據類型設置樣式
+      resultDiv.style.backgroundColor = type === 'success' ? '#d4edda' : 
+                                       type === 'error' ? '#f8d7da' : '#d1ecf1';
+      resultDiv.style.color = type === 'success' ? '#155724' : 
+                             type === 'error' ? '#721c24' : '#0c5460';
+      resultDiv.style.border = `1px solid ${type === 'success' ? '#c3e6cb' : 
+                                        type === 'error' ? '#f5c6cb' : '#bee5eb'}`;
+    }
+
+    async function loadUsersAuth(){
+      const {base, tok} = getConfig();
+      const hdr = tok? {'x-admin-token':tok} : {};
+      const res = await fetch(base + '/admin/users_auth?limit=1000', {headers: hdr});
+      const data = await res.json();
+      usersAuth = data.users_auth || [];
+      renderUsersAuth();
+    }
+
+    function renderUsersAuth(){
+      const tb = $('#tblAuth tbody'); tb.innerHTML='';
+      usersAuth.forEach(a=>{
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${a.id}</td><td>${a.user_id}</td><td>${a.username||''}</td><td>${a.email||''}</td><td>${a.phone||''}</td><td>${a.created_at||''}</td>`;
+        tb.appendChild(tr);
+      });
+    }
+
+    function resetPassword(){
+      const userId = $('#rpUserId').value.trim();
+      const newPass = $('#rpPass').value.trim();
+      if (!userId || !newPass || newPass.length < 6) {
+        alert('請填寫用戶ID和新密碼（至少6碼）');
+        return;
+      }
+      // 這裡添加重設密碼的API調用
+      alert('重設密碼功能開發中');
+    }
+
+    async function loadInspect(){
+      const {base, tok} = getConfig();
+      const hdr = tok? {'x-admin-token':tok} : {};
+      const params = new URLSearchParams();
+      if ($('#fUserId').value) params.set('user_id', $('#fUserId').value);
+      if ($('#fSessionId').value) params.set('session_id', $('#fSessionId').value);
+      if ($('#fDateFrom').value) params.set('date_from', $('#fDateFrom').value);
+      if ($('#fDateTo').value) params.set('date_to', $('#fDateTo').value);
+      if ($('#fMode').value) params.set('mode', $('#fMode').value);
+      if ($('#fAgent').value) params.set('agent', $('#fAgent').value);
+      
+      const res = await fetch(base + '/admin/messages?' + params.toString(), {headers: hdr});
+      const data = await res.json();
+      lastInspect = data;
+      renderInspect();
+    }
+
+    function renderInspect(){
+      const msgDiv = $('#msgList');
+      const reqDiv = $('#reqFullList');
+      if (msgDiv) msgDiv.innerHTML = (lastInspect.messages||[]).map(m=>`<div>${m.created_at}: ${m.role} - ${(m.content||'').slice(0,200)}</div>`).join('');
+      if (reqDiv) reqDiv.innerHTML = (lastInspect.requests||[]).map(r=>`<div>${r.created_at}: ${r.mode} - ${(r.user_input||'').slice(0,200)}</div>`).join('');
+    }
+
+    function downloadJSON(){
+      const data = JSON.stringify(lastInspect, null, 2);
+      const blob = new Blob([data], {type: 'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'admin_data.json';
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    function downloadCSV(){
+      // CSV下載邏輯
+      alert('CSV下載功能開發中');
+    }
+
+    // 導航功能
+    function initNavigation() {
+      const navItems = document.querySelectorAll('.nav-item');
+      const pageContents = document.querySelectorAll('.page-content');
+      
+      navItems.forEach(item => {
+        item.addEventListener('click', function() {
+          const targetPage = this.dataset.page;
+          
+          // 移除所有active狀態
+          navItems.forEach(nav => nav.classList.remove('active'));
+          pageContents.forEach(page => page.classList.remove('active'));
+          
+          // 添加active狀態
+          this.classList.add('active');
+          const targetElement = document.getElementById(targetPage + '-page');
+          if (targetElement) {
+            targetElement.classList.add('active');
+          }
+          
+          // 根據頁面載入相應數據
+          switch(targetPage) {
+            case 'dashboard':
+              loadAll();
+              break;
+            case 'users':
+              loadUsersAuth();
+              loadAll();
+              break;
+            case 'usage':
+              loadUsage();
+              break;
+            case 'credits':
+              loadUsersFull();
+              break;
+            case 'requests':
+              loadUsage();
+              break;
+            case 'messages':
+              loadInspect();
+              break;
+            case 'analytics':
+              loadAnalytics();
+              break;
+            case 'audit':
+              loadAuditLogs();
+              break;
+          }
+        });
+      });
+    }
+
+    // 載入稽核日誌
+    async function loadAuditLogs() {
+      try {
+        const {base, tok} = getConfig();
+        const response = await fetch(base + '/admin/audit_logs', {
+          headers: tok ? {'x-admin-token': tok} : {}
+        });
+        
+        if (response.ok) {
+          const data = await response.json();
+          const auditDiv = document.getElementById('auditLogs');
+          if (auditDiv) {
+            auditDiv.innerHTML = data.audit_logs ? 
+              data.audit_logs.map(log => 
+                `<div style="margin-bottom:8px; padding:8px; background:#fff; border-radius:4px; border-left:3px solid #3b82f6;">
+                  <strong>${log.action}</strong> - ${log.created_at}<br>
+                  <span class="muted">目標用戶: ${log.target_user_id || 'N/A'}</span><br>
+                  <span class="muted">詳情: ${log.details || 'N/A'}</span>
+                </div>`
+              ).join('') : 
+              '<div class="muted">暫無稽核記錄</div>';
+          }
+        } else {
+          console.error('載入稽核日誌失敗:', response.status);
+        }
+      } catch (error) {
+        console.error('載入稽核日誌錯誤:', error);
+      }
+    }
+
+    function escapeHtml(s){ return (s||'').replace(/[&<>"']/g, c=> ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c])); }
+
+    // 初始化
+    applyConfig();
+    initNavigation();
+    loadAll();
+  </script>
+</body>
+</html>
