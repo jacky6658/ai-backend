@@ -1,17 +1,11 @@
 FROM python:3.11-slim
 
-# 設定環境變數
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-# 設定工作目錄
 WORKDIR /app
 
 # 安裝系統依賴
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        ca-certificates \
-        tzdata && \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    tzdata && \
     rm -rf /var/lib/apt/lists/*
 
 # 建立必要目錄

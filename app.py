@@ -3629,6 +3629,160 @@ except ImportError as e:
 except Exception as e:
     print(f"❌ Failed to integrate AI Points System: {e}")
 
+# 新增腳本生成相關導入
+from fastapi.responses import StreamingResponse
+from memory import MemoryManager
+from rag import RAGRetriever
+from knowledge_loader import KnowledgeLoader
+from providers import LLMProvider
+import json
+import asyncio
+
+# 初始化組件
+memory_manager = MemoryManager()
+rag_retriever = RAGRetriever()
+knowledge_loader = KnowledgeLoader()
+llm_provider = LLMProvider("local")
+
+@app.post("/api/chat")
+async def chat_endpoint(request: dict):
+    """非串流聊天端點"""
+    try:
+        agent = request.get("agent", "script_generation")
+        topic = request.get("topic", "")
+        template = request.get("template", "A")
+        platform = request.get("platform", "Reels")
+        duration = request.get("duration", "30")
+        message = request.get("message", "")
+        user_id = request.get("user_id", "default")
+        
+        # 構建prompt
+        prompt = build_prompt(agent, topic, template, platform, duration, message, user_id)
+        
+        # 生成回應
+        messages = [{"role": "user", "content": prompt}]
+        response = ""
+        for chunk in llm_provider.stream_response(messages, agent=agent, topic=topic, template=template, platform=platform, duration=duration):
+            if chunk["type"] == "content":
+                response += chunk["token"]
+        
+        # 保存對話
+        memory_manager.add_message(user_id, "user", message)
+        memory_manager.add_message(user_id, "assistant", response)
+        
+        # 檢查是否需要總結
+        if memory_manager.should_summarize(user_id):
+            summary = f"用戶{user_id}的對話總結：{response[:500]}..."
+            memory_manager.update_summary(user_id, summary)
+        
+        return {"answer": response, "usage": {"tokens": len(response)}}
+    
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/api/stream")
+async def stream_endpoint(
+    agent: str = "script_generation",
+    topic: str = "",
+    template: str = "A", 
+    platform: str = "Reels",
+    duration: str = "30",
+    user_id: str = "default"
+):
+    """SSE串流端點"""
+    async def generate():
+        try:
+            # 構建prompt
+            prompt = build_prompt(agent, topic, template, platform, duration, "", user_id)
+            
+            # 生成回應
+            messages = [{"role": "user", "content": prompt}]
+            
+            full_response = ""
+            for chunk in llm_provider.stream_response(messages, agent=agent, topic=topic, template=template, platform=platform, duration=duration):
+                if chunk["type"] == "content":
+                    full_response += chunk["token"]
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                elif chunk["type"] == "done":
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                    break
+                elif chunk["type"] == "error":
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                    break
+            
+            # 保存對話
+            if full_response:
+                memory_manager.add_message(user_id, "user", f"生成{topic}腳本")
+                memory_manager.add_message(user_id, "assistant", full_response)
+                
+                # 檢查是否需要總結
+                if memory_manager.should_summarize(user_id):
+                    summary = f"用戶{user_id}的腳本生成總結：{full_response[:500]}..."
+                    memory_manager.update_summary(user_id, summary)
+        
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    
+    return StreamingResponse(generate(), media_type="text/plain")
+
+def build_prompt(agent: str, topic: str, template: str, platform: str, duration: str, message: str, user_id: str) -> str:
+    """構建prompt"""
+    # 載入知識庫
+    knowledge = knowledge_loader.load_knowledge(agent)
+    if not knowledge:
+        knowledge = "知識庫載入失敗"
+    
+    # 獲取對話歷史
+    recent_messages = memory_manager.get_recent_messages(user_id, 20)
+    
+    # 獲取總結
+    summary = memory_manager.get_summary(user_id)
+    
+    # RAG檢索
+    rag_context = rag_retriever.retrieve(agent, f"{topic} {template} {platform}")
+    
+    # 構建system prompt
+    system_prompt = f"""你是專業的{agent}助手。請嚴格依據以下知識庫回答，不要超出範圍。
+
+知識庫內容：
+{knowledge}
+
+重要規則：
+1. 只能基於上述知識庫回答，超出範圍請前綴「【超出知識庫，以下為一般經驗】」
+2. 回答要專業、實用、具體
+3. 如果是腳本生成，必須包含完整的Hook→Value→CTA結構
+4. 平台差異要明確體現（Reels/TikTok/小紅書/YouTube Shorts）
+5. 時長要控制在{duration}秒內
+"""
+    
+    # 添加總結
+    if summary:
+        system_prompt += f"\n對話總結：{summary}\n"
+    
+    # 添加RAG上下文
+    if rag_context:
+        system_prompt += f"\n相關知識片段：\n" + "\n".join(rag_context) + "\n"
+    
+    # 添加對話歷史
+    if recent_messages:
+        system_prompt += "\n最近對話：\n"
+        for msg in recent_messages[-10:]:  # 只取最近10條
+            system_prompt += f"{msg['role']}: {msg['content']}\n"
+    
+    # 添加當前請求
+    if agent == "script_generation":
+        system_prompt += f"\n請為以下參數生成腳本：\n"
+        system_prompt += f"主題：{topic}\n"
+        system_prompt += f"模板：{template}\n" 
+        system_prompt += f"平台：{platform}\n"
+        system_prompt += f"時長：{duration}秒\n"
+        if message:
+            system_prompt += f"額外要求：{message}\n"
+    else:
+        system_prompt += f"\n用戶問題：{message}\n"
+    
+    return system_prompt
+
 # 啟動服務器
 if __name__ == "__main__":
     import uvicorn
