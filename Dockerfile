@@ -25,6 +25,9 @@ COPY points_system.py /app/
 COPY points_routes.py /app/
 COPY points_integration.py /app/
 
+# 複製 admin 資料夾
+COPY admin/ /app/admin/
+
 # 放知識庫進容器
 COPY data/kb.txt /data/kb.txt
 
