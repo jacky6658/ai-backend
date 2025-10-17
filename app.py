@@ -2117,19 +2117,33 @@ async def admin_add_credits(req: Request):
 
     conn = get_conn(); conn.row_factory = sqlite3.Row
     try:
-        # 查找用戶
+        # 查找用戶 - 先查 users_auth，再查 users
         if user_id:
             # 直接使用user_id查找
             row = conn.execute(
                 "SELECT user_id, username, email FROM users_auth WHERE user_id = ?",
                 (user_id,)
             ).fetchone()
+            
+            # 如果在 users_auth 中找不到，嘗試在 users 表中查找
+            if not row:
+                row = conn.execute(
+                    "SELECT user_id, name as username, email FROM users WHERE user_id = ?",
+                    (user_id,)
+                ).fetchone()
         else:
             # 使用identifier查找
             row = conn.execute(
                 "SELECT user_id, username, email FROM users_auth WHERE username = ? OR email = ?",
                 (identifier, identifier)
             ).fetchone()
+            
+            # 如果在 users_auth 中找不到，嘗試在 users 表中查找
+            if not row:
+                row = conn.execute(
+                    "SELECT user_id, name as username, email FROM users WHERE name = ? OR email = ?",
+                    (identifier, identifier)
+                ).fetchone()
         
         if not row:
             return JSONResponse(status_code=404, content={"error": "user_not_found", "message": "找不到指定的用戶"})
