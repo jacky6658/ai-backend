@@ -22,14 +22,21 @@ class LLMProvider:
         # 模擬完整回應
         full_response = self._generate_local_response(messages, **kwargs)
         
-        # 逐token輸出
+        # 逐token輸出 - 智能加速
         tokens = list(full_response)
         for i, token in enumerate(tokens):
             yield {
                 "type": "content",
                 "token": token
             }
-            time.sleep(0.02)  # 模擬延遲
+            
+            # 智能延遲：開頭慢一點，中間快，結尾稍慢
+            if i < 10:  # 前10個字符稍慢，讓用戶看到開始
+                time.sleep(0.01)
+            elif i < len(tokens) - 10:  # 中間部分最快
+                time.sleep(0.003)
+            else:  # 結尾稍慢，讓用戶看到完成
+                time.sleep(0.008)
         
         yield {"type": "done"}
     
@@ -67,38 +74,40 @@ class LLMProvider:
         
         script = f"""# {topic} - {templates[template]} 腳本
 
-## 平台特性：{platforms[platform]}
-## 時長：{duration}秒
+**平台：** {platforms[platform]}
+**時長：** {duration}秒
 
-### 腳本結構：
+## 腳本結構
 
-**Hook (0-5秒)：**
-- 吸睛開場，直擊痛點
+### Hook (0-5秒)
+「你知道為什麼{topic}總是沒效果嗎？」
+- 直擊痛點，吸睛開場
 - 使用問句或反差手法
-- 例：「你知道為什麼{topic}總是沒效果嗎？」
 
-**Value (5-{int(duration)*0.8}秒)：**
-- 核心價值內容
-- 最多三個重點
-- 包含機制、步驟、見證
+### Value (5-{int(duration)*0.8}秒)
+核心價值內容：
+1. 機制原理說明
+2. 具體步驟方法  
+3. 真實見證效果
 
-**CTA ({int(duration)*0.8}-{duration}秒)：**
+### CTA ({int(duration)*0.8}-{duration}秒)
+「記得關注收藏，獲取更多{topic}技巧」
 - 明確行動指引
 - 關注、留言或購買連結
 
-### 拍攝建議：
+## 拍攝要點
 - 鏡頭：CU/MCU/MS/WS交替
 - 節奏：2-3秒換畫面
 - 字幕：關鍵詞加粗放大
-- 聲音：乾淨收音，關鍵詞加強
+- 聲音：乾淨收音，重點加強
 
-### JSON格式：
+## 分鏡腳本
 ```json
 {{
   "segments": [
-    {{"type": "hook", "start_sec": 0, "end_sec": 5, "camera": "CU", "dialog": "你知道為什麼{topic}總是沒效果嗎？", "visual": "大字卡+表情特寫", "cta": ""}},
-    {{"type": "value", "start_sec": 5, "end_sec": {int(duration)*0.8}, "camera": "MS", "dialog": "核心內容講解", "visual": "產品展示+字幕", "cta": ""}},
-    {{"type": "cta", "start_sec": {int(duration)*0.8}, "end_sec": {duration}, "camera": "WS", "dialog": "記得關注收藏", "visual": "品牌logo", "cta": "關注+收藏"}}
+    {{"type": "hook", "start_sec": 0, "end_sec": 5, "camera": "CU", "dialog": "你知道為什麼{topic}總是沒效果嗎？", "visual": "大字卡+表情特寫"}},
+    {{"type": "value", "start_sec": 5, "end_sec": {int(duration)*0.8}, "camera": "MS", "dialog": "核心內容講解", "visual": "產品展示+字幕"}},
+    {{"type": "cta", "start_sec": {int(duration)*0.8}, "end_sec": {duration}, "camera": "WS", "dialog": "記得關注收藏", "visual": "品牌logo"}}
   ]
 }}
 ```"""
