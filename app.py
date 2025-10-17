@@ -493,7 +493,6 @@ async def auth_signup(req: Request):
         existing_auth = conn.execute("SELECT user_id FROM users_auth WHERE user_id=?", (user_id,)).fetchone()
         
         if existing_user or existing_auth:
-            conn.close()
             raise HTTPException(status_code=409, detail="user_exists")
         
         # 建立 users 表記錄
@@ -513,17 +512,14 @@ async def auth_signup(req: Request):
         
     except sqlite3.IntegrityError as e:
         conn.rollback()
-        conn.close()
         print(f"用戶註冊失敗 - 重複用戶: {e}")
         raise HTTPException(status_code=409, detail="user_exists")
     except Exception as e:
         conn.rollback()
-        conn.close()
         print(f"用戶註冊失敗: {e}")
         raise HTTPException(status_code=500, detail="registration_failed")
     finally:
-        if conn:
-            conn.close()
+        conn.close()
     
     return {"ok": True, "user_id": user_id, "message": "用戶註冊成功"}
 
