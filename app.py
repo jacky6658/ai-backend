@@ -36,7 +36,7 @@ OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "https://aijobvideobackend.
 try:
     from authlib.integrations.starlette_client import OAuth
     oauth = OAuth()
-    if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
+，    if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
         oauth.register(
             name="google",
             server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
@@ -488,24 +488,44 @@ async def auth_signup(req: Request):
 
     conn = get_conn(); conn.row_factory = sqlite3.Row
     try:
-        # 建立 users（若不存在）
-        u = conn.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,)).fetchone()
-        if not u:
-            conn.execute(
-                "INSERT INTO users (user_id, email, name) VALUES (?, ?, ?)",
-                (user_id, email, username)
-            )
-        # 建立 users_auth
+        # 檢查用戶是否已存在
+        existing_user = conn.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,)).fetchone()
+        existing_auth = conn.execute("SELECT user_id FROM users_auth WHERE user_id=?", (user_id,)).fetchone()
+        
+        if existing_user or existing_auth:
+            conn.close()
+            raise HTTPException(status_code=409, detail="user_exists")
+        
+        # 建立 users 表記錄
         conn.execute(
-            "INSERT INTO users_auth (user_id, username, email, phone, password_hash) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO users (user_id, email, name, created_at, updated_at, status) VALUES (?, ?, ?, datetime('now'), datetime('now'), 'active')",
+            (user_id, email, username)
+        )
+        
+        # 建立 users_auth 表記錄
+        conn.execute(
+            "INSERT INTO users_auth (user_id, username, email, phone, password_hash, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))",
             (user_id, username, email, phone, hash_password(password))
         )
+        
         conn.commit()
-    except sqlite3.IntegrityError:
+        print(f"新用戶註冊成功: {user_id}, email: {email}, username: {username}")
+        
+    except sqlite3.IntegrityError as e:
+        conn.rollback()
         conn.close()
+        print(f"用戶註冊失敗 - 重複用戶: {e}")
         raise HTTPException(status_code=409, detail="user_exists")
-    conn.close()
-    return {"ok": True, "user_id": user_id}
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        print(f"用戶註冊失敗: {e}")
+        raise HTTPException(status_code=500, detail="registration_failed")
+    finally:
+        if conn:
+            conn.close()
+    
+    return {"ok": True, "user_id": user_id, "message": "用戶註冊成功"}
 
 @app.post("/auth/login")
 async def auth_login(req: Request):
