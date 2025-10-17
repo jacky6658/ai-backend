@@ -54,7 +54,11 @@ class Plan:
     is_active: bool
 
 class PointsSystem:
-    def __init__(self, db_path: str = "ai_points.db"):
+    def __init__(self, db_path: str = None):
+        import os
+        if db_path is None:
+            # 使用與主應用相同的資料庫
+            db_path = os.getenv("DB_PATH", "three_agents_system.db")
         self.db_path = db_path
         self.init_database()
     

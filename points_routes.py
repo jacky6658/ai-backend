@@ -217,7 +217,8 @@ def get_user_id_from_request(req: Request) -> Optional[str]:
         try:
             from app import session_signer
             data = session_signer.loads(session_cookie)
-            return data.get("user_id")
+            # 後端使用 'uid' 作為用戶ID的鍵
+            return data.get("uid")
         except:
             pass
     

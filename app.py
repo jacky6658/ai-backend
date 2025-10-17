@@ -16,7 +16,7 @@ import hashlib
 # from fastapi.staticfiles import StaticFiles  # 前端分離部署，不需要
 
 # ========= 環境變數 =========
-DB_PATH = os.getenv("DB_PATH", "/data/three_agents_system.db")
+DB_PATH = os.getenv("DB_PATH", "three_agents_system.db")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 KNOWLEDGE_TXT_PATH = os.getenv("KNOWLEDGE_TXT_PATH", "/data/kb.txt")
