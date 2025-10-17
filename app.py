@@ -2100,7 +2100,10 @@ async def admin_reset_password(req: Request):
 @app.post("/admin/user/add_credits")
 async def admin_add_credits(req: Request):
     """管理員為用戶充值點數"""
+    print(f"[DEBUG] admin_add_credits called")
+    
     if not _check_admin(req):
+        print(f"[DEBUG] admin check failed")
         return JSONResponse(status_code=403, content={"error": "forbidden"})
     
     data = await req.json()
@@ -2108,7 +2111,16 @@ async def admin_add_credits(req: Request):
     identifier = (data.get("identifier") or "").strip()  # username 或 email
     credits = data.get("credits", 0)
     reason = (data.get("reason") or "管理員充值").strip()
+    
+    print(f"[DEBUG] Received data: user_id='{user_id}', identifier='{identifier}', credits={credits}, reason='{reason}'")
 
+    # 如果前端只發送了 identifier，檢查是否為 user_id 格式
+    if not user_id and identifier:
+        # 檢查是否為 user_id 格式（以 g_ 或 u_ 開頭）
+        if identifier.startswith(('g_', 'u_', 'google_', 'web')):
+            user_id = identifier
+            identifier = ""
+    
     if not identifier and not user_id:
         return JSONResponse(status_code=400, content={"error": "missing_fields", "message": "請提供用戶ID或email"})
     
@@ -2119,11 +2131,13 @@ async def admin_add_credits(req: Request):
     try:
         # 查找用戶 - 先查 users_auth，再查 users
         if user_id:
+            print(f"[DEBUG] Looking up user by user_id: {user_id}")
             # 直接使用user_id查找
             row = conn.execute(
                 "SELECT user_id, username, email FROM users_auth WHERE user_id = ?",
                 (user_id,)
             ).fetchone()
+            print(f"[DEBUG] Found in users_auth: {row}")
             
             # 如果在 users_auth 中找不到，嘗試在 users 表中查找
             if not row:
@@ -2131,12 +2145,15 @@ async def admin_add_credits(req: Request):
                     "SELECT user_id, name as username, email FROM users WHERE user_id = ?",
                     (user_id,)
                 ).fetchone()
+                print(f"[DEBUG] Found in users: {row}")
         else:
+            print(f"[DEBUG] Looking up user by identifier: {identifier}")
             # 使用identifier查找
             row = conn.execute(
                 "SELECT user_id, username, email FROM users_auth WHERE username = ? OR email = ?",
                 (identifier, identifier)
             ).fetchone()
+            print(f"[DEBUG] Found in users_auth: {row}")
             
             # 如果在 users_auth 中找不到，嘗試在 users 表中查找
             if not row:
@@ -2144,8 +2161,10 @@ async def admin_add_credits(req: Request):
                     "SELECT user_id, name as username, email FROM users WHERE name = ? OR email = ?",
                     (identifier, identifier)
                 ).fetchone()
+                print(f"[DEBUG] Found in users: {row}")
         
         if not row:
+            print(f"[DEBUG] User not found in any table")
             return JSONResponse(status_code=404, content={"error": "user_not_found", "message": "找不到指定的用戶"})
 
         user_id = row["user_id"]
@@ -2170,9 +2189,9 @@ async def admin_add_credits(req: Request):
 
         # 記錄訂單
         conn.execute(
-            """INSERT INTO orders (user_id, order_type, amount, status, description, created_at) 
-               VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-            (user_id, "admin_credit", credits, "completed", reason)
+            """INSERT INTO orders (user_id, order_type, amount, status, created_at) 
+               VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+            (user_id, "admin_credit", credits, "completed")
         )
 
         # 稽核記錄
