@@ -2471,7 +2471,8 @@ async function login(){
     
     # 讀取 admin.html 檔案
     try:
-        admin_html_path = os.path.join(os.path.dirname(__file__), 'admin', 'admin.html')
+        # 根據 GitHub 倉庫結構，admin 資料夾與 backend 資料夾在同一層級
+        admin_html_path = os.path.join(os.path.dirname(__file__), '..', 'admin', 'admin.html')
         with open(admin_html_path, 'r', encoding='utf-8') as f:
             admin_html_content = f.read()
         return HTMLResponse(content=admin_html_content)
