@@ -2,7 +2,7 @@
 <html lang="zh-Hant">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>AIJob 管理後台</title>
   <style>
         body {
@@ -130,7 +130,273 @@
         }
         .hidden {
             display: none;
-    }
+        }
+        
+        /* iOS Safari 優化 */
+        body {
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+            -webkit-tap-highlight-color: transparent;
+            -webkit-touch-callout: none;
+            -webkit-user-select: none;
+            -moz-user-select: none;
+            -ms-user-select: none;
+            user-select: none;
+        }
+        
+        /* 允許文字選擇 */
+        input, textarea, .table td, .stat-number, .stat-label {
+            -webkit-user-select: text;
+            -moz-user-select: text;
+            -ms-user-select: text;
+            user-select: text;
+        }
+        
+        /* 防止 iOS Safari 縮放 */
+        input[type="text"], input[type="email"], input[type="password"], select, textarea {
+            font-size: 16px;
+            -webkit-appearance: none;
+            border-radius: 0;
+        }
+        
+        /* 移動端響應式設計 */
+        @media screen and (max-width: 768px) {
+            body {
+                padding: 10px;
+                -webkit-text-size-adjust: 100%;
+            }
+            
+            .container {
+                margin: 0;
+                border-radius: 0;
+                box-shadow: none;
+                min-height: 100vh;
+            }
+            
+            .header {
+                padding: 15px;
+                position: sticky;
+                top: 0;
+                z-index: 100;
+            }
+            
+            .header h1 {
+                font-size: 1.2em;
+                margin: 0;
+            }
+            
+            .header p {
+                font-size: 0.9em;
+                margin: 5px 0 0 0;
+            }
+            
+            .nav {
+                position: sticky;
+                top: 0;
+                z-index: 99;
+            }
+            
+            .nav ul {
+                flex-direction: column;
+                overflow-x: auto;
+                -webkit-overflow-scrolling: touch;
+            }
+            
+            .nav li {
+                flex: none;
+                min-width: 120px;
+            }
+            
+            .nav a {
+                padding: 12px 15px;
+                font-size: 0.9em;
+                white-space: nowrap;
+                border-bottom: 1px solid #4b5563;
+            }
+            
+            .content {
+                padding: 15px;
+            }
+            
+            .stats {
+                grid-template-columns: repeat(2, 1fr);
+                gap: 10px;
+                margin-bottom: 20px;
+            }
+            
+            .stat-card {
+                padding: 15px;
+            }
+            
+            .stat-number {
+                font-size: 1.5em;
+            }
+            
+            .card {
+                padding: 15px;
+                margin-bottom: 15px;
+            }
+            
+            .table {
+                font-size: 0.8em;
+                overflow-x: auto;
+                -webkit-overflow-scrolling: touch;
+                display: block;
+                white-space: nowrap;
+            }
+            
+            .table thead, .table tbody, .table tr {
+                display: block;
+            }
+            
+            .table th, .table td {
+                display: inline-block;
+                width: auto;
+                min-width: 100px;
+                padding: 8px;
+                border: 1px solid #e5e7eb;
+                margin: 1px;
+            }
+            
+            .table th {
+                background: #f9fafb;
+                font-weight: 600;
+            }
+            
+            .btn {
+                padding: 12px 16px;
+                font-size: 0.9em;
+                margin: 3px;
+                min-height: 44px; /* iOS 最小觸控區域 */
+                -webkit-tap-highlight-color: rgba(0,0,0,0.1);
+            }
+            
+            .form-group input, .form-group select {
+                padding: 12px;
+                font-size: 16px; /* 防止 iOS 縮放 */
+                min-height: 44px;
+            }
+            
+            /* 移動端表格卡片式顯示 */
+            .mobile-table {
+                display: none;
+            }
+            
+            .mobile-card {
+                background: white;
+                border: 1px solid #e5e7eb;
+                border-radius: 8px;
+                padding: 15px;
+                margin-bottom: 10px;
+            }
+            
+            .mobile-card-header {
+                font-weight: 600;
+                margin-bottom: 10px;
+                padding-bottom: 8px;
+                border-bottom: 1px solid #e5e7eb;
+            }
+            
+            .mobile-card-row {
+                display: flex;
+                justify-content: space-between;
+                margin-bottom: 8px;
+                padding: 5px 0;
+            }
+            
+            .mobile-card-label {
+                font-weight: 500;
+                color: #6b7280;
+                flex: 1;
+            }
+            
+            .mobile-card-value {
+                flex: 2;
+                text-align: right;
+            }
+        }
+        
+        /* 超小螢幕優化 */
+        @media screen and (max-width: 480px) {
+            .stats {
+                grid-template-columns: 1fr;
+            }
+            
+            .nav a {
+                padding: 10px 12px;
+                font-size: 0.8em;
+            }
+            
+            .content {
+                padding: 10px;
+            }
+            
+            .card {
+                padding: 12px;
+            }
+            
+            .btn {
+                width: 100%;
+                margin: 5px 0;
+            }
+        }
+        
+        /* iOS Safari 特定優化 */
+        @supports (-webkit-touch-callout: none) {
+            .container {
+                -webkit-overflow-scrolling: touch;
+            }
+            
+            .nav ul {
+                -webkit-overflow-scrolling: touch;
+            }
+            
+            .table {
+                -webkit-overflow-scrolling: touch;
+            }
+            
+            /* 修復 iOS Safari 的 flexbox 問題 */
+            .nav ul {
+                display: -webkit-flex;
+                display: flex;
+            }
+            
+            .stats {
+                display: -webkit-grid;
+                display: grid;
+            }
+        }
+        
+        /* 深色模式支援 */
+        @media (prefers-color-scheme: dark) {
+            body {
+                background: #1a1a1a;
+                color: #ffffff;
+            }
+            
+            .container {
+                background: #2d2d2d;
+            }
+            
+            .card {
+                background: #3a3a3a;
+                border-color: #4a4a4a;
+            }
+            
+            .table th, .table td {
+                border-color: #4a4a4a;
+            }
+            
+            .table th {
+                background: #3a3a3a;
+            }
+            
+            .form-group input, .form-group select {
+                background: #3a3a3a;
+                border-color: #4a4a4a;
+                color: #ffffff;
+            }
+        }
   </style>
 </head>
 <body>
@@ -527,9 +793,9 @@
                             <div class="summary-item">
                                 <span class="label">總消費:</span>
                                 <span class="value">${data.total_consumed || 0} 點</span>
-                            </div>
-                        </div>
-                        
+    </div>
+  </div>
+
                         <div class="credit-transactions">
                             <h4>點數交易記錄</h4>
                             <div class="table-container">
