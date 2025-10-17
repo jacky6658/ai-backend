@@ -2985,14 +2985,21 @@ async def positioning_analyze(req: Request):
         if ai_response:
             # 簡單解析AI回應，提取關鍵信息
             lines = ai_response.split('\n')
+            in_execution_section = False
             for line in lines:
                 line = line.strip()
                 if '業務類型：' in line or '目標受眾：' in line or '品牌語氣：' in line:
                     positioning_summary += line + "\n"
                 elif '語氣' in line and ('專業' in line or '親切' in line or '幽默' in line or '權威' in line):
                     tone_guidelines = line
-                elif '實作建議' in line or '執行' in line or '建議' in line:
+                elif '實作建議' in line or '執行建議' in line:
+                    in_execution_section = True
                     execution_suggestions += line + "\n"
+                elif in_execution_section and (line.startswith('•') or line.startswith('-') or line.startswith('*') or '發文頻率' in line or '平台策略' in line or '內容策略' in line):
+                    execution_suggestions += line + "\n"
+                elif in_execution_section and not (line.startswith('•') or line.startswith('-') or line.startswith('*') or '發文頻率' in line or '平台策略' in line or '內容策略' in line):
+                    # 如果遇到非執行建議的內容，結束執行建議區塊
+                    in_execution_section = False
         
         # 如果沒有提取到足夠信息，使用默認值
         if not positioning_summary:
