@@ -36,7 +36,7 @@ OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "https://aijobvideobackend.
 try:
     from authlib.integrations.starlette_client import OAuth
     oauth = OAuth()
-，    if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
+    if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
         oauth.register(
             name="google",
             server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
