@@ -2269,6 +2269,75 @@ async def admin_get_user_credits(user_id: str, req: Request):
         conn.close()
         return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
 
+@app.get("/admin/user/credit_details/{user_id}")
+async def admin_get_user_credit_details(user_id: str, req: Request):
+    """獲取用戶點數詳情和交易記錄"""
+    if not _check_admin(req):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    try:
+        # 獲取用戶信息
+        user_row = conn.execute(
+            "SELECT user_id, username, email FROM users_auth WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+        
+        if not user_row:
+            return JSONResponse(status_code=404, content={"error": "user_not_found"})
+
+        # 獲取點數餘額
+        credit_row = conn.execute(
+            "SELECT balance, updated_at FROM user_credits WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+        
+        balance = credit_row["balance"] if credit_row else 0
+        
+        # 獲取交易記錄
+        transactions = conn.execute("""
+            SELECT 
+                created_at,
+                type,
+                module,
+                points,
+                balance_after,
+                description,
+                reason
+            FROM credit_transactions 
+            WHERE user_id = ? 
+            ORDER BY created_at DESC 
+            LIMIT 100
+        """, (user_id,)).fetchall()
+        
+        # 計算總充值和總消費
+        stats = conn.execute("""
+            SELECT 
+                SUM(CASE WHEN type = 'charge' THEN points ELSE 0 END) as total_charged,
+                SUM(CASE WHEN type = 'consume' THEN points ELSE 0 END) as total_consumed
+            FROM credit_transactions 
+            WHERE user_id = ?
+        """, (user_id,)).fetchone()
+        
+        total_charged = stats["total_charged"] or 0
+        total_consumed = stats["total_consumed"] or 0
+        
+        conn.close()
+        
+        return {
+            "user_id": user_id,
+            "username": user_row["username"],
+            "email": user_row["email"],
+            "balance": balance,
+            "total_charged": total_charged,
+            "total_consumed": total_consumed,
+            "transactions": [dict(t) for t in transactions]
+        }
+        
+    except Exception as e:
+        conn.close()
+        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
+
 @app.get("/api/plans")
 async def get_subscription_plans():
     """獲取訂閱方案列表"""

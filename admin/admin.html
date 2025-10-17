@@ -476,10 +476,245 @@
             }
         }
 
-        // 查看用戶點數
-        function viewUserCredits(userId) {
-            console.log('查看用戶點數:', userId);
-            // 實作查看用戶點數詳情邏輯
+        // 查看用戶點數詳情
+        async function viewUserCredits(userId) {
+            console.log('查看用戶點數詳情:', userId);
+            
+            try {
+                // 獲取用戶點數詳情
+                const response = await fetch(`/admin/user/credit_details/${userId}`, {
+                    method: 'GET',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    credentials: 'include'
+                });
+                
+                if (!response.ok) {
+                    throw new Error('獲取用戶點數詳情失敗');
+                }
+                
+                const data = await response.json();
+                showCreditDetailsModal(userId, data);
+                
+            } catch (error) {
+                console.error('獲取用戶點數詳情失敗:', error);
+                alert('獲取用戶點數詳情失敗: ' + error.message);
+            }
+        }
+        
+        // 顯示點數詳情模態窗口
+        function showCreditDetailsModal(userId, data) {
+            // 創建模態窗口
+            const modal = document.createElement('div');
+            modal.className = 'modal-overlay';
+            modal.innerHTML = `
+                <div class="modal-content" style="max-width: 800px; max-height: 80vh; overflow-y: auto;">
+                    <div class="modal-header">
+                        <h3>用戶點數詳情 - ${userId}</h3>
+                        <button class="close-btn" onclick="closeCreditDetailsModal()">&times;</button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="credit-summary">
+                            <div class="summary-item">
+                                <span class="label">當前餘額:</span>
+                                <span class="value">${data.balance || 0} 點</span>
+                            </div>
+                            <div class="summary-item">
+                                <span class="label">總充值:</span>
+                                <span class="value">${data.total_charged || 0} 點</span>
+                            </div>
+                            <div class="summary-item">
+                                <span class="label">總消費:</span>
+                                <span class="value">${data.total_consumed || 0} 點</span>
+                            </div>
+                        </div>
+                        
+                        <div class="credit-transactions">
+                            <h4>點數交易記錄</h4>
+                            <div class="table-container">
+                                <table class="data-table">
+                                    <thead>
+                                        <tr>
+                                            <th>時間</th>
+                                            <th>類型</th>
+                                            <th>功能</th>
+                                            <th>點數</th>
+                                            <th>餘額</th>
+                                            <th>備註</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="credit-transactions-tbody">
+                                        ${generateTransactionRows(data.transactions || [])}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            // 添加樣式
+            const style = document.createElement('style');
+            style.textContent = `
+                .modal-overlay {
+                    position: fixed;
+                    top: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 100%;
+                    background: rgba(0, 0, 0, 0.5);
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    z-index: 1000;
+                }
+                .modal-content {
+                    background: white;
+                    border-radius: 8px;
+                    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+                    max-width: 90%;
+                    max-height: 90%;
+                    overflow: hidden;
+                }
+                .modal-header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    padding: 20px;
+                    border-bottom: 1px solid #e5e7eb;
+                    background: #f9fafb;
+                }
+                .modal-header h3 {
+                    margin: 0;
+                    color: #1f2937;
+                }
+                .close-btn {
+                    background: none;
+                    border: none;
+                    font-size: 24px;
+                    cursor: pointer;
+                    color: #6b7280;
+                }
+                .close-btn:hover {
+                    color: #374151;
+                }
+                .modal-body {
+                    padding: 20px;
+                }
+                .credit-summary {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                    gap: 15px;
+                    margin-bottom: 20px;
+                }
+                .summary-item {
+                    display: flex;
+                    justify-content: space-between;
+                    padding: 10px;
+                    background: #f3f4f6;
+                    border-radius: 6px;
+                }
+                .summary-item .label {
+                    font-weight: 500;
+                    color: #374151;
+                }
+                .summary-item .value {
+                    font-weight: 600;
+                    color: #1f2937;
+                }
+                .credit-transactions h4 {
+                    margin: 0 0 15px 0;
+                    color: #1f2937;
+                }
+                .table-container {
+                    overflow-x: auto;
+                }
+                .data-table {
+                    width: 100%;
+                    border-collapse: collapse;
+                }
+                .data-table th,
+                .data-table td {
+                    padding: 8px 12px;
+                    text-align: left;
+                    border-bottom: 1px solid #e5e7eb;
+                }
+                .data-table th {
+                    background: #f9fafb;
+                    font-weight: 600;
+                    color: #374151;
+                }
+                .data-table td {
+                    color: #1f2937;
+                }
+                .transaction-type {
+                    padding: 2px 8px;
+                    border-radius: 4px;
+                    font-size: 12px;
+                    font-weight: 500;
+                }
+                .transaction-type.charge {
+                    background: #dcfce7;
+                    color: #166534;
+                }
+                .transaction-type.consume {
+                    background: #fef3c7;
+                    color: #92400e;
+                }
+                .transaction-type.refund {
+                    background: #dbeafe;
+                    color: #1e40af;
+                }
+            `;
+            
+            document.head.appendChild(style);
+            document.body.appendChild(modal);
+        }
+        
+        // 生成交易記錄行
+        function generateTransactionRows(transactions) {
+            if (!transactions || transactions.length === 0) {
+                return '<tr><td colspan="6" style="text-align: center; color: #6b7280;">暫無交易記錄</td></tr>';
+            }
+            
+            return transactions.map(transaction => {
+                const typeClass = transaction.type === 'charge' ? 'charge' : 
+                                 transaction.type === 'consume' ? 'consume' : 'refund';
+                const typeText = transaction.type === 'charge' ? '充值' : 
+                                transaction.type === 'consume' ? '消費' : '退款';
+                const pointsText = transaction.type === 'consume' ? `-${transaction.points}` : `+${transaction.points}`;
+                const moduleText = transaction.module ? getModuleName(transaction.module) : '-';
+                
+                return `
+                    <tr>
+                        <td>${transaction.created_at || '-'}</td>
+                        <td><span class="transaction-type ${typeClass}">${typeText}</span></td>
+                        <td>${moduleText}</td>
+                        <td>${pointsText}</td>
+                        <td>${transaction.balance_after || '-'}</td>
+                        <td>${transaction.description || transaction.reason || '-'}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+        
+        // 獲取功能名稱
+        function getModuleName(module) {
+            const moduleNames = {
+                'positioning': '定位顧問',
+                'topics': '選題助手',
+                'script': '腳本生成'
+            };
+            return moduleNames[module] || module;
+        }
+        
+        // 關閉點數詳情模態窗口
+        function closeCreditDetailsModal() {
+            const modal = document.querySelector('.modal-overlay');
+            if (modal) {
+                modal.remove();
+            }
         }
 
         // 儲存設定
