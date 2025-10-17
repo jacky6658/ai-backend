@@ -1,40 +1,42 @@
 FROM python:3.11-slim
 
+# 設定環境變數
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# 設定工作目錄
 WORKDIR /app
 
-# 安裝基本套件
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates tzdata && \
+# 安裝系統依賴
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        tzdata \
+        gcc \
+        python3-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# 建立 DB 目錄（給 SQLite 用）
-RUN mkdir -p /data && chmod 777 /data
+# 升級 pip
+RUN python -m pip install --upgrade pip
 
-# 安裝 Python 套件
-COPY requirements.txt /app/
+# 複製並安裝 Python 依賴
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 複製程式碼
-COPY app.py /app/
-COPY chat_stream.py /app/
-COPY knowledge_text_loader.py /app/
-COPY points_system.py /app/
-COPY points_routes.py /app/
-COPY points_integration.py /app/
+# 驗證安裝
+RUN python -c "import fastapi; print('FastAPI version:', fastapi.__version__)"
 
-# 複製 admin 資料夾
-COPY admin/ /app/admin/
+# 複製測試應用
+COPY app_test.py /app/app.py
 
-# 放知識庫進容器
-COPY data/kb.txt /data/kb.txt
+# 建立必要目錄
+RUN mkdir -p /data && chmod 777 /data
 
 # 設定環境變數
+ENV DB_PATH=/data/test.db
 ENV GEMINI_MODEL=gemini-2.5-flash
-ENV DB_PATH=/data/three_agents_system.db
-ENV KNOWLEDGE_TXT_PATH=/data/kb.txt
 
 EXPOSE 8080
 
