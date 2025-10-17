@@ -21,6 +21,10 @@ RUN python -c "import fastapi; print('FastAPI installed successfully')"
 
 # 複製應用程式碼
 COPY app.py /app/
+COPY memory.py /app/
+COPY rag.py /app/
+COPY knowledge_loader.py /app/
+COPY providers.py /app/
 COPY chat_stream.py /app/
 COPY knowledge_text_loader.py /app/
 COPY points_system.py /app/
@@ -31,7 +35,7 @@ COPY points_integration.py /app/
 COPY admin/ /app/admin/
 
 # 放知識庫進容器
-COPY data/kb.txt /data/kb.txt
+COPY data/ /data/
 
 # 設定環境變數
 ENV DB_PATH=/data/three_agents_system.db
