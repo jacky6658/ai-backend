@@ -8,7 +8,7 @@
 # 必要環境變數
 GEMINI_API_KEY=your_gemini_api_key_here
 GEMINI_MODEL=gemini-2.5-flash  # 可選，預設為 gemini-2.5-flash
-KNOWLEDGE_TXT_PATH=/data/data/kb.txt  # 可選，預設為 /data/data/kb.txt
+KNOWLEDGE_TXT_PATH=/data/kb.txt  # 可選，預設為 /data/kb.txt
 
 # 資料庫設定
 DB_PATH=/data/three_agents_system.db  # 可選，預設為 /data/three_agents_system.db

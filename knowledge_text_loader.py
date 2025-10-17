@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Simple knowledge text loader + retriever
-- Reads from env KNOWLEDGE_TXT_PATH (default: /data/data/kb.txt)
+- Reads from env KNOWLEDGE_TXT_PATH (default: /data/kb.txt)
 - If not found, will try to concatenate /data/kb*.txt and /data/*.txt
 - Provides:
     load_knowledge_text(force: bool=False) -> str
@@ -36,7 +36,7 @@ def _read_file(path: str) -> str:
 
 def _gather_all_text() -> str:
     """Try the env path first; if not found, concatenate candidates under /data."""
-    env_path = os.getenv("KNOWLEDGE_TXT_PATH", "/data/data/kb.txt")
+    env_path = os.getenv("KNOWLEDGE_TXT_PATH", "/data/kb.txt")
     if os.path.exists(env_path):
         t = _read_file(env_path)
         if t.strip():

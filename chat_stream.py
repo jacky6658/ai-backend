@@ -20,7 +20,7 @@ from knowledge_text_loader import load_knowledge_text, retrieve_context
 # 環境變數
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-KNOWLEDGE_TXT_PATH = os.getenv("KNOWLEDGE_TXT_PATH", "/data/data/kb.txt")
+KNOWLEDGE_TXT_PATH = os.getenv("KNOWLEDGE_TXT_PATH", "/data/kb.txt")
 DB_PATH = os.getenv("DB_PATH", "/data/three_agents_system.db")
 
 # 系統提示模板

@@ -26,7 +26,7 @@ COPY points_routes.py /app/
 COPY points_integration.py /app/
 
 # 放知識庫進容器
-COPY kb.txt /data/kb.txt
+COPY data/kb.txt /data/kb.txt
 
 # 設定環境變數
 ENV GEMINI_MODEL=gemini-2.5-flash
