@@ -674,9 +674,29 @@ async def auth_login(req: Request):
     if not row or row["password_hash"] != hash_password(password):
         raise HTTPException(status_code=401, detail="invalid_credentials")
 
+    # 獲取用戶完整信息
+    conn = get_conn()
+    conn.row_factory = sqlite3.Row
+    user = conn.execute(
+        "SELECT user_id, email, name, credits, referral_code, created_at FROM users WHERE user_id = ?",
+        (row["user_id"],)
+    ).fetchone()
+    conn.close()
+    
+    if not user:
+        raise HTTPException(status_code=500, detail="user_data_not_found")
+    
     # 設置 Session Cookie
     token = create_session_cookie(row["user_id"])
-    resp = JSONResponse({"ok": True})
+    resp = JSONResponse({
+        "ok": True,
+        "user_id": user["user_id"],
+        "email": user["email"],
+        "name": user["name"],
+        "credits": user["credits"],
+        "referral_code": user["referral_code"],
+        "created_at": user["created_at"]
+    })
     resp.set_cookie(
         "session", token,
         httponly=True, secure=True, samesite="none", max_age=7*24*3600

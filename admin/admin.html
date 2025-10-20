@@ -641,6 +641,71 @@
             }
         }
 
+        // 檢查管理員登入狀態
+        async function checkAdminLogin() {
+            try {
+                const response = await fetch('/admin/users', {
+                    credentials: 'include'
+                });
+                if (response.status === 403) {
+                    showLoginModal();
+                    return false;
+                }
+                return true;
+            } catch (error) {
+                console.error('檢查管理員登入失敗:', error);
+                showLoginModal();
+                return false;
+            }
+        }
+
+        // 顯示登入模態視窗
+        function showLoginModal() {
+            const modal = document.createElement('div');
+            modal.style.cssText = `
+                position: fixed; top: 0; left: 0; width: 100%; height: 100%; 
+                background: rgba(0,0,0,0.5); z-index: 1000; display: flex; 
+                align-items: center; justify-content: center;
+            `;
+            modal.innerHTML = `
+                <div style="background: white; padding: 30px; border-radius: 8px; width: 300px;">
+                    <h3 style="margin: 0 0 20px 0;">管理員登入</h3>
+                    <input type="text" id="adminUsername" placeholder="管理員帳號" style="width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 4px;">
+                    <input type="password" id="adminPassword" placeholder="管理員密碼" style="width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 4px;">
+                    <button onclick="adminLogin()" style="width: 100%; padding: 10px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer;">登入</button>
+                    <div id="loginError" style="color: red; margin-top: 10px;"></div>
+                </div>
+            `;
+            document.body.appendChild(modal);
+        }
+
+        // 管理員登入
+        async function adminLogin() {
+            const username = document.getElementById('adminUsername').value;
+            const password = document.getElementById('adminPassword').value;
+            const errorDiv = document.getElementById('loginError');
+            
+            try {
+                const response = await fetch('/admin/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',
+                    body: JSON.stringify({ username, password })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    document.body.removeChild(document.querySelector('div[style*="position: fixed"]'));
+                    location.reload();
+                } else {
+                    errorDiv.textContent = data.message || '登入失敗';
+                }
+            } catch (error) {
+                errorDiv.textContent = '登入失敗: ' + error.message;
+            }
+        }
+
         // 載入用戶數據
         async function loadUsers() {
             try {
@@ -674,6 +739,8 @@
                 }
             } catch (error) {
                 console.error('載入用戶數據失敗:', error);
+                const tbody = document.querySelector('#usersTable tbody');
+                tbody.innerHTML = '<tr><td colspan="7">載入失敗: ' + error.message + '</td></tr>';
             }
         }
 
@@ -1095,9 +1162,13 @@
         }
 
         // 頁面載入時初始化
-        document.addEventListener('DOMContentLoaded', function() {
-            loadSettings();
-            loadDashboard();
+        document.addEventListener('DOMContentLoaded', async function() {
+            // 先檢查管理員登入狀態
+            const isLoggedIn = await checkAdminLogin();
+            if (isLoggedIn) {
+                loadSettings();
+                loadDashboard();
+            }
         });
     </script>
 </body>
