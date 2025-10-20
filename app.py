@@ -613,6 +613,7 @@ async def auth_signup(req: Request):
     email = (data.get("email") or "").strip()
     username = (data.get("username") or "").strip()
     password = (data.get("password") or "").strip()
+    referral_code = (data.get("referral_code") or "").strip()  # 新增推薦碼參數
     if not all([email, username, password, phone]):
         raise HTTPException(status_code=400, detail="missing_fields")
 
@@ -627,13 +628,35 @@ async def auth_signup(req: Request):
         if existing_user or existing_auth:
             raise HTTPException(status_code=409, detail="user_exists")
         
-        # 生成推薦碼
-        referral_code = generate_referral_code(user_id)
+        # 處理推薦碼獎勵
+        referrer_id = None
+        if referral_code:
+            # 查找推薦人
+            referrer = conn.execute(
+                "SELECT user_id FROM users WHERE referral_code = ?", (referral_code,)
+            ).fetchone()
+            if referrer:
+                referrer_id = referrer['user_id']
+                # 給推薦人增加 500 點數
+                conn.execute(
+                    "UPDATE users SET credits = credits + 500 WHERE user_id = ?", (referrer_id,)
+                )
+                # 記錄推薦獎勵
+                conn.execute(
+                    "INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, 500, 'referral_bonus', ?)",
+                    (referrer_id, f"推薦新用戶 {user_id} 獲得獎勵")
+                )
+        
+        # 生成新用戶推薦碼
+        new_referral_code = generate_referral_code(user_id)
+        
+        # 創建新用戶，如果使用推薦碼則額外獲得 500 點數
+        initial_credits = 1000 if referral_code and referrer_id else 500
         
         # 建立 users 表記錄
         conn.execute(
-            "INSERT INTO users (user_id, email, name, created_at, updated_at, status, credits, referral_code) VALUES (?, ?, ?, datetime('now'), datetime('now'), 'active', 500, ?)",
-            (user_id, email, username, referral_code)
+            "INSERT INTO users (user_id, email, name, created_at, updated_at, status, credits, referral_code) VALUES (?, ?, ?, datetime('now'), datetime('now'), 'active', ?, ?)",
+            (user_id, email, username, initial_credits, new_referral_code)
         )
         
         # 建立 users_auth 表記錄
@@ -642,8 +665,14 @@ async def auth_signup(req: Request):
             (user_id, username, email, phone, hash_password(password))
         )
         
+        # 記錄新用戶獎勵
+        conn.execute(
+            "INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, 'signup_bonus', ?)",
+            (user_id, initial_credits, f"註冊獎勵{'（含推薦獎勵）' if referral_code and referrer_id else ''}")
+        )
+        
         conn.commit()
-        print(f"新用戶註冊成功: {user_id}, email: {email}, username: {username}")
+        print(f"新用戶註冊成功: {user_id}, email: {email}, username: {username}, 初始點數: {initial_credits}")
         
     except sqlite3.IntegrityError as e:
         conn.rollback()
@@ -1352,7 +1381,7 @@ def fallback_copy(user_input: str, topic: Optional[str]) -> Dict[str, Any]:
 # ========= 三智能體系統核心功能 =========
 
 # 用戶管理
-def create_or_get_user(user_id: str, email: str = None, name: str = None) -> Dict:
+def create_or_get_user(user_id: str, email: str = None, name: str = None, referral_code: str = None) -> Dict:
     """創建或獲取用戶"""
     conn = get_conn()
     conn.row_factory = sqlite3.Row
@@ -1363,11 +1392,40 @@ def create_or_get_user(user_id: str, email: str = None, name: str = None) -> Dic
     
     if not user:
         # 為新用戶生成推薦碼
-        referral_code = generate_referral_code(user_id)
+        new_referral_code = generate_referral_code(user_id)
+        
+        # 處理推薦碼獎勵
+        referrer_id = None
+        if referral_code:
+            # 查找推薦人
+            referrer = conn.execute(
+                "SELECT user_id FROM users WHERE referral_code = ?", (referral_code,)
+            ).fetchone()
+            if referrer:
+                referrer_id = referrer['user_id']
+                # 給推薦人增加 500 點數
+                conn.execute(
+                    "UPDATE users SET credits = credits + 500 WHERE user_id = ?", (referrer_id,)
+                )
+                # 記錄推薦獎勵
+                conn.execute(
+                    "INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, 500, 'referral_bonus', ?)",
+                    (referrer_id, f"推薦新用戶 {user_id} 獲得獎勵")
+                )
+        
+        # 創建新用戶，如果使用推薦碼則額外獲得 500 點數
+        initial_credits = 1000 if referral_code and referrer_id else 500
         conn.execute(
-            "INSERT INTO users (user_id, email, name, credits, referral_code) VALUES (?, ?, ?, 500, ?)",
-            (user_id, email, name, referral_code)
+            "INSERT INTO users (user_id, email, name, credits, referral_code) VALUES (?, ?, ?, ?, ?)",
+            (user_id, email, name, initial_credits, new_referral_code)
         )
+        
+        # 記錄新用戶獎勵
+        conn.execute(
+            "INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, 'signup_bonus', ?)",
+            (user_id, initial_credits, f"註冊獎勵{'（含推薦獎勵）' if referral_code and referrer_id else ''}")
+        )
+        
         conn.commit()
         user = conn.execute(
             "SELECT * FROM users WHERE user_id = ?", (user_id,)
