@@ -58,8 +58,8 @@ from chat_stream import router as chat_stream_router
 app.include_router(chat_stream_router)
 
 # 掛載點數系統
-from points_integration import integrate_points_system
-integrate_points_system(app)
+# from points_integration import integrate_points_system
+# integrate_points_system(app)
 
 # 動態設定 CORS：若需要帶 Cookie 就不能使用 "*"
 # 預設白名單包含 GitHub Pages、Zeabur 前端子網域、正式站子網域與本機
@@ -949,12 +949,129 @@ async def google_callback(request: Request):
         user_id = f"g_{sub}"
         create_or_get_user(user_id, email=email, name=name)
         token_val = create_session_cookie(user_id)
-        resp = RedirectResponse(url=request.query_params.get("state") or "/")
+        
+        # 重定向到中間頁面，而不是直接跳轉到前端
+        next_url = request.query_params.get("state") or "https://jacky6658.github.io/AItest/"
+        success_url = f"/auth/google/success?next={next_url}"
+        resp = RedirectResponse(url=success_url)
         resp.set_cookie("session", token_val, httponly=True, secure=True, samesite="none", max_age=7*24*3600)
         return resp
     except Exception as e:
         print("[OAuth Callback Error]", e)
-        return JSONResponse(status_code=500, content={"error": "oauth_failed"})
+        # 錯誤時也重定向到中間頁面，但帶上錯誤參數
+        next_url = request.query_params.get("state") or "https://jacky6658.github.io/AItest/"
+        error_url = f"/auth/google/success?next={next_url}&error=google_login_failed"
+        return RedirectResponse(url=error_url)
+
+@app.get("/auth/google/success")
+async def google_success(request: Request, next: str = "https://jacky6658.github.io/AItest/", error: str = None):
+    """Google 登入成功的中間頁面，負責通知父視窗並關閉彈窗"""
+    html_content = f"""
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Google 登入</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }}
+        .container {{
+            text-align: center;
+            padding: 2rem;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+        }}
+        .spinner {{
+            width: 40px;
+            height: 40px;
+            border: 4px solid rgba(255, 255, 255, 0.3);
+            border-top: 4px solid white;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 1rem;
+        }}
+        @keyframes spin {{
+            0% {{ transform: rotate(0deg); }}
+            100% {{ transform: rotate(360deg); }}
+        }}
+        .message {{
+            font-size: 1.2rem;
+            margin-bottom: 1rem;
+        }}
+        .error {{
+            color: #ff6b6b;
+        }}
+        .success {{
+            color: #51cf66;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="spinner"></div>
+        <div class="message" id="message">
+            {'登入失敗，正在關閉視窗...' if error else '登入成功，正在跳轉...'}
+        </div>
+    </div>
+
+    <script>
+        (function() {{
+            const urlParams = new URLSearchParams(window.location.search);
+            const nextUrl = urlParams.get('next') || '{next}';
+            const error = urlParams.get('error');
+            
+            console.log('Google 登入中間頁面載入');
+            console.log('Next URL:', nextUrl);
+            console.log('Error:', error);
+            
+            // 通知父視窗登入結果
+            if (window.opener) {{
+                console.log('通知父視窗登入結果');
+                window.opener.postMessage({{
+                    type: 'google_login_result',
+                    success: !error,
+                    error: error,
+                    nextUrl: nextUrl
+                }}, '*');
+                
+                // 延遲關閉彈窗，讓父視窗有時間處理訊息
+                setTimeout(() => {{
+                    console.log('關閉彈窗');
+                    window.close();
+                }}, 1000);
+            }} else {{
+                // 如果不是彈窗模式，直接跳轉
+                console.log('非彈窗模式，直接跳轉到:', nextUrl);
+                setTimeout(() => {{
+                    window.location.href = nextUrl;
+                }}, 2000);
+            }}
+            
+            // 超時保護：如果 5 秒後還沒關閉，強制關閉
+            setTimeout(() => {{
+                if (window.opener) {{
+                    window.close();
+                }} else {{
+                    window.location.href = nextUrl;
+                }}
+            }}, 5000);
+        }})();
+    </script>
+</body>
+</html>
+    """
+    return HTMLResponse(content=html_content)
 
 # ========= 內建知識庫 =========
 BUILTIN_KB_SCRIPT = """
