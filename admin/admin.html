@@ -395,8 +395,8 @@
                 background: #3a3a3a;
                 border-color: #4a4a4a;
                 color: #ffffff;
-            }
-        }
+      }
+    }
   </style>
 </head>
 <body>
@@ -410,6 +410,7 @@
             <ul>
                 <li><a href="#" onclick="showSection('dashboard')" class="active">儀表板</a></li>
                 <li><a href="#" onclick="showSection('users')">用戶管理</a></li>
+                <li><a href="#" onclick="showSection('referrals')">推薦碼管理</a></li>
                 <li><a href="#" onclick="showSection('credits')">點數管理</a></li>
                 <li><a href="#" onclick="showSection('analytics')">數據分析</a></li>
                 <li><a href="#" onclick="showSection('settings')">系統設定</a></li>
@@ -466,18 +467,48 @@
                                 <th>用戶ID</th>
                                 <th>Email</th>
                                 <th>用戶名</th>
+                                <th>點數</th>
+                                <th>推薦碼</th>
                                 <th>註冊時間</th>
                 <th>操作</th>
               </tr>
             </thead>
                         <tbody>
                             <tr>
-                                <td colspan="5">載入中...</td>
+                                <td colspan="7">載入中...</td>
                             </tr>
             </tbody>
           </table>
         </div>
       </div>
+
+            <!-- 推薦碼管理 -->
+            <div id="referrals" class="section hidden">
+                <h2>推薦碼管理</h2>
+                <div class="card">
+                    <h3>推薦關係統計</h3>
+                    <table class="table" id="referralsTable">
+                        <thead>
+                            <tr>
+                                <th>推薦者</th>
+                                <th>被推薦者</th>
+                                <th>推薦碼</th>
+                                <th>推薦時間</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td colspan="4">載入中...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <div class="card">
+                    <h3>手動重置每月點數</h3>
+                    <button class="btn" onclick="resetMonthlyCredits()">重置所有免費用戶點數為500</button>
+                </div>
+            </div>
 
             <!-- 點數管理 -->
             <div id="credits" class="section hidden">
@@ -578,12 +609,15 @@
                 case 'dashboard':
                     loadDashboard();
                     break;
-                case 'users':
-                    loadUsers();
-                    break;
-                case 'credits':
-                    loadCredits();
-                    break;
+            case 'users':
+                loadUsers();
+                break;
+            case 'referrals':
+                loadReferrals();
+                break;
+            case 'credits':
+                loadCredits();
+                break;
                 case 'analytics':
                     loadAnalytics();
                     break;
@@ -625,6 +659,8 @@
                             <td>${user.user_id}</td>
                             <td>${user.email || '-'}</td>
                             <td>${user.name || '-'}</td>
+                            <td>${user.credits || 0}</td>
+                            <td>${user.referral_code || '-'}</td>
                             <td>${user.created_at || '-'}</td>
                             <td>
                                 <button class="btn" onclick="viewUser('${user.user_id}')">查看</button>
@@ -634,10 +670,65 @@
                         tbody.appendChild(row);
                     });
                 } else {
-                    tbody.innerHTML = '<tr><td colspan="5">無用戶數據</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="7">無用戶數據</td></tr>';
                 }
             } catch (error) {
                 console.error('載入用戶數據失敗:', error);
+            }
+        }
+
+        // 載入推薦碼數據
+        async function loadReferrals() {
+            try {
+                const response = await fetch('/admin/referrals', {
+                    credentials: 'include'
+                });
+                const data = await response.json();
+                
+                const tbody = document.querySelector('#referralsTable tbody');
+                tbody.innerHTML = '';
+                
+                if (data.referrals && data.referrals.length > 0) {
+                    data.referrals.forEach(ref => {
+                        const row = document.createElement('tr');
+                        row.innerHTML = `
+                            <td>${ref.referrer_name || ref.referrer_id}</td>
+                            <td>${ref.referred_name || ref.referred_id}</td>
+                            <td>${ref.referral_code}</td>
+                            <td>${ref.created_at || '-'}</td>
+                        `;
+                        tbody.appendChild(row);
+                    });
+                } else {
+                    tbody.innerHTML = '<tr><td colspan="4">無推薦數據</td></tr>';
+                }
+            } catch (error) {
+                console.error('載入推薦碼數據失敗:', error);
+            }
+        }
+
+        // 重置每月點數
+        async function resetMonthlyCredits() {
+            if (!confirm('確定要重置所有免費用戶點數為500嗎？')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch('/admin/reset-monthly-credits', {
+                    method: 'POST',
+                    credentials: 'include'
+                });
+                const data = await response.json();
+                
+                if (data.ok) {
+                    alert('每月點數重置成功！');
+                    loadUsers(); // 重新載入用戶數據
+                } else {
+                    alert('重置失敗：' + (data.error || '未知錯誤'));
+                }
+            } catch (error) {
+                console.error('重置點數失敗:', error);
+                alert('重置失敗：' + error.message);
             }
         }
 
