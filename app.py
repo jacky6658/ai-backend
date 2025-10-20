@@ -2192,7 +2192,7 @@ async def admin_users(req: Request):
     if not _check_admin(req):
         return JSONResponse(status_code=403, content={"error": "forbidden"})
     conn = get_conn(); conn.row_factory = sqlite3.Row
-    users = conn.execute("SELECT user_id, email, name, created_at, updated_at, status, credits, referral_code FROM users ORDER BY created_at DESC LIMIT 500").fetchall()
+    users = conn.execute("SELECT user_id, email, name, created_at, updated_at, status, referral_code FROM users ORDER BY created_at DESC LIMIT 500").fetchall()
     auths = conn.execute(
         """
         SELECT user_id, username, email, phone, created_at,
@@ -2200,9 +2200,21 @@ async def admin_users(req: Request):
         FROM users_auth ORDER BY created_at DESC LIMIT 500
         """
     ).fetchall()
+    # 為每個用戶添加點數信息
+    users_with_credits = []
+    for user in users:
+        user_dict = dict(user)
+        # 查詢用戶點數
+        conn_temp = get_conn()
+        conn_temp.row_factory = sqlite3.Row
+        credits_row = conn_temp.execute("SELECT credits FROM users WHERE user_id = ?", (user['user_id'],)).fetchone()
+        user_dict['credits'] = credits_row['credits'] if credits_row and credits_row['credits'] is not None else 0
+        conn_temp.close()
+        users_with_credits.append(user_dict)
+    
     conn.close()
     return {
-        "users": [dict(u) for u in users],
+        "users": users_with_credits,
         "users_auth": [dict(a) for a in auths],
     }
 
