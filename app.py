@@ -179,6 +179,77 @@ def get_conn() -> sqlite3.Connection:
     _ensure_db_dir(DB_PATH)
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
+def reset_monthly_credits():
+    """每月重置免費用戶點數為500"""
+    conn = get_conn()
+    try:
+        # 重置所有免費用戶的點數為500
+        conn.execute("""
+            UPDATE users 
+            SET credits = 500, updated_at = datetime('now')
+            WHERE status = 'active' AND credits < 500
+        """)
+        conn.commit()
+        print("每月點數重置完成")
+    except Exception as e:
+        print(f"重置點數失敗: {e}")
+    finally:
+        conn.close()
+
+def generate_referral_code(user_id: str) -> str:
+    """生成推薦碼"""
+    import random
+    import string
+    
+    # 生成6位隨機字母數字組合
+    code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return f"REF{code}"
+
+def apply_referral_code(referral_code: str, new_user_id: str) -> bool:
+    """應用推薦碼，雙方獲得500點數"""
+    conn = get_conn()
+    try:
+        # 查找推薦碼的擁有者
+        referrer = conn.execute(
+            "SELECT user_id, credits FROM users WHERE referral_code = ?", 
+            (referral_code,)
+        ).fetchone()
+        
+        if not referrer:
+            return False
+        
+        referrer_id = referrer[0]
+        referrer_credits = referrer[1] or 0
+        
+        # 更新推薦者點數
+        conn.execute(
+            "UPDATE users SET credits = credits + 500, updated_at = datetime('now') WHERE user_id = ?",
+            (referrer_id,)
+        )
+        
+        # 更新新用戶點數
+        conn.execute(
+            "UPDATE users SET credits = credits + 500, updated_at = datetime('now') WHERE user_id = ?",
+            (new_user_id,)
+        )
+        
+        # 記錄推薦關係
+        conn.execute(
+            "INSERT INTO referrals (referrer_id, referred_id, referral_code, created_at) VALUES (?, ?, ?, datetime('now'))",
+            (referrer_id, new_user_id, referral_code)
+        )
+        
+        conn.commit()
+        print(f"推薦碼 {referral_code} 應用成功，雙方獲得500點數")
+        return True
+        
+    except Exception as e:
+        conn.rollback()
+        print(f"應用推薦碼失敗: {e}")
+        return False
+    finally:
+        conn.close()
+
 def init_db():
     _ensure_db_dir(DB_PATH)
     conn = get_conn()
@@ -214,7 +285,22 @@ def init_db():
             platform_preferences TEXT,
             language_preference TEXT DEFAULT 'zh-TW',
             timezone TEXT DEFAULT 'Asia/Taipei',
-            status TEXT DEFAULT 'active'
+            status TEXT DEFAULT 'active',
+            credits INTEGER DEFAULT 500,
+            referral_code TEXT UNIQUE
+        )
+    """)
+    
+    # 添加推薦關係表
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS referrals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id TEXT NOT NULL,
+            referred_id TEXT NOT NULL,
+            referral_code TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(referrer_id) REFERENCES users(user_id),
+            FOREIGN KEY(referred_id) REFERENCES users(user_id)
         )
     """)
 
@@ -418,6 +504,52 @@ def on_startup():
 @app.get("/healthz")
 def healthz(): return {"ok": True}
 
+@app.post("/admin/reset-monthly-credits")
+async def admin_reset_monthly_credits(req: Request):
+    """管理員手動重置每月點數"""
+    if not _check_admin(req):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    
+    try:
+        reset_monthly_credits()
+        return {"ok": True, "message": "每月點數重置完成"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/api/referral-code/{user_id}")
+async def get_referral_code(user_id: str):
+    """獲取用戶推薦碼"""
+    conn = get_conn()
+    conn.row_factory = sqlite3.Row
+    
+    user = conn.execute(
+        "SELECT referral_code FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    
+    conn.close()
+    
+    if user and user[0]:
+        return {"referral_code": user[0]}
+    else:
+        return JSONResponse(status_code=404, content={"error": "user_not_found"})
+
+@app.post("/api/apply-referral")
+async def apply_referral(req: Request):
+    """應用推薦碼"""
+    data = await req.json()
+    referral_code = data.get("referral_code", "").strip()
+    user_id = data.get("user_id", "").strip()
+    
+    if not referral_code or not user_id:
+        return JSONResponse(status_code=400, content={"error": "missing_fields"})
+    
+    success = apply_referral_code(referral_code, user_id)
+    
+    if success:
+        return {"ok": True, "message": "推薦碼應用成功，雙方獲得500點數"}
+    else:
+        return JSONResponse(status_code=400, content={"error": "invalid_referral_code"})
+
 @app.get("/favicon.ico")
 def favicon(): return Response(status_code=204)
 
@@ -495,10 +627,13 @@ async def auth_signup(req: Request):
         if existing_user or existing_auth:
             raise HTTPException(status_code=409, detail="user_exists")
         
+        # 生成推薦碼
+        referral_code = generate_referral_code(user_id)
+        
         # 建立 users 表記錄
         conn.execute(
-            "INSERT INTO users (user_id, email, name, created_at, updated_at, status) VALUES (?, ?, ?, datetime('now'), datetime('now'), 'active')",
-            (user_id, email, username)
+            "INSERT INTO users (user_id, email, name, created_at, updated_at, status, credits, referral_code) VALUES (?, ?, ?, datetime('now'), datetime('now'), 'active', 500, ?)",
+            (user_id, email, username, referral_code)
         )
         
         # 建立 users_auth 表記錄
@@ -581,11 +716,99 @@ def me(session: str | None = Cookie(default=None)):
     if not uid:
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
     conn = get_conn(); conn.row_factory = sqlite3.Row
-    u = conn.execute("SELECT user_id, email, name FROM users WHERE user_id=?", (uid,)).fetchone()
+    u = conn.execute("SELECT user_id, email, name, credits, referral_code, created_at FROM users WHERE user_id=?", (uid,)).fetchone()
     conn.close()
     if not u:
         return JSONResponse(status_code=404, content={"error": "user_not_found"})
-    return {"id": u["user_id"], "email": u["email"], "name": u["name"]}
+    return {"id": u["user_id"], "email": u["email"], "name": u["name"], "credits": u["credits"] or 0, "referral_code": u["referral_code"], "created_at": u["created_at"]}
+
+@app.get("/api/user/profile")
+def get_user_profile(session: str | None = Cookie(default=None)):
+    """獲取用戶完整檔案信息"""
+    uid = verify_session_cookie(session) if session else None
+    if not uid:
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    
+    conn = get_conn()
+    conn.row_factory = sqlite3.Row
+    
+    # 獲取用戶基本信息
+    user = conn.execute("""
+        SELECT user_id, email, name, credits, referral_code, created_at, updated_at, status
+        FROM users WHERE user_id = ?
+    """, (uid,)).fetchone()
+    
+    if not user:
+        conn.close()
+        return JSONResponse(status_code=404, content={"error": "user_not_found"})
+    
+    # 獲取使用統計
+    usage_stats = conn.execute("""
+        SELECT 
+            COUNT(CASE WHEN module = 'positioning' THEN 1 END) as positioning_count,
+            COUNT(CASE WHEN module = 'topics' THEN 1 END) as topics_count,
+            COUNT(CASE WHEN module = 'script' THEN 1 END) as script_count,
+            COUNT(*) as total_usage
+        FROM usage_logs 
+        WHERE user_id = ? AND created_at >= date('now', 'start of month')
+    """, (uid,)).fetchone()
+    
+    # 獲取最近的點數交易記錄
+    credit_history = conn.execute("""
+        SELECT credits_change, description, created_at
+        FROM orders 
+        WHERE user_id = ? 
+        ORDER BY created_at DESC 
+        LIMIT 10
+    """, (uid,)).fetchall()
+    
+    conn.close()
+    
+    return {
+        "user": dict(user),
+        "usage_stats": {
+            "positioning": usage_stats["positioning_count"] or 0,
+            "topics": usage_stats["topics_count"] or 0,
+            "script": usage_stats["script_count"] or 0,
+            "total": usage_stats["total_usage"] or 0
+        },
+        "credit_history": [dict(record) for record in credit_history]
+    }
+
+@app.get("/api/user/knowledge")
+def get_user_knowledge(session: str | None = Cookie(default=None), agent: str = "positioning"):
+    """獲取用戶知識庫內容（生成結果和對話記錄）"""
+    uid = verify_session_cookie(session) if session else None
+    if not uid:
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    
+    conn = get_conn()
+    conn.row_factory = sqlite3.Row
+    
+    # 獲取一鍵生成結果
+    oneclick_results = conn.execute("""
+        SELECT content, created_at, mode
+        FROM usage_logs 
+        WHERE user_id = ? AND module = ? AND mode = 'oneclick'
+        ORDER BY created_at DESC 
+        LIMIT 20
+    """, (uid, agent)).fetchall()
+    
+    # 獲取對話記錄
+    chat_history = conn.execute("""
+        SELECT role, content, created_at
+        FROM messages 
+        WHERE user_id = ? AND agent_type = ?
+        ORDER BY created_at DESC 
+        LIMIT 50
+    """, (uid, agent)).fetchall()
+    
+    conn.close()
+    
+    return {
+        "oneclick_results": [dict(record) for record in oneclick_results],
+        "chat_history": [dict(record) for record in chat_history]
+    }
 
 @app.post("/logout")
 def logout():
@@ -1002,9 +1225,11 @@ def create_or_get_user(user_id: str, email: str = None, name: str = None) -> Dic
     ).fetchone()
     
     if not user:
+        # 為新用戶生成推薦碼
+        referral_code = generate_referral_code(user_id)
         conn.execute(
-            "INSERT INTO users (user_id, email, name) VALUES (?, ?, ?)",
-            (user_id, email, name)
+            "INSERT INTO users (user_id, email, name, credits, referral_code) VALUES (?, ?, ?, 500, ?)",
+            (user_id, email, name, referral_code)
         )
         conn.commit()
         user = conn.execute(
@@ -1947,7 +2172,7 @@ async def admin_users(req: Request):
     if not _check_admin(req):
         return JSONResponse(status_code=403, content={"error": "forbidden"})
     conn = get_conn(); conn.row_factory = sqlite3.Row
-    users = conn.execute("SELECT user_id, email, name, created_at, updated_at, status FROM users ORDER BY created_at DESC LIMIT 500").fetchall()
+    users = conn.execute("SELECT user_id, email, name, created_at, updated_at, status, credits, referral_code FROM users ORDER BY created_at DESC LIMIT 500").fetchall()
     auths = conn.execute(
         """
         SELECT user_id, username, email, phone, created_at,
@@ -1960,6 +2185,22 @@ async def admin_users(req: Request):
         "users": [dict(u) for u in users],
         "users_auth": [dict(a) for a in auths],
     }
+
+@app.get("/admin/referrals")
+async def admin_referrals(req: Request):
+    if not _check_admin(req):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    conn = get_conn(); conn.row_factory = sqlite3.Row
+    referrals = conn.execute("""
+        SELECT r.referrer_id, r.referred_id, r.referral_code, r.created_at,
+               u1.name as referrer_name, u2.name as referred_name
+        FROM referrals r
+        LEFT JOIN users u1 ON r.referrer_id = u1.user_id
+        LEFT JOIN users u2 ON r.referred_id = u2.user_id
+        ORDER BY r.created_at DESC LIMIT 500
+    """).fetchall()
+    conn.close()
+    return {"referrals": [dict(r) for r in referrals]}
 
 @app.get("/admin/users_full")
 async def admin_users_full(req: Request, limit: int = 500):
