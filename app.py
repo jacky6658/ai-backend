@@ -2191,32 +2191,72 @@ def _check_admin(req: Request):
 async def admin_users(req: Request):
     if not _check_admin(req):
         return JSONResponse(status_code=403, content={"error": "forbidden"})
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    users = conn.execute("SELECT user_id, email, name, created_at, updated_at, status, referral_code FROM users ORDER BY created_at DESC LIMIT 500").fetchall()
-    auths = conn.execute(
-        """
-        SELECT user_id, username, email, phone, created_at,
-               CASE WHEN password_hash IS NOT NULL AND length(password_hash)>0 THEN 1 ELSE 0 END AS has_password
-        FROM users_auth ORDER BY created_at DESC LIMIT 500
-        """
-    ).fetchall()
-    # 為每個用戶添加點數信息
-    users_with_credits = []
-    for user in users:
-        user_dict = dict(user)
-        # 查詢用戶點數
-        conn_temp = get_conn()
-        conn_temp.row_factory = sqlite3.Row
-        credits_row = conn_temp.execute("SELECT credits FROM users WHERE user_id = ?", (user['user_id'],)).fetchone()
-        user_dict['credits'] = credits_row['credits'] if credits_row and credits_row['credits'] is not None else 0
-        conn_temp.close()
-        users_with_credits.append(user_dict)
     
-    conn.close()
-    return {
-        "users": users_with_credits,
-        "users_auth": [dict(a) for a in auths],
-    }
+    conn = get_conn()
+    conn.row_factory = sqlite3.Row
+    
+    try:
+        # 先檢查並修復資料庫結構
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                email TEXT UNIQUE,
+                name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'active',
+                credits INTEGER DEFAULT 500,
+                referral_code TEXT
+            )
+        """)
+        
+        # 檢查並添加缺失的欄位
+        cursor = conn.execute("PRAGMA table_info(users)")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        if 'credits' not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN credits INTEGER DEFAULT 500")
+            print("已添加 credits 欄位")
+            
+        if 'referral_code' not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN referral_code TEXT")
+            print("已添加 referral_code 欄位")
+        
+        # 為沒有推薦碼的用戶生成推薦碼
+        users_without_ref = conn.execute("SELECT user_id FROM users WHERE referral_code IS NULL OR referral_code = ''").fetchall()
+        for user in users_without_ref:
+            import uuid
+            ref_code = str(uuid.uuid4())[:8].upper()
+            conn.execute("UPDATE users SET referral_code = ? WHERE user_id = ?", (ref_code, user['user_id']))
+            print(f"為用戶 {user['user_id']} 生成推薦碼: {ref_code}")
+        
+        # 為沒有點數的用戶設置預設點數
+        conn.execute("UPDATE users SET credits = 500 WHERE credits IS NULL")
+        
+        conn.commit()
+        
+        # 查詢用戶資料
+        users = conn.execute("SELECT user_id, email, name, created_at, updated_at, status, credits, referral_code FROM users ORDER BY created_at DESC LIMIT 500").fetchall()
+        
+        auths = conn.execute(
+            """
+            SELECT user_id, username, email, phone, created_at,
+                   CASE WHEN password_hash IS NOT NULL AND length(password_hash)>0 THEN 1 ELSE 0 END AS has_password
+            FROM users_auth ORDER BY created_at DESC LIMIT 500
+            """
+        ).fetchall()
+        
+        conn.close()
+        
+        return {
+            "users": [dict(u) for u in users],
+            "users_auth": [dict(a) for a in auths],
+        }
+        
+    except Exception as e:
+        conn.close()
+        print(f"資料庫錯誤: {e}")
+        return JSONResponse(status_code=500, content={"error": f"資料庫錯誤: {str(e)}"})
 
 @app.get("/admin/referrals")
 async def admin_referrals(req: Request):
