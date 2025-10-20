@@ -402,8 +402,21 @@
 <body>
     <div class="container">
         <div class="header">
-            <h1>AIJob 短影音智能 - 管理後台</h1>
-            <p>系統管理與監控中心</p>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+      <div>
+                    <h1>AIJob 短影音智能 - 管理後台</h1>
+                    <p>系統管理與監控中心</p>
+      </div>
+                <button id="admin-logout-btn" onclick="adminLogout()" style="
+                    background: #dc2626; 
+                    color: white; 
+                    border: none; 
+                    padding: 8px 16px; 
+                    border-radius: 4px; 
+                    cursor: pointer;
+                    font-size: 14px;
+                ">登出</button>
+      </div>
     </div>
 
         <nav class="nav">
@@ -446,8 +459,8 @@
                         <p>載入中...</p>
       </div>
         </div>
-        </div>
-        
+      </div>
+
             <!-- 用戶管理 -->
             <div id="users" class="section hidden">
                 <h2>用戶管理</h2>
@@ -469,7 +482,7 @@
                                 <th>用戶名</th>
                                 <th>點數</th>
                                 <th>推薦碼</th>
-                                <th>註冊時間</th>
+                <th>註冊時間</th>
                 <th>操作</th>
               </tr>
             </thead>
@@ -488,28 +501,28 @@
                 <div class="card">
                     <h3>推薦關係統計</h3>
                     <table class="table" id="referralsTable">
-                        <thead>
-                            <tr>
+            <thead>
+              <tr>
                                 <th>推薦者</th>
                                 <th>被推薦者</th>
                                 <th>推薦碼</th>
                                 <th>推薦時間</th>
-                            </tr>
-                        </thead>
+              </tr>
+            </thead>
                         <tbody>
                             <tr>
                                 <td colspan="4">載入中...</td>
                             </tr>
-                        </tbody>
-                    </table>
-                </div>
-                
+            </tbody>
+          </table>
+        </div>
+        
                 <div class="card">
                     <h3>手動重置每月點數</h3>
                     <button class="btn" onclick="resetMonthlyCredits()">重置所有免費用戶點數為500</button>
-                </div>
-            </div>
-
+      </div>
+        </div>
+        
             <!-- 點數管理 -->
             <div id="credits" class="section hidden">
                 <h2>點數管理</h2>
@@ -522,7 +535,7 @@
                     <div class="form-group">
                         <label>充值點數:</label>
                         <input type="number" id="chargeAmount" placeholder="輸入充值點數">
-        </div>
+      </div>
                     <div class="form-group">
                         <label>充值原因:</label>
                         <input type="text" id="chargeReason" placeholder="輸入充值原因">
@@ -548,7 +561,7 @@
             </tbody>
           </table>
         </div>
-            </div>
+      </div>
 
             <!-- 數據分析 -->
             <div id="analytics" class="section hidden">
@@ -558,8 +571,8 @@
                     <div id="analyticsChart">
                         <p>圖表載入中...</p>
             </div>
-          </div>
-        </div>
+            </div>
+            </div>
         
             <!-- 系統設定 -->
             <div id="settings" class="section hidden">
@@ -569,17 +582,17 @@
                     <div class="form-group">
                         <label>API Base URL:</label>
                         <input type="text" id="apiBase" value="https://aijobvideobackend.zeabur.app">
-                    </div>
+            </div>
                     <div class="form-group">
                         <label>Admin Token:</label>
                         <input type="password" id="adminToken" placeholder="管理員Token">
-                    </div>
+            </div>
                     <button class="btn" onclick="saveSettings()">儲存設定</button>
           </div>
+            </div>
+          </div>
         </div>
-      </div>
-    </div>
-
+        
     <script>
         // 顯示指定區塊
         function showSection(sectionId) {
@@ -674,7 +687,7 @@
                     <input type="password" id="adminPassword" placeholder="管理員密碼" style="width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 4px;">
                     <button onclick="adminLogin()" style="width: 100%; padding: 10px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer;">登入</button>
                     <div id="loginError" style="color: red; margin-top: 10px;"></div>
-                </div>
+          </div>
             `;
             document.body.appendChild(modal);
         }
@@ -706,13 +719,64 @@
             }
         }
 
+        // 管理員登出
+        async function adminLogout() {
+            try {
+                const response = await fetch('/admin/logout', {
+                    method: 'POST',
+                    credentials: 'include'
+                });
+                
+                if (response.ok) {
+                    showToast('已登出', 'success');
+                    location.reload();
+                } else {
+                    showToast('登出失敗', 'error');
+                }
+            } catch (error) {
+                console.error('登出失敗:', error);
+                showToast('登出失敗: ' + error.message, 'error');
+            }
+        }
+
+        // 簡單的提示函數
+        function showToast(message, type) {
+            const toast = document.createElement('div');
+            toast.style.cssText = `
+                position: fixed; top: 20px; right: 20px; z-index: 10000;
+                padding: 12px 20px; border-radius: 4px; color: white;
+                background: ${type === 'success' ? '#10b981' : '#ef4444'};
+                font-size: 14px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            `;
+            toast.textContent = message;
+            document.body.appendChild(toast);
+            setTimeout(() => {
+                if (toast.parentNode) {
+                    toast.parentNode.removeChild(toast);
+                }
+            }, 3000);
+        }
+
         // 載入用戶數據
         async function loadUsers() {
             try {
                 const response = await fetch('/admin/users', {
                     credentials: 'include'
                 });
-                const data = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                
+                const text = await response.text();
+                let data;
+                try {
+                    data = JSON.parse(text);
+                } catch (parseError) {
+                    console.error('JSON解析失敗:', parseError);
+                    console.error('響應內容:', text);
+                    throw new Error('服務器返回的不是有效的JSON格式');
+                }
                 
                 const tbody = document.querySelector('#usersTable tbody');
                 tbody.innerHTML = '';
@@ -937,13 +1001,13 @@
                     <div class="modal-header">
                         <h3>用戶點數詳情 - ${userId}</h3>
                         <button class="close-btn" onclick="closeCreditDetailsModal()">&times;</button>
-                    </div>
+        </div>
                     <div class="modal-body">
                         <div class="credit-summary">
                             <div class="summary-item">
                                 <span class="label">當前餘額:</span>
                                 <span class="value">${data.balance || 0} 點</span>
-                            </div>
+      </div>
                             <div class="summary-item">
                                 <span class="label">總充值:</span>
                                 <span class="value">${data.total_charged || 0} 點</span>
