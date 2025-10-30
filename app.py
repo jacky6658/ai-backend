@@ -512,47 +512,51 @@ def generate_access_token(user_id: str) -> str:
 
 
 def verify_access_token(token: str, allow_expired: bool = False) -> Optional[str]:
-    """驗證訪問令牌並返回用戶 ID
-    
-    Args:
-        token: JWT token
-        allow_expired: 如果為 True，允許過期的 token（用於 refresh 場景）
+    """
+    驗證訪問令牌並返回用戶 ID
+    - allow_expired=False：僅在過期時回傳 None；未過期則回傳 user_id
+    - allow_expired=True：允許過期（給 refresh 用），仍回傳 user_id
     """
     try:
         import base64
         import json
         parts = token.split('.')
         if len(parts) != 3:
-            print(f"DEBUG: verify_access_token - token 格式錯誤（不是3部分），allow_expired={allow_expired}")
+            print(f"[verify_access_token] format error, allow_expired={allow_expired}")
             return None
-        
-        # 驗證簽名
+
+        # 簽名驗證
         expected_signature = hashlib.sha256(f"{parts[0]}.{parts[1]}.{JWT_SECRET}".encode()).hexdigest()
         if expected_signature != parts[2]:
-            print(f"DEBUG: verify_access_token - 簽名驗證失敗，allow_expired={allow_expired}")
-            print(f"DEBUG: JWT_SECRET 是否設定: {JWT_SECRET is not None and JWT_SECRET != ''}")
+            print(f"[verify_access_token] bad signature, allow_expired={allow_expired}")
+            print(f"[verify_access_token] JWT_SECRET set: {bool(JWT_SECRET)}")
             return None
-        
-        # 解碼 payload
-        payload = json.loads(base64.urlsafe_b64decode(parts[1] + '==').decode())
-        
-        # 檢查過期時間（如果 allow_expired=False）
-        if not allow_expired:
-            exp = payload.get("exp", 0)
-            now = datetime.now().timestamp()
-            if exp < now:
-                print(f"DEBUG: verify_access_token - token 已過期，exp={exp}, now={now}, allow_expired={allow_expired}")
-            return None
-        
+
+        # 解碼 payload（修正 padding）
+        payload_b64 = parts[1]
+        padding = '=' * ((4 - len(payload_b64) % 4) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + padding).decode())
+
         user_id = payload.get("user_id")
-        if allow_expired:
-            exp = payload.get("exp", 0)
-            now = datetime.now().timestamp()
-            is_expired = exp < now
-            print(f"DEBUG: verify_access_token - 驗證成功，user_id={user_id}, 已過期={is_expired}, allow_expired={allow_expired}")
+        if not user_id:
+            return None
+
+        exp = payload.get("exp", 0)
+        now = datetime.now().timestamp()
+
+        if not allow_expired:
+            if exp < now:
+                print(f"[verify_access_token] expired: exp={exp}, now={now}, allow_expired={allow_expired}")
+                return None
+            print(f"[verify_access_token] ok: user_id={user_id}, exp={exp}, now={now}, allow_expired={allow_expired}")
+            return user_id
+
+        # allow_expired=True：給 refresh 用
+        is_expired = exp < now
+        print(f"[verify_access_token] ok(refresh): user_id={user_id}, expired={is_expired}, allow_expired={allow_expired}")
         return user_id
     except Exception as e:
-        print(f"DEBUG: verify_access_token - 發生異常: {str(e)}, allow_expired={allow_expired}")
+        print(f"[verify_access_token] error: {e}, allow_expired={allow_expired}")
         return None
 
 
