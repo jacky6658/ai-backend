@@ -1,4303 +1,4571 @@
-# app.py
 import os
 import json
-import glob
-import sqlite3
-from typing import List, Optional, Any, Dict
-from datetime import datetime, date
-
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.sessions import SessionMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse, Response, StreamingResponse, RedirectResponse
-from fastapi import Cookie
-from itsdangerous import URLSafeSerializer, BadSignature
 import hashlib
-# from fastapi.staticfiles import StaticFiles  # 前端分離部署，不需要
+import sqlite3
+import secrets
+import asyncio
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional, Iterable
+from urllib.parse import urlparse
 
-# ========= 環境變數 =========
-DB_PATH = os.getenv("DB_PATH", "three_agents_system.db")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-KNOWLEDGE_TXT_PATH = os.getenv("KNOWLEDGE_TXT_PATH", "/data/kb.txt")
-GLOBAL_KB_TEXT = ""
-SESSION_SECRET = os.getenv("SESSION_SECRET", "change-me-session-secret")
-session_signer = URLSafeSerializer(SESSION_SECRET, salt="session")
-admin_session_signer = URLSafeSerializer(SESSION_SECRET, salt="admin_session")
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse, RedirectResponse, HTMLResponse, Response
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import httpx
 
-# Admin 帳號（請以環境變數設定）
-ADMIN_USER = os.getenv("ADMIN_USER")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+import google.generativeai as genai
 
-# Google OAuth2（可選）
+# PostgreSQL 支援
+try:
+    import psycopg2
+    from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+    PSYCOPG2_AVAILABLE = True
+except ImportError:
+    PSYCOPG2_AVAILABLE = False
+    print("WARNING: psycopg2 未安裝，將使用 SQLite")
+
+
+# 導入新的記憶系統模組
+from memory import stm
+from prompt_builder import build_enhanced_prompt, format_memory_for_display
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatBody(BaseModel):
+    message: str
+    platform: Optional[str] = None
+    profile: Optional[str] = None
+    history: Optional[List[ChatMessage]] = None
+    topic: Optional[str] = None
+    style: Optional[str] = None
+    duration: Optional[str] = "30"
+    user_id: Optional[str] = None  # 新增用戶ID
+
+
+class UserProfile(BaseModel):
+    user_id: str
+    preferred_platform: Optional[str] = None
+    preferred_style: Optional[str] = None
+    preferred_duration: Optional[str] = "30"
+    content_preferences: Optional[Dict[str, Any]] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class Generation(BaseModel):
+    id: Optional[str] = None
+    user_id: str
+    content: str
+    platform: Optional[str] = None
+    topic: Optional[str] = None
+    dedup_hash: Optional[str] = None  # 改為可選，後端自動生成
+    created_at: Optional[datetime] = None
+
+
+class ConversationSummary(BaseModel):
+    user_id: str
+    summary: str
+    message_count: int
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class GoogleUser(BaseModel):
+    id: str
+    email: str
+    name: str
+    picture: Optional[str] = None
+    verified_email: bool = False
+
+
+class AuthToken(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    user: GoogleUser
+
+
+class LongTermMemoryRequest(BaseModel):
+    conversation_type: str
+    session_id: str
+    message_role: str
+    message_content: str
+    metadata: Optional[str] = None
+
+
+# 載入環境變數
+load_dotenv()
+
+# OAuth 配置（從環境變數讀取）
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "https://aijobvideobackend.zeabur.app/auth/google/callback")
-try:
-    from authlib.integrations.starlette_client import OAuth
-    oauth = OAuth()
-    if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
-        oauth.register(
-            name="google",
-            server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
-            client_id=GOOGLE_CLIENT_ID,
-            client_secret=GOOGLE_CLIENT_SECRET,
-            client_kwargs={"scope": "openid email profile"},
-        )
-    _OAUTH_READY = True
-except Exception as _e:
-    print("[OAuth] not enabled:", _e)
-    oauth = None
-    _OAUTH_READY = False
+GOOGLE_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "http://localhost:5173/auth/callback")
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://aivideonew.zeabur.app")
+# 允許作為回跳前端的白名單（避免任意導向）
+ALLOWED_FRONTENDS = {
+    "https://aivideonew.zeabur.app",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+}
 
-# ========= App 與 CORS =========
-app = FastAPI(title="Three AI Agents System with Long-term Memory")
+# 除錯資訊
+print(f"DEBUG: Environment variables loaded:")
+print(f"DEBUG: GOOGLE_CLIENT_ID: {GOOGLE_CLIENT_ID}")
+print(f"DEBUG: GOOGLE_CLIENT_SECRET: {GOOGLE_CLIENT_SECRET}")
+print(f"DEBUG: GOOGLE_REDIRECT_URI: {GOOGLE_REDIRECT_URI}")
+print(f"DEBUG: FRONTEND_BASE_URL: {FRONTEND_BASE_URL}")
 
-# 掛載串流聊天路由
-from chat_stream import router as chat_stream_router
-app.include_router(chat_stream_router)
-
-# 掛載點數系統
-# from points_integration import integrate_points_system
-# integrate_points_system(app)
-
-# 動態設定 CORS：若需要帶 Cookie 就不能使用 "*"
-# 預設白名單包含 GitHub Pages、Zeabur 前端子網域、正式站子網域與本機
-ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS",
-    "https://jacky6658.github.io,https://jacky6658.github.io/Altest/,http://localhost:3000,https://video.aijob.com.tw,https://aijobvideo.zeabur.app,https://aijob.com.tw"
-).split(",")
-ORIGINS = [o.strip().rstrip("/") for o in ORIGINS if o.strip()]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ORIGINS,
-    allow_credentials=True,
-    allow_methods=["POST", "OPTIONS", "GET", "PUT", "DELETE"],
-    allow_headers=["*"],
-)
-
-# OAuth 需要 Starlette SessionMiddleware；使用獨立 cookie 名稱避免與本系統 session 混淆
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=SESSION_SECRET,
-    session_cookie="oauth_session",
-    same_site="none",
-    https_only=True,
-)
-
-# 前端分離部署，不需要靜態文件服務
-
-# ========= 引導式問答狀態（記憶體暫存） =========
-QA_SESSIONS: Dict[str, Dict[str, Any]] = {}  # key: session_id
-QA_QUESTIONS = [
-    {"key":"structure","q":"【Q1】請選擇腳本結構（A 三段式 / B 問題解決 / C Before-After / D 教學 / E 敘事 / F 爆點連發）"},
-    {"key":"duration","q":"【Q2】影片時長（30 或 60 秒）"},
-    {"key":"topic","q":"【Q3】請輸入主題或產品名稱"},
-    {"key":"goal","q":"【Q4】主要目標（吸流量 / 教育 / 轉單 / 品牌）"},
-    {"key":"audience","q":"【Q5】目標受眾（年齡/性別/特質/痛點）"},
-    {"key":"hook","q":"【Q6】開場鉤子類型（問句/反差/同理/數字）＋想放的關鍵詞"},
-    {"key":"cta","q":"【Q7】CTA（關注/收藏 / 留言/私訊 / 購買連結）"}
-]
-
-def qa_reset(session_id: str):
-    QA_SESSIONS[session_id] = {"step": 0, "answers": {}}
-
-def qa_next_question(session_id: str) -> Optional[str]:
-    st = QA_SESSIONS.get(session_id)
-    if not st: return None
-    step = st["step"]
-    if step < len(QA_QUESTIONS):
-        return QA_QUESTIONS[step]["q"]
-    return None
-
-def qa_record_answer(session_id: str, user_text: str):
-    st = QA_SESSIONS.get(session_id)
-    if not st: return
-    step = st["step"]
-    if step < len(QA_QUESTIONS):
-        key = QA_QUESTIONS[step]["key"]
-        st["answers"][key] = user_text
-        st["step"] = step + 1
-
-def compose_brief_from_answers(ans: Dict[str,str]) -> str:
-    labels = {
-        "structure":"結構","duration":"時長","topic":"主題","goal":"目標","audience":"受眾",
-        "hook":"鉤子","cta":"CTA"
-    }
-    lines = []
-    for it in QA_QUESTIONS:
-        k = it["key"]
-        if k in ans:
-            lines.append(f"{labels.get(k,k)}：{ans[k]}")
-    return "；".join(lines)
-
-# ========= 簡易 KB 檢索 =========
-def load_kb_text() -> str:
-    path = KNOWLEDGE_TXT_PATH
-    try:
-        if os.path.exists(path):
-            with open(path,"r",encoding="utf-8") as f:
-                return f.read()
-    except Exception:
-        pass
-    return ""
-
-def retrieve_context(query: str, max_chars: int = 1200) -> str:
-    text = GLOBAL_KB_TEXT or ""
-    if not text: 
-        return ""
-    import re
-    toks = [t for t in re.split(r'[\s，。；、,.:?!\-\/\[\]()]+', (query or "")) if len(t)>=1]
-    toks = list(dict.fromkeys(toks))
-    lines = text.splitlines()
-    scored = []
-    for i, line in enumerate(lines):
-        score = sum(1 for t in toks if t and t in line)
-        if score>0:
-            scored.append((score, i, line))
-    scored.sort(key=lambda x:(-x[0], x[1]))
-    selected=[]
-    total=0
-    for _, _, ln in scored:
-        if not ln.strip(): 
-            continue
-        take = ln.strip()
-        if total + len(take) + 1 > max_chars:
-            break
-        selected.append(take)
-        total += len(take) + 1
-    if not selected:
-        return text[:max_chars]
-    return "\n".join(selected)
-
-# ========= DB =========
-def _ensure_db_dir(path: str):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-
-def get_conn() -> sqlite3.Connection:
-    _ensure_db_dir(DB_PATH)
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
-
-def reset_monthly_credits():
-    """每月重置免費用戶點數為500"""
-    conn = get_conn()
-    try:
-        # 重置所有免費用戶的點數為500
-        conn.execute("""
-            UPDATE users 
-            SET credits = 500, updated_at = datetime('now')
-            WHERE status = 'active' AND credits < 500
-        """)
-        conn.commit()
-        print("每月點數重置完成")
-    except Exception as e:
-        print(f"重置點數失敗: {e}")
-    finally:
-        conn.close()
-
-def generate_referral_code(user_id: str) -> str:
-    """生成推薦碼"""
-    import random
-    import string
-    
-    # 生成6位隨機字母數字組合
-    code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    return f"REF{code}"
-
-def apply_referral_code(referral_code: str, new_user_id: str) -> bool:
-    """應用推薦碼，雙方獲得500點數"""
-    conn = get_conn()
-    try:
-        # 查找推薦碼的擁有者
-        referrer = conn.execute(
-            "SELECT user_id, credits FROM users WHERE referral_code = ?", 
-            (referral_code,)
-        ).fetchone()
-        
-        if not referrer:
-            return False
-        
-        referrer_id = referrer[0]
-        referrer_credits = referrer[1] or 0
-        
-        # 更新推薦者點數
-        conn.execute(
-            "UPDATE users SET credits = credits + 500, updated_at = datetime('now') WHERE user_id = ?",
-            (referrer_id,)
-        )
-        
-        # 更新新用戶點數
-        conn.execute(
-            "UPDATE users SET credits = credits + 500, updated_at = datetime('now') WHERE user_id = ?",
-            (new_user_id,)
-        )
-        
-        # 記錄推薦關係
-        conn.execute(
-            "INSERT INTO referrals (referrer_id, referred_id, referral_code, created_at) VALUES (?, ?, ?, datetime('now'))",
-            (referrer_id, new_user_id, referral_code)
-        )
-        
-        conn.commit()
-        print(f"推薦碼 {referral_code} 應用成功，雙方獲得500點數")
-        return True
-        
-    except Exception as e:
-        conn.rollback()
-        print(f"應用推薦碼失敗: {e}")
-        return False
-    finally:
-        conn.close()
-
-def init_db():
-    _ensure_db_dir(DB_PATH)
-    conn = get_conn()
-    cur = conn.cursor()
-    
-    # 原有表格
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            user_id TEXT,
-            user_input TEXT,
-            mode TEXT,
-            messages_json TEXT,
-            previous_segments_json TEXT,
-            response_json TEXT
-        )
-    """)
-    try:
-        cur.execute("ALTER TABLE requests ADD COLUMN user_id TEXT")
-    except Exception:
-        pass
-    
-    # 新增：三智能體系統表格
-    # 1. 用戶基本資訊表
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id TEXT PRIMARY KEY,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            email TEXT,
-            name TEXT,
-            platform_preferences TEXT,
-            language_preference TEXT DEFAULT 'zh-TW',
-            timezone TEXT DEFAULT 'Asia/Taipei',
-            status TEXT DEFAULT 'active',
-            credits INTEGER DEFAULT 500,
-            referral_code TEXT UNIQUE
-        )
-    """)
-    
-    # 添加推薦關係表
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS referrals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            referrer_id TEXT NOT NULL,
-            referred_id TEXT NOT NULL,
-            referral_code TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(referrer_id) REFERENCES users(user_id),
-            FOREIGN KEY(referred_id) REFERENCES users(user_id)
-        )
-    """)
-
-    # 新增：Email/帳號登入表（本地帳號）
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users_auth (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            username TEXT UNIQUE,
-            email TEXT,
-            phone TEXT,
-            password_hash TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(user_id)
-        )
-    """)
-    
-    # 2. 用戶定位檔案表
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS user_profiles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            business_type TEXT,
-            target_audience TEXT,
-            brand_voice TEXT,
-            content_goals TEXT,
-            primary_platform TEXT,
-            secondary_platforms TEXT,
-            posting_frequency TEXT,
-            preferred_topics TEXT,
-            content_styles TEXT,
-            video_duration_preference TEXT,
-            competitors TEXT,
-            unique_value_proposition TEXT,
-            current_followers INTEGER DEFAULT 0,
-            engagement_rate REAL DEFAULT 0.0,
-            FOREIGN KEY (user_id) REFERENCES users(user_id),
-            UNIQUE(user_id)
-        )
-    """)
-    
-    # 3. 會話記錄表
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            session_id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            agent_type TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT 'active',
-            context_summary TEXT,
-            key_insights TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
-        )
-    """)
-    
-    # 4. 對話記錄表
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            metadata TEXT,
-            FOREIGN KEY (session_id) REFERENCES sessions(session_id)
-        )
-    """)
-    
-    # 5. 智能體記憶表
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS agent_memories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            agent_type TEXT NOT NULL,
-            memory_type TEXT NOT NULL,
-            content TEXT NOT NULL,
-            importance_score INTEGER DEFAULT 5,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            last_accessed DATETIME DEFAULT CURRENT_TIMESTAMP,
-            access_count INTEGER DEFAULT 1,
-            tags TEXT,
-            related_memories TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
-        )
-    """)
-    
-    # 6. 選題建議表
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS topic_suggestions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            suggested_date DATE NOT NULL,
-            topics TEXT NOT NULL,
-            reasoning TEXT,
-            user_feedback TEXT,
-            used_count INTEGER DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(user_id),
-            UNIQUE(user_id, suggested_date)
-        )
-    """)
-    
-    # 建立索引
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_agent ON sessions(user_id, agent_type)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_user_agent ON agent_memories(user_id, agent_type)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_importance ON agent_memories(importance_score DESC)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_topic_suggestions_user_date ON topic_suggestions(user_id, suggested_date)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_requests_user_time ON requests(user_id, created_at DESC)")
-
-    # 用戶點數與訂單（簡化）
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_credits (
-            user_id TEXT PRIMARY KEY,
-            balance INTEGER DEFAULT 0,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-        """
+# JWT 密鑰（用於生成訪問令牌）
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    raise RuntimeError(
+        "Missing JWT_SECRET in environment. Set a stable secret to keep tokens valid across restarts."
     )
-    cur.execute(
-        """
+
+# 安全認證
+security = HTTPBearer()
+
+
+# SQL 語法轉換輔助函數
+def convert_sql_for_postgresql(sql: str) -> str:
+    """將 SQLite 語法轉換為 PostgreSQL 語法"""
+    # 轉換 AUTOINCREMENT
+    sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+    sql = sql.replace("AUTOINCREMENT", "")
+    
+    # 轉換 TEXT 和 VARCHAR
+    # 保留 TEXT 類型（PostgreSQL 也支援）
+    # 但主鍵用 VARCHAR
+    if "PRIMARY KEY" in sql:
+        sql = sql.replace("TEXT PRIMARY KEY", "VARCHAR(255) PRIMARY KEY")
+    
+    # INTEGER -> INTEGER (PostgreSQL 也支援)
+    # REAL -> REAL (PostgreSQL 也支援)
+    
+    return sql
+
+
+# 數據庫初始化
+def init_database():
+    """初始化資料庫（支援 PostgreSQL 和 SQLite）"""
+    database_url = os.getenv("DATABASE_URL")
+    
+    # 判斷使用哪種資料庫
+    use_postgresql = False
+    conn = None
+    
+    if database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE:
+        use_postgresql = True
+        print(f"INFO: 初始化 PostgreSQL 資料庫")
+        conn = psycopg2.connect(database_url)
+        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+        cursor = conn.cursor()
+    else:
+        # 使用 SQLite
+        db_dir = os.getenv("DATABASE_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
+        db_path = os.path.join(db_dir, "chatbot.db")
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        print(f"INFO: 初始化 SQLite 資料庫: {db_path}")
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+    
+    # 輔助函數：執行 SQL 並自動轉換語法
+    def execute_sql(sql: str):
+        if use_postgresql:
+            sql = convert_sql_for_postgresql(sql)
+        cursor.execute(sql)
+    
+    # 創建用戶偏好表
+    execute_sql("""
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            user_id TEXT PRIMARY KEY,
+            preferred_platform TEXT,
+            preferred_style TEXT,
+            preferred_duration TEXT,
+            content_preferences TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # 創建生成內容表
+    execute_sql("""
+        CREATE TABLE IF NOT EXISTS generations (
+            id TEXT PRIMARY KEY,
+            user_id TEXT,
+            content TEXT,
+            platform TEXT,
+            topic TEXT,
+            dedup_hash TEXT UNIQUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES user_profiles (user_id)
+        )
+    """)
+    
+    # 創建對話摘要表
+    execute_sql("""
+        CREATE TABLE IF NOT EXISTS conversation_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            conversation_type TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES user_profiles (user_id)
+        )
+    """)
+    
+    # 兼容舊表：補齊缺少欄位（message_count, updated_at）
+    try:
+        execute_sql("""
+            ALTER TABLE conversation_summaries ADD COLUMN message_count INTEGER DEFAULT 0
+        """)
+    except Exception as e:
+        # 欄位已存在則略過（SQLite/PG 不同錯誤訊息，這裡容錯）
+        pass
+    try:
+        execute_sql("""
+            ALTER TABLE conversation_summaries ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        """)
+    except Exception as e:
+        pass
+    
+    # 創建用戶偏好追蹤表
+    execute_sql("""
+        CREATE TABLE IF NOT EXISTS user_preferences (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            preference_type TEXT NOT NULL,
+            preference_value TEXT NOT NULL,
+            confidence_score REAL DEFAULT 1.0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES user_profiles (user_id),
+            UNIQUE(user_id, preference_type)
+        )
+    """)
+    
+    # 創建用戶行為記錄表
+    execute_sql("""
+        CREATE TABLE IF NOT EXISTS user_behaviors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            behavior_type TEXT NOT NULL,
+            behavior_data TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES user_profiles (user_id)
+        )
+    """)
+    
+    # 創建用戶認證表
+    execute_sql("""
+        CREATE TABLE IF NOT EXISTS user_auth (
+            user_id TEXT PRIMARY KEY,
+            google_id TEXT UNIQUE,
+            email TEXT UNIQUE,
+            name TEXT,
+            picture TEXT,
+            access_token TEXT,
+            refresh_token TEXT,
+            expires_at TIMESTAMP,
+            is_subscribed INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # 為現有用戶添加 is_subscribed 欄位（如果不存在）
+    try:
+        cursor.execute("ALTER TABLE user_auth ADD COLUMN is_subscribed INTEGER DEFAULT 1")
+        print("INFO: 已新增 is_subscribed 欄位到 user_auth 表")
+    except (sqlite3.OperationalError, Exception) as e:
+        # 兼容 SQLite 和 PostgreSQL 的錯誤
+        error_str = str(e).lower()
+        if "duplicate column" in error_str or "already exists" in error_str:
+            print("INFO: 欄位 is_subscribed 已存在，跳過新增")
+        else:
+            print(f"WARNING: 無法新增 is_subscribed 欄位: {e}")
+    
+    # 將所有現有用戶的訂閱狀態設為 1（已訂閱）
+    try:
+        cursor.execute("UPDATE user_auth SET is_subscribed = 1 WHERE is_subscribed IS NULL OR is_subscribed = 0")
+        updated_count = cursor.rowcount
+        if updated_count > 0:
+            print(f"INFO: 已將 {updated_count} 個用戶設為已訂閱")
+    except Exception as e:
+        print(f"INFO: 更新訂閱狀態時出現錯誤（可能是表格為空）: {e}")
+    
+    # 創建帳號定位記錄表
+    execute_sql("""
+        CREATE TABLE IF NOT EXISTS positioning_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            record_number TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES user_profiles (user_id)
+        )
+    """)
+    
+    # 創建腳本儲存表
+    execute_sql("""
+        CREATE TABLE IF NOT EXISTS user_scripts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            script_name TEXT,
+            title TEXT,
+            content TEXT NOT NULL,
+            script_data TEXT,
+            platform TEXT,
+            topic TEXT,
+            profile TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES user_profiles (user_id)
+        )
+    """)
+    
+    # 創建購買訂單表（orders）
+    execute_sql("""
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL,
-            order_type TEXT NOT NULL,
-            amount INTEGER DEFAULT 0,
-            plan TEXT,
-            status TEXT DEFAULT 'paid',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            paid_at DATETIME
+            order_id TEXT UNIQUE NOT NULL,
+            plan_type TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            currency TEXT DEFAULT 'TWD',
+            payment_method TEXT,
+            payment_status TEXT DEFAULT 'pending',
+            paid_at TIMESTAMP,
+            expires_at TIMESTAMP,
+            invoice_number TEXT,
+            invoice_type TEXT,
+            vat_number TEXT,
+            raw_data TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        """
-    )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_time ON orders(user_id, created_at DESC)")
-
-    # 訂閱方案表
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS subscription_plans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            description TEXT,
-            price INTEGER NOT NULL,
-            credits INTEGER NOT NULL,
-            duration_days INTEGER DEFAULT 30,
-            is_active BOOLEAN DEFAULT 1,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    # 用戶訂閱記錄
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_subscriptions (
+    """)
+    
+    # 創建長期記憶對話表（Long Term Memory）
+    execute_sql("""
+        CREATE TABLE IF NOT EXISTS long_term_memory (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL,
-            plan_id INTEGER NOT NULL,
-            status TEXT DEFAULT 'active',
-            start_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-            end_date DATETIME,
-            auto_renew BOOLEAN DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (plan_id) REFERENCES subscription_plans (id)
+            conversation_type TEXT NOT NULL,
+            session_id TEXT,
+            message_role TEXT NOT NULL,
+            message_content TEXT NOT NULL,
+            metadata TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES user_auth (user_id)
         )
-        """
-    )
-
-    # 管理操作稽核表
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS admin_audit_logs (
+    """)
+    
+    # 創建AI顧問對話記錄表
+    execute_sql("""
+        CREATE TABLE IF NOT EXISTS ai_advisor_chats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            action TEXT NOT NULL,
-            admin_token_hash TEXT,
-            target_user_id TEXT,
-            details TEXT
+            user_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            message_role TEXT NOT NULL,
+            message_content TEXT NOT NULL,
+            platform TEXT,
+            topic TEXT,
+            style TEXT,
+            duration TEXT,
+            metadata TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES user_auth (user_id)
         )
-        """
-    )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_action_time ON admin_audit_logs(action, created_at DESC)")
+    """)
     
-    conn.commit()
-    conn.close()
-
-@app.on_event("startup")
-def on_startup():
-    try:
-        init_db()
-        global GLOBAL_KB_TEXT
-        GLOBAL_KB_TEXT = load_kb_text()
-        print(f"[BOOT] KB loaded from {KNOWLEDGE_TXT_PATH} len={len(GLOBAL_KB_TEXT)}")
-        print(f"[BOOT] DB ready at {DB_PATH}")
-    except Exception as e:
-        print("[BOOT] DB init failed:", e)
-
-@app.get("/healthz")
-def healthz(): return {"ok": True}
-
-@app.post("/admin/reset-monthly-credits")
-async def admin_reset_monthly_credits(req: Request):
-    """管理員手動重置每月點數"""
-    if not _check_admin(req):
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    
-    try:
-        reset_monthly_credits()
-        return {"ok": True, "message": "每月點數重置完成"}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-@app.get("/api/referral-code/{user_id}")
-async def get_referral_code(user_id: str):
-    """獲取用戶推薦碼"""
-    conn = get_conn()
-    conn.row_factory = sqlite3.Row
-    
-    user = conn.execute(
-        "SELECT referral_code FROM users WHERE user_id = ?", (user_id,)
-    ).fetchone()
-    
-    conn.close()
-    
-    if user and user[0]:
-        return {"referral_code": user[0]}
-    else:
-        return JSONResponse(status_code=404, content={"error": "user_not_found"})
-
-@app.post("/api/apply-referral")
-async def apply_referral(req: Request):
-    """應用推薦碼"""
-    data = await req.json()
-    referral_code = data.get("referral_code", "").strip()
-    user_id = data.get("user_id", "").strip()
-    
-    if not referral_code or not user_id:
-        return JSONResponse(status_code=400, content={"error": "missing_fields"})
-    
-    success = apply_referral_code(referral_code, user_id)
-    
-    if success:
-        return {"ok": True, "message": "推薦碼應用成功，雙方獲得500點數"}
-    else:
-        return JSONResponse(status_code=400, content={"error": "invalid_referral_code"})
-
-@app.get("/favicon.ico")
-def favicon(): return Response(status_code=204)
-
-@app.get("/", response_class=HTMLResponse)
-def api_info():
-    """API 資訊頁面"""
-    return """
-    <html><body style="font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px;">
-      <h1>🎯 三智能體長期記憶系統</h1>
-      <p>後端 API 服務已啟動！前端請訪問：<a href="https://jacky6658.github.io/Altest/" target="_blank">https://jacky6658.github.io/Altest/</a></p>
-      
-      <h2>📋 API 端點列表</h2>
-      
-      <h3>原有功能：</h3>
-      <ul>
-        <li><code>POST /chat_generate</code> - 腳本/文案二合一生成</li>
-        <li><code>POST /generate_script</code> - 舊流程保留</li>
-        <li><code>POST /chat_qa</code> - 引導式問答</li>
-        <li><code>POST /export/xlsx</code> - Excel 匯出</li>
-      </ul>
-      
-      <h3>新增三智能體功能：</h3>
-      <ul>
-        <li><strong>定位智能體</strong></li>
-        <ul>
-          <li><code>POST /agent/positioning/analyze</code> - 分析用戶定位</li>
-          <li><code>PUT /agent/positioning/profile</code> - 更新定位檔案</li>
-        </ul>
-        <li><strong>選題智能體</strong></li>
-        <ul>
-          <li><code>POST /agent/topics/suggest</code> - 獲取選題建議</li>
-          <li><code>GET /agent/topics/history</code> - 選題歷史</li>
-        </ul>
-        <li><strong>腳本文案智能體</strong></li>
-        <ul>
-          <li><code>POST /agent/content/generate</code> - 生成腳本/文案（增強版）</li>
-        </ul>
-        <li><strong>記憶系統</strong></li>
-        <ul>
-          <li><code>GET /memory/user/{user_id}</code> - 獲取用戶記憶</li>
-          <li><code>POST /memory/add</code> - 添加記憶</li>
-        </ul>
-      </ul>
-      
-      <h2>🔧 系統狀態</h2>
-      <p>✅ 資料庫：已初始化</p>
-      <p>✅ 知識庫：已載入</p>
-      <p>✅ 三智能體：已啟動</p>
-      <p>✅ 長期記憶：已啟用</p>
-    </body></html>
-    """
-
-# ========= Email/帳號 註冊 / 登入 / 會話 =========
-from fastapi import Body
-from fastapi import Form
-
-@app.post("/auth/signup")
-async def auth_signup(req: Request):
-    data = await req.json()
-    phone = (data.get("phone") or "").strip()
-    email = (data.get("email") or "").strip()
-    username = (data.get("username") or "").strip()
-    password = (data.get("password") or "").strip()
-    referral_code = (data.get("referral_code") or "").strip()  # 新增推薦碼參數
-    if not all([email, username, password, phone]):
-        raise HTTPException(status_code=400, detail="missing_fields")
-
-    user_id = f"u_{hashlib.md5((email+username).encode()).hexdigest()[:12]}"
-
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    try:
-        # 檢查用戶是否已存在
-        existing_user = conn.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,)).fetchone()
-        existing_auth = conn.execute("SELECT user_id FROM users_auth WHERE user_id=?", (user_id,)).fetchone()
-        
-        if existing_user or existing_auth:
-            raise HTTPException(status_code=409, detail="user_exists")
-        
-        # 處理推薦碼獎勵
-        referrer_id = None
-        if referral_code:
-            # 查找推薦人
-            referrer = conn.execute(
-                "SELECT user_id FROM users WHERE referral_code = ?", (referral_code,)
-            ).fetchone()
-            if referrer:
-                referrer_id = referrer['user_id']
-                # 給推薦人增加 500 點數
-                conn.execute(
-                    "UPDATE users SET credits = credits + 500 WHERE user_id = ?", (referrer_id,)
-                )
-                # 記錄推薦獎勵
-                conn.execute(
-                    "INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, 500, 'referral_bonus', ?)",
-                    (referrer_id, f"推薦新用戶 {user_id} 獲得獎勵")
-                )
-        
-        # 生成新用戶推薦碼
-        new_referral_code = generate_referral_code(user_id)
-        
-        # 創建新用戶，如果使用推薦碼則額外獲得 500 點數
-        initial_credits = 1000 if referral_code and referrer_id else 500
-        
-        # 建立 users 表記錄
-        conn.execute(
-            "INSERT INTO users (user_id, email, name, created_at, updated_at, status, credits, referral_code) VALUES (?, ?, ?, datetime('now'), datetime('now'), 'active', ?, ?)",
-            (user_id, email, username, initial_credits, new_referral_code)
+    # 創建IP人設規劃對話記錄表
+    execute_sql("""
+        CREATE TABLE IF NOT EXISTS ip_planning_chats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            message_role TEXT NOT NULL,
+            message_content TEXT NOT NULL,
+            positioning_type TEXT,
+            target_audience TEXT,
+            content_style TEXT,
+            metadata TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES user_auth (user_id)
         )
-        
-        # 建立 users_auth 表記錄
-        conn.execute(
-            "INSERT INTO users_auth (user_id, username, email, phone, password_hash, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))",
-            (user_id, username, email, phone, hash_password(password))
+    """)
+    
+    # 創建LLM對話記錄表
+    execute_sql("""
+        CREATE TABLE IF NOT EXISTS llm_conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            message_role TEXT NOT NULL,
+            message_content TEXT NOT NULL,
+            conversation_context TEXT,
+            model_used TEXT,
+            metadata TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES user_auth (user_id)
         )
-        
-        # 記錄新用戶獎勵
-        conn.execute(
-            "INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, 'signup_bonus', ?)",
-            (user_id, initial_credits, f"註冊獎勵{'（含推薦獎勵）' if referral_code and referrer_id else ''}")
+    """)
+    
+    # 創建授權記錄表（licenses）
+    execute_sql("""
+        CREATE TABLE IF NOT EXISTS licenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            order_id TEXT,
+            tier TEXT DEFAULT 'personal',
+            seats INTEGER DEFAULT 1,
+            features_json TEXT,
+            source TEXT,
+            start_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP NOT NULL,
+            status TEXT DEFAULT 'active',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        
+    """)
+    
+    # PostgreSQL 使用 AUTOCOMMIT，不需要 commit
+    # SQLite 需要 commit
+    if not use_postgresql:
         conn.commit()
-        print(f"新用戶註冊成功: {user_id}, email: {email}, username: {username}, 初始點數: {initial_credits}")
-        
-    except sqlite3.IntegrityError as e:
-        conn.rollback()
-        print(f"用戶註冊失敗 - 重複用戶: {e}")
-        raise HTTPException(status_code=409, detail="user_exists")
-    except Exception as e:
-        conn.rollback()
-        print(f"用戶註冊失敗: {e}")
-        raise HTTPException(status_code=500, detail="registration_failed")
-    finally:
         conn.close()
     
-    return {"ok": True, "user_id": user_id, "message": "用戶註冊成功"}
-
-@app.post("/auth/login")
-async def auth_login(req: Request):
-    data = await req.json()
-    identifier = (data.get("identifier") or "").strip()
-    password = (data.get("password") or "").strip()
-    if not identifier or not password:
-        raise HTTPException(status_code=400, detail="missing_fields")
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT user_id, password_hash FROM users_auth WHERE username=? OR email=?",
-        (identifier, identifier)
-    ).fetchone()
-    conn.close()
-    if not row or row["password_hash"] != hash_password(password):
-        raise HTTPException(status_code=401, detail="invalid_credentials")
-
-    # 獲取用戶完整信息
-    conn = get_conn()
-    conn.row_factory = sqlite3.Row
-    user = conn.execute(
-        "SELECT user_id, email, name, credits, referral_code, created_at FROM users WHERE user_id = ?",
-        (row["user_id"],)
-    ).fetchone()
-    conn.close()
-    
-    if not user:
-        raise HTTPException(status_code=500, detail="user_data_not_found")
-    
-    # 設置 Session Cookie
-    token = create_session_cookie(row["user_id"])
-    resp = JSONResponse({
-        "ok": True,
-        "user_id": user["user_id"],
-        "email": user["email"],
-        "name": user["name"],
-        "credits": user["credits"],
-        "referral_code": user["referral_code"],
-        "created_at": user["created_at"]
-    })
-    resp.set_cookie(
-        "session", token,
-        httponly=True, secure=True, samesite="none", max_age=7*24*3600
-    )
-    return resp
-
-# 前端跨網域第三方 Cookie 可能被瀏覽器阻擋，提供彈窗版登入：
-# 以第一方情境設定 session，最後回傳頁面自動通知 opener 並關閉
-@app.post("/auth/login_popup", response_class=HTMLResponse)
-async def auth_login_popup(identifier: str = Form(...), password: str = Form(...)):
-    if not identifier or not password:
-        return HTMLResponse("<p>missing fields</p>", status_code=400)
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT user_id, password_hash FROM users_auth WHERE username=? OR email=?",
-        (identifier, identifier)
-    ).fetchone()
-    conn.close()
-    if not row or row["password_hash"] != hash_password(password):
-        return HTMLResponse("<script>window.close()</script>", status_code=401)
-    token = create_session_cookie(row["user_id"])
-    html = f"""
-<!DOCTYPE html><meta charset=\"utf-8\" />
-<script>
-  try {{
-    document.cookie = "session={token}; Path=/; SameSite=None; Secure; HttpOnly";
-  }} catch (_e) {{}}
-  try {{ if (window.opener) window.opener.postMessage('login_ok','*'); }} catch(_e) {{}}
-  window.close();
-</script>
-"""
-    return HTMLResponse(html)
-
-@app.get("/me")
-def me(session: str | None = Cookie(default=None)):
-    uid = verify_session_cookie(session) if session else None
-    if not uid:
-        return JSONResponse(status_code=401, content={"error": "unauthorized"})
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    u = conn.execute("SELECT user_id, email, name, credits, referral_code, created_at FROM users WHERE user_id=?", (uid,)).fetchone()
-    conn.close()
-    if not u:
-        return JSONResponse(status_code=404, content={"error": "user_not_found"})
-    return {"id": u["user_id"], "email": u["email"], "name": u["name"], "credits": u["credits"] or 0, "referral_code": u["referral_code"], "created_at": u["created_at"]}
-
-@app.get("/api/user/profile")
-def get_user_profile(session: str | None = Cookie(default=None)):
-    """獲取用戶完整檔案信息"""
-    uid = verify_session_cookie(session) if session else None
-    if not uid:
-        return JSONResponse(status_code=401, content={"error": "unauthorized"})
-    
-    conn = get_conn()
-    conn.row_factory = sqlite3.Row
-    
-    # 獲取用戶基本信息
-    user = conn.execute("""
-        SELECT user_id, email, name, credits, referral_code, created_at, updated_at, status
-        FROM users WHERE user_id = ?
-    """, (uid,)).fetchone()
-    
-    if not user:
+    if use_postgresql:
         conn.close()
-        return JSONResponse(status_code=404, content={"error": "user_not_found"})
-    
-    # 獲取使用統計
-    usage_stats = conn.execute("""
-        SELECT 
-            COUNT(CASE WHEN module = 'positioning' THEN 1 END) as positioning_count,
-            COUNT(CASE WHEN module = 'topics' THEN 1 END) as topics_count,
-            COUNT(CASE WHEN module = 'script' THEN 1 END) as script_count,
-            COUNT(*) as total_usage
-        FROM usage_logs 
-        WHERE user_id = ? AND created_at >= date('now', 'start of month')
-    """, (uid,)).fetchone()
-    
-    # 獲取最近的點數交易記錄
-    credit_history = conn.execute("""
-        SELECT credits_change, description, created_at
-        FROM orders 
-        WHERE user_id = ? 
-        ORDER BY created_at DESC 
-        LIMIT 10
-    """, (uid,)).fetchall()
-    
-    conn.close()
-    
-    return {
-        "user": dict(user),
-        "usage_stats": {
-            "positioning": usage_stats["positioning_count"] or 0,
-            "topics": usage_stats["topics_count"] or 0,
-            "script": usage_stats["script_count"] or 0,
-            "total": usage_stats["total_usage"] or 0
-        },
-        "credit_history": [dict(record) for record in credit_history]
-    }
+        return "PostgreSQL"
+    else:
+        return db_path
 
-@app.get("/api/user/knowledge")
-def get_user_knowledge(session: str | None = Cookie(default=None), agent: str = "positioning"):
-    """獲取用戶知識庫內容（生成結果和對話記錄）"""
-    uid = verify_session_cookie(session) if session else None
-    if not uid:
-        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+
+def get_db_connection():
+    """獲取數據庫連接（支援 PostgreSQL 和 SQLite）"""
+    database_url = os.getenv("DATABASE_URL")
     
-    conn = get_conn()
-    conn.row_factory = sqlite3.Row
-    
-    # 獲取一鍵生成結果
-    oneclick_results = conn.execute("""
-        SELECT content, created_at, mode
-        FROM usage_logs 
-        WHERE user_id = ? AND module = ? AND mode = 'oneclick'
-        ORDER BY created_at DESC 
-        LIMIT 20
-    """, (uid, agent)).fetchall()
-    
-    # 獲取對話記錄
-    chat_history = conn.execute("""
-        SELECT role, content, created_at
-        FROM messages 
-        WHERE user_id = ? AND agent_type = ?
-        ORDER BY created_at DESC 
-        LIMIT 50
-    """, (uid, agent)).fetchall()
-    
-    conn.close()
-    
-    return {
-        "oneclick_results": [dict(record) for record in oneclick_results],
-        "chat_history": [dict(record) for record in chat_history]
-    }
-
-@app.post("/logout")
-def logout():
-    resp = JSONResponse({"ok": True})
-    resp.delete_cookie("session")
-    return resp
-
-# ========= Auth Helpers =========
-def hash_password(password: str) -> str:
-    return hashlib.sha256((password or "").encode("utf-8")).hexdigest()
-
-def create_session_cookie(user_id: str) -> str:
-    return session_signer.dumps({"uid": user_id, "ts": int(datetime.now().timestamp())})
-
-def verify_session_cookie(cookie_val: str) -> str | None:
-    try:
-        data = session_signer.loads(cookie_val)
-        return data.get("uid")
-    except BadSignature:
-        return None
-
-def create_admin_session_cookie(username: str) -> str:
-    return admin_session_signer.dumps({"adm": username, "ts": int(datetime.now().timestamp())})
-
-def verify_admin_session_cookie(cookie_val: str) -> str | None:
-    try:
-        data = admin_session_signer.loads(cookie_val)
-        return data.get("adm")
-    except BadSignature:
-        return None
-
-# ========= Google OAuth2 Endpoints =========
-@app.get("/auth/google/start")
-async def google_start(request: Request, next: str | None = "/"):
-    if not _OAUTH_READY:
-        return JSONResponse(status_code=501, content={"error": "oauth_not_configured"})
-    resp = await oauth.google.authorize_redirect(
-        request,
-        redirect_uri=OAUTH_REDIRECT_URI,
-        state=next or "/",
-        prompt="consent select_account",
-        max_age=0,
-    )
-    # 確保不被站內既有 session 影響，先清除使用者 session cookie
-    try:
-        resp.delete_cookie("session")
-    except Exception:
-        pass
-    return resp
-
-@app.get("/auth/google/callback")
-async def google_callback(request: Request):
-    if not _OAUTH_READY:
-        return JSONResponse(status_code=501, content={"error": "oauth_not_configured"})
-    try:
-        token = await oauth.google.authorize_access_token(request)
+    # 如果有 DATABASE_URL 且包含 postgresql://，使用 PostgreSQL
+    if database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE:
         try:
-            print("[OAuth] token keys:", sorted(list((token or {}).keys())))
-        except Exception:
-            pass
-        # 主要路徑：使用 id_token 解析
-        idinfo = None
-        try:
-            idinfo = await oauth.google.parse_id_token(request, token)
-            try:
-                print("[OAuth] id_token parsed, keys:", sorted(list((idinfo or {}).keys())))
-            except Exception:
-                pass
-        except Exception:
-            idinfo = None
-        # 後備路徑：若無 id_token，改呼叫 userinfo 端點
-        if not idinfo or not idinfo.get("sub"):
-            try:
-                resp = await oauth.google.get("userinfo", token=token)
-                idinfo = resp.json() if resp is not None else {}
-                try:
-                    print("[OAuth] userinfo keys:", sorted(list((idinfo or {}).keys())))
-                except Exception:
-                    pass
-            except Exception:
-                idinfo = {}
-            # 進一步後備：直接以 access_token 打 OIDC userinfo 端點
-            try:
-                import httpx
-                at = (token or {}).get("access_token")
-                if at and (not idinfo or not idinfo.get("sub")):
-                    async with httpx.AsyncClient(timeout=8) as client:
-                        r = await client.get(
-                            "https://openidconnect.googleapis.com/v1/userinfo",
-                            headers={"Authorization": f"Bearer {at}"},
-                        )
-                        try:
-                            print("[OAuth] direct userinfo status:", r.status_code)
-                        except Exception:
-                            pass
-                        if r.status_code == 200:
-                            idinfo = r.json()
-                            try:
-                                print("[OAuth] direct userinfo keys:", sorted(list((idinfo or {}).keys())))
-                            except Exception:
-                                pass
-            except Exception as _e:
-                try:
-                    print("[OAuth] direct userinfo error:", _e)
-                except Exception:
-                    pass
-        sub = (idinfo or {}).get("sub"); email = (idinfo or {}).get("email"); name = (idinfo or {}).get("name") or (email.split("@")[0] if email else "user")
-        # 最後備援：若缺少 sub 但有 email，使用 email 雜湊生成穩定 ID
-        if not sub and email:
-            import hashlib
-            sub = hashlib.sha256(email.encode("utf-8")).hexdigest()[:24]
-        if not sub:
-            try:
-                print("[OAuth] missing sub/email. idinfo keys:", sorted(list((idinfo or {}).keys())))
-            except Exception:
-                pass
-            return JSONResponse(status_code=400, content={"error": "invalid_google_response"})
-        user_id = f"g_{sub}"
-        create_or_get_user(user_id, email=email, name=name)
-        token_val = create_session_cookie(user_id)
+            print(f"INFO: 連接到 PostgreSQL 資料庫")
+            conn = psycopg2.connect(database_url)
+            conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+            return conn
+        except Exception as e:
+            print(f"ERROR: PostgreSQL 連接失敗: {e}")
+            raise
+    
+    # 預設使用 SQLite
+    db_dir = os.getenv("DATABASE_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
+    db_path = os.path.join(db_dir, "chatbot.db")
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    
+    print(f"INFO: 連接到 SQLite 資料庫: {db_path}")
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def generate_dedup_hash(content: str, platform: str = None, topic: str = None) -> str:
+    """生成去重哈希值"""
+    # 清理內容，移除時間相關和隨機元素
+    clean_content = content.lower().strip()
+    # 移除常見的時間標記和隨機元素
+    clean_content = clean_content.replace('\n', ' ').replace('\r', ' ')
+    # 移除多餘空格
+    clean_content = ' '.join(clean_content.split())
+    
+    hash_input = f"{clean_content}|{platform or ''}|{topic or ''}"
+    return hashlib.md5(hash_input.encode('utf-8')).hexdigest()
+
+
+def generate_user_id(email: str) -> str:
+    """根據 email 生成用戶 ID"""
+    return hashlib.md5(email.encode('utf-8')).hexdigest()[:12]
+
+
+def generate_access_token(user_id: str) -> str:
+    """生成訪問令牌"""
+    payload = {
+        "user_id": user_id,
+        "exp": datetime.now().timestamp() + 3600  # 1小時過期
+    }
+    # 簡單的 JWT 實現（生產環境建議使用 PyJWT）
+    import base64
+    import json
+    header = {"alg": "HS256", "typ": "JWT"}
+    encoded_header = base64.urlsafe_b64encode(json.dumps(header).encode()).decode().rstrip('=')
+    encoded_payload = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
+    signature = hashlib.sha256(f"{encoded_header}.{encoded_payload}.{JWT_SECRET}".encode()).hexdigest()
+    return f"{encoded_header}.{encoded_payload}.{signature}"
+
+
+def verify_access_token(token: str, allow_expired: bool = False) -> Optional[str]:
+    """驗證訪問令牌並返回用戶 ID
+    
+    Args:
+        token: JWT token
+        allow_expired: 如果為 True，允許過期的 token（用於 refresh 場景）
+    """
+    try:
+        import base64
+        import json
+        parts = token.split('.')
+        if len(parts) != 3:
+            print(f"DEBUG: verify_access_token - token 格式錯誤（不是3部分），allow_expired={allow_expired}")
+            return None
         
-        # 重定向到中間頁面，而不是直接跳轉到前端
-        next_url = request.query_params.get("state") or "https://jacky6658.github.io/AItest/"
-        success_url = f"/auth/google/success?next={next_url}"
-        resp = RedirectResponse(url=success_url)
-        resp.set_cookie("session", token_val, httponly=True, secure=True, samesite="none", max_age=7*24*3600)
-        return resp
+        # 驗證簽名
+        expected_signature = hashlib.sha256(f"{parts[0]}.{parts[1]}.{JWT_SECRET}".encode()).hexdigest()
+        if expected_signature != parts[2]:
+            print(f"DEBUG: verify_access_token - 簽名驗證失敗，allow_expired={allow_expired}")
+            print(f"DEBUG: JWT_SECRET 是否設定: {JWT_SECRET is not None and JWT_SECRET != ''}")
+            return None
+        
+        # 解碼 payload
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + '==').decode())
+        
+        # 檢查過期時間（如果 allow_expired=False）
+        if not allow_expired:
+            exp = payload.get("exp", 0)
+            now = datetime.now().timestamp()
+            if exp < now:
+                print(f"DEBUG: verify_access_token - token 已過期，exp={exp}, now={now}, allow_expired={allow_expired}")
+            return None
+        
+        user_id = payload.get("user_id")
+        if allow_expired:
+            exp = payload.get("exp", 0)
+            now = datetime.now().timestamp()
+            is_expired = exp < now
+            print(f"DEBUG: verify_access_token - 驗證成功，user_id={user_id}, 已過期={is_expired}, allow_expired={allow_expired}")
+        return user_id
     except Exception as e:
-        print("[OAuth Callback Error]", e)
-        # 錯誤時也重定向到中間頁面，但帶上錯誤參數
-        next_url = request.query_params.get("state") or "https://jacky6658.github.io/AItest/"
-        error_url = f"/auth/google/success?next={next_url}&error=google_login_failed"
-        return RedirectResponse(url=error_url)
+        print(f"DEBUG: verify_access_token - 發生異常: {str(e)}, allow_expired={allow_expired}")
+        return None
 
-@app.get("/auth/google/success")
-async def google_success(request: Request, next: str = "https://jacky6658.github.io/AItest/", error: str = None):
-    """Google 登入成功的中間頁面，負責通知父視窗並關閉彈窗"""
-    html_content = f"""
-<!DOCTYPE html>
-<html lang="zh-TW">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Google 登入</title>
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            margin: 0;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-        }}
-        .container {{
-            text-align: center;
-            padding: 2rem;
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 16px;
-            backdrop-filter: blur(10px);
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
-        }}
-        .spinner {{
-            width: 40px;
-            height: 40px;
-            border: 4px solid rgba(255, 255, 255, 0.3);
-            border-top: 4px solid white;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-            margin: 0 auto 1rem;
-        }}
-        @keyframes spin {{
-            0% {{ transform: rotate(0deg); }}
-            100% {{ transform: rotate(360deg); }}
-        }}
-        .message {{
-            font-size: 1.2rem;
-            margin-bottom: 1rem;
-        }}
-        .error {{
-            color: #ff6b6b;
-        }}
-        .success {{
-            color: #51cf66;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="spinner"></div>
-        <div class="message" id="message">
-            {'登入失敗，正在關閉視窗...' if error else '登入成功，正在跳轉...'}
-        </div>
-    </div>
 
-    <script>
-        (function() {{
-            const urlParams = new URLSearchParams(window.location.search);
-            const nextUrl = urlParams.get('next') || '{next}';
-            const error = urlParams.get('error');
-            
-            console.log('Google 登入中間頁面載入');
-            console.log('Next URL:', nextUrl);
-            console.log('Error:', error);
-            
-            // 通知父視窗登入結果
-            if (window.opener) {{
-                console.log('通知父視窗登入結果');
-                window.opener.postMessage({{
-                    type: 'google_login_result',
-                    success: !error,
-                    error: error,
-                    nextUrl: nextUrl
-                }}, '*');
-                
-                // 延遲關閉彈窗，讓父視窗有時間處理訊息
-                setTimeout(() => {{
-                    console.log('關閉彈窗');
-                    window.close();
-                }}, 1000);
-            }} else {{
-                // 如果不是彈窗模式，直接跳轉
-                console.log('非彈窗模式，直接跳轉到:', nextUrl);
-                setTimeout(() => {{
-                    window.location.href = nextUrl;
-                }}, 2000);
-            }}
-            
-            // 超時保護：如果 5 秒後還沒關閉，強制關閉
-            setTimeout(() => {{
-                if (window.opener) {{
-                    window.close();
-                }} else {{
-                    window.location.href = nextUrl;
-                }}
-            }}, 5000);
-        }})();
-    </script>
-</body>
-</html>
-    """
-    return HTMLResponse(content=html_content)
-
-# ========= 內建知識庫 =========
-BUILTIN_KB_SCRIPT = """
-【短影音腳本原則（濃縮）】
-1) Hook(0-5s) → Value → CTA。60s 版可拆 5~6 段，節奏清楚。
-2) 每段輸出：type/start_sec/end_sec/camera/dialog/visual/cta。
-3) Hook 用痛點/反差/數據鉤子 + 快節奏 B-roll；Value 拆重點；CTA 動詞+利益+下一步。
-4) 語氣口語、短句、有節奏，避免空話。
-"""
-
-BUILTIN_KB_COPY = """
-【社群文案原則（濃縮）】
-1) 結構：吸睛開頭 → 主體賣點/故事 → CTA → Hashtags。
-2) 風格：貼近受眾、短句、可搭 emoji、結尾有動作。
-3) Hashtags：主關鍵字 1-3、延伸 5-8。
-4) 欄位：main_copy / alternates / hashtags / cta / image_ideas（平台化圖片建議）。
-"""
-
-def load_extra_kb(max_chars=2500) -> str:
-    chunks, total = [], 0
-    if GLOBAL_KB_TEXT:
-        seg = GLOBAL_KB_TEXT[:max_chars]
-        chunks.append(f"\n[KB:global]\n{seg}")
-        total += len(seg)
-    else:
-        paths = glob.glob("/data/kb*.txt") + glob.glob("/data/*.kb.txt") + glob.glob("/data/knowledge*.txt")
-        for p in paths:
-            try:
-                t = open(p, "r", encoding="utf-8").read().strip()
-                if not t: continue
-                take = (max_chars - total)
-                seg = t[:take]
-                if seg:
-                    chunks.append(f"\n[KB:{os.path.basename(p)}]\n{seg}")
-                    total += len(seg)
-                if total >= max_chars: break
-            except Exception:
-                pass
-    return "\n".join(chunks)
-
-EXTRA_KB = load_extra_kb()
-
-# ========= 提示字 & 工具 =========
-SHORT_HINT_SCRIPT = "內容有點太短了 🙏 請提供：行業/平台/時長(秒)/目標/主題（例如：『電商｜Reels｜60秒｜購買｜夏季新品開箱』），我就能生成完整腳本。"
-SHORT_HINT_COPY   = "內容有點太短了 🙏 請提供：平台/受眾/語氣/主題/CTA（例如：『IG｜男生視角｜活力回歸｜CTA：點連結』），我就能生成完整貼文。"
-
-def _ensure_json_block(text: str) -> str:
-    if not text: raise ValueError("empty model output")
-    t = text.strip()
-    if t.startswith("```"):
-        parts = t.split("```")
-        if len(parts) >= 3: t = parts[1]
-    i = min([x for x in (t.find("{"), t.find("[")) if x >= 0], default=-1)
-    if i < 0: return t
-    j = max(t.rfind("}"), t.rfind("]"))
-    if j > i: return t[i:j+1]
-    return t
-
-def detect_mode(messages: List[Dict[str, str]], explicit: Optional[str]) -> str:
-    """優先使用 explicit；否則用關鍵字判斷。"""
-    if explicit in ("script", "copy"):
-        return explicit
-    last = ""
-    for m in reversed(messages or []):
-        if m.get("role") == "user":
-            last = (m.get("content") or "").lower()
-            break
-    copy_keys = [
-        "文案","貼文","copy","hashtag","hashtags",
-        "ig","facebook","fb","linkedin","小紅書","x（twitter）","x/twitter","抖音文案"
-    ]
-    if any(k in last for k in copy_keys):
-        return "copy"
-    return "script"
-
-def parse_segments(json_text: str) -> List[Dict[str, Any]]:
-    data = json.loads(json_text)
-    if isinstance(data, dict) and "segments" in data: data = data["segments"]
-    if not isinstance(data, list): raise ValueError("segments must be a list")
-    segs = []
-    for it in data:
-        segs.append({
-            "type": it.get("type") or it.get("label") or "場景",
-            "start_sec": it.get("start_sec", None),
-            "end_sec": it.get("end_sec", None),
-            "camera": it.get("camera", ""),
-            "dialog": it.get("dialog", ""),
-            "visual": it.get("visual", ""),
-            "cta": it.get("cta", "")
-        })
-    return segs
-
-def parse_copy(json_text: str) -> Dict[str, Any]:
-    data = json.loads(json_text)
-    if isinstance(data, list): data = data[0] if data else {}
-    return {
-        "main_copy":   data.get("main_copy", ""),
-        "alternates":  data.get("alternates", []) or data.get("openers", []),
-        "hashtags":    data.get("hashtags", []),
-        "cta":         data.get("cta", ""),
-        "image_ideas": data.get("image_ideas", [])
-    }
-
-# === NEW: 模板/時長/模式說明 ===
-TEMPLATE_GUIDE = {
-    "A": "三段式：Hook → Value → CTA。重點清楚、節奏明快，適合廣泛情境。",
-    "B": "問題解決：痛點 → 解法 → 證據/示例 → CTA。適合教育與導購。",
-    "C": "Before-After：改變前後對比，強調差異與收益 → CTA。適合案例/見證。",
-    "D": "教學：步驟化教學（1-2-3）+ 注意事項 → CTA。適合技巧分享。",
-    "E": "敘事：小故事鋪陳 → 轉折亮點 → CTA。適合品牌情緒/人物敘事。",
-    "F": "爆點連發：連續強 Hook/金句/反差點，最後收斂 → CTA。適合抓注意力。"
-}
-
-def _duration_plan(duration: Optional[int]) -> Dict[str, Any]:
-    """
-    回傳分段建議與 fewshot JSON。30s 走 3 段；60s 走 6 段（每段~10s）。
-    """
-    if int(duration or 0) == 60:
-        fewshot = """
-{"segments":[
-  {"type":"hook","start_sec":0,"end_sec":10,"camera":"CU","dialog":"...","visual":"...","cta":""},
-  {"type":"value1","start_sec":10,"end_sec":20,"camera":"MS","dialog":"...","visual":"...","cta":""},
-  {"type":"value2","start_sec":20,"end_sec":30,"camera":"MS","dialog":"...","visual":"...","cta":""},
-  {"type":"value3","start_sec":30,"end_sec":40,"camera":"MS","dialog":"...","visual":"...","cta":""},
-  {"type":"value4","start_sec":40,"end_sec":50,"camera":"MS","dialog":"...","visual":"...","cta":""},
-  {"type":"cta","start_sec":50,"end_sec":60,"camera":"WS","dialog":"...","visual":"...","cta":"..."}
-]}
-"""
-        return {"fewshot": fewshot, "note": "請以 60 秒約 6 段輸出，段與段間節奏分明。"}
-    # default 30s
-    fewshot = """
-{"segments":[
-  {"type":"hook","start_sec":0,"end_sec":5,"camera":"CU","dialog":"...","visual":"...","cta":""},
-  {"type":"value","start_sec":5,"end_sec":25,"camera":"MS","dialog":"...","visual":"...","cta":""},
-  {"type":"cta","start_sec":25,"end_sec":30,"camera":"WS","dialog":"...","visual":"...","cta":"..."}
-]}
-"""
-    return {"fewshot": fewshot, "note": "請以 30 秒 3 段輸出，Hook 要強、CTA 明確。"}
-
-def build_script_prompt(
-    user_input: str,
-    previous_segments: List[Dict[str, Any]],
-    template_type: Optional[str] = None,
-    duration: Optional[int] = None,
-    dialogue_mode: Optional[str] = None,
-    knowledge_hint: Optional[str] = None,
-) -> str:
-    plan = _duration_plan(duration)
-    fewshot = plan["fewshot"]
-    duration_note = plan["note"]
-    tmpl = (template_type or "").strip().upper()
-    tmpl_text = TEMPLATE_GUIDE.get(tmpl, "未指定模板時由你判斷最合適的結構。")
-
-    kb = (BUILTIN_KB_SCRIPT + "\n" + (EXTRA_KB or "")).strip()
-    # 動態 KB 擷取：合併使用者輸入與可選提示
-    q = user_input
-    if knowledge_hint:
-        q = f"{knowledge_hint}\n{user_input}"
+async def get_google_user_info(access_token: str) -> Optional[GoogleUser]:
+    """從 Google 獲取用戶資訊"""
     try:
-        kb_ctx_dynamic = retrieve_context(q)
-    except Exception:
-        kb_ctx_dynamic = ""
-
-    prev = json.dumps(previous_segments or [], ensure_ascii=False)
-
-    mode_line = ""
-    if (dialogue_mode or "").lower() == "free":
-        mode_line = "語氣更自由、可主動提出精煉建議與反問以完善腳本；"
-    elif (dialogue_mode or "").lower() == "guide":
-        mode_line = "語氣偏引導，逐步釐清要素後直接給出完整分段；"
-
-    return f"""
-根據使用者輸入生成短影音腳本。{mode_line}
-
-🎯 腳本參數：
-• 模板：{tmpl or "（未指定）"} - {tmpl_text}
-• 時長：{int(duration) if duration else "（未指定，預設 30）"} 秒
-• 平台：Instagram Reels、TikTok、YouTube Shorts、Facebook Reels
-
-📚 知識庫：
-{kb}
-
-【KB輔助摘錄】（若空白代表無）
-{kb_ctx_dynamic[:1000]}
-
-💡 台灣市場特色：
-• 內容風格：生活化、親切、實用
-• 節奏要求：2-3秒換畫面，節奏緊湊
-• Hook原則：0-5秒直給結論，用大字卡與強情緒表情
-• 語氣：堅定、直給結論，避免口癖贅字
-
-使用者輸入：
-{user_input}
-
-已接受段落：
-{prev}
-
-直接輸出JSON格式，不要任何開場白或說明文字：
-{fewshot}
-"""
-
-def build_copy_prompt(user_input: str, topic: Optional[str]) -> str:
-    topic_line = f"\n【主題】{topic}" if topic else ""
-    fewshot = """
-{
-  "main_copy":"主貼文（含換行與 emoji）",
-  "alternates":["備選開頭A","備選開頭B","備選開頭C"],
-  "hashtags":["#關鍵字1","#關鍵字2","#延伸3","#延伸4"],
-  "cta":"行動呼籲一句話",
-  "image_ideas":["配圖/照片/示意圖建議1","建議2","建議3"]
-}
-"""
-    kb = (BUILTIN_KB_COPY + "\n" + (EXTRA_KB or "")).strip()
-    return f"""
-你是社群文案顧問。請依「使用者輸入」與可選的主題輸出**JSON**，包含主貼文、備選開頭、Hashtags、CTA，並加入 image_ideas（平台導向的圖片/拍法/視覺建議）。語氣可口語並適度使用 emoji。
-
-{kb}
-
-使用者輸入：
-{user_input}{topic_line}
-
-只回傳 JSON（單一物件，不要 markdown fence）：
-{fewshot}
-"""
-
-# ========= Gemini =========
-def use_gemini() -> bool: return bool(GEMINI_API_KEY)
-
-def gemini_generate_text(prompt: str) -> str:
-    import google.generativeai as genai
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(GEMINI_MODEL)
-    res = model.generate_content(prompt)
-    return (res.text or "").strip()
-
-# ========= Fallback =========
-def fallback_segments(user_input: str, prev_len: int, duration: Optional[int]=None) -> List[Dict[str, Any]]:
-    d = int(duration or 30)
-    if d >= 60:
-        # 粗略 60s 六段
-        labels = ["hook","value1","value2","value3","value4","cta"]
-        segs=[]
-        start=0
-        for i,l in enumerate(labels):
-            end = 10*(i+1)
-            if i==len(labels)-1: end = 60
-            cam = "CU" if i==0 else ("WS" if i==len(labels)-1 else "MS")
-            segs.append({
-                "type": l, "start_sec": start, "end_sec": end, "camera": cam,
-                "dialog": f"（模擬）{user_input[:36]}…",
-                "visual": "（模擬）快切 B-roll / 大字卡",
-                "cta": "點連結領取 🔗" if l=="cta" else ""
-            })
-            start = end
-        return segs
-    # 預設 30s 三段
-    step = prev_len
-    return [{
-        "type": "hook" if step == 0 else ("cta" if step >= 2 else "value"),
-        "start_sec": 0 if step == 0 else 5 if step == 1 else 25,
-        "end_sec":   5 if step == 0 else 25 if step == 1 else 30,
-        "camera": "CU" if step == 0 else "MS" if step == 1 else "WS",
-        "dialog": f"（模擬）{user_input[:36]}…",
-        "visual": "（模擬）快切 B-roll / 大字卡",
-        "cta": "點連結領取 🔗" if step >= 2 else ""
-    }]
-
-def fallback_copy(user_input: str, topic: Optional[str]) -> Dict[str, Any]:
-    t = f"（主題：{topic}）" if topic else ""
-    return {
-        "main_copy":  f"（模擬）IG 貼文：{user_input} {t}\n精神回歸、效率回升！⚡️\n今天就行動吧！",
-        "alternates": ["🔥 今天就開始","💡 其實只要這樣做","👉 你也可以"],
-        "hashtags":   ["#行銷","#AI","#文案","#社群經營"],
-        "cta":        "立即點連結 🔗",
-        "image_ideas":["產品近拍 + 生活情境","品牌色背景大字卡","步驟流程示意圖"]
-    }
-
-# ========= 三智能體系統核心功能 =========
-
-# 用戶管理
-def create_or_get_user(user_id: str, email: str = None, name: str = None, referral_code: str = None) -> Dict:
-    """創建或獲取用戶"""
-    conn = get_conn()
-    conn.row_factory = sqlite3.Row
-    
-    user = conn.execute(
-        "SELECT * FROM users WHERE user_id = ?", (user_id,)
-    ).fetchone()
-    
-    if not user:
-        # 為新用戶生成推薦碼
-        new_referral_code = generate_referral_code(user_id)
-        
-        # 處理推薦碼獎勵
-        referrer_id = None
-        if referral_code:
-            # 查找推薦人
-            referrer = conn.execute(
-                "SELECT user_id FROM users WHERE referral_code = ?", (referral_code,)
-            ).fetchone()
-            if referrer:
-                referrer_id = referrer['user_id']
-                # 給推薦人增加 500 點數
-                conn.execute(
-                    "UPDATE users SET credits = credits + 500 WHERE user_id = ?", (referrer_id,)
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://www.googleapis.com/oauth2/v2/userinfo",
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return GoogleUser(
+                    id=data["id"],
+                    email=data["email"],
+                    name=data["name"],
+                    picture=data.get("picture"),
+                    verified_email=data.get("verified_email", False)
                 )
-                # 記錄推薦獎勵
-                conn.execute(
-                    "INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, 500, 'referral_bonus', ?)",
-                    (referrer_id, f"推薦新用戶 {user_id} 獲得獎勵")
-                )
-        
-        # 創建新用戶，如果使用推薦碼則額外獲得 500 點數
-        initial_credits = 1000 if referral_code and referrer_id else 500
-        conn.execute(
-            "INSERT INTO users (user_id, email, name, credits, referral_code) VALUES (?, ?, ?, ?, ?)",
-            (user_id, email, name, initial_credits, new_referral_code)
-        )
-        
-        # 記錄新用戶獎勵
-        conn.execute(
-            "INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, 'signup_bonus', ?)",
-            (user_id, initial_credits, f"註冊獎勵{'（含推薦獎勵）' if referral_code and referrer_id else ''}")
-        )
-        
-        conn.commit()
-        user = conn.execute(
-            "SELECT * FROM users WHERE user_id = ?", (user_id,)
-        ).fetchone()
-    
-    conn.close()
-    return dict(user) if user else None
+    except Exception as e:
+        print(f"Error getting Google user info: {e}")
+    return None
 
-def get_user_profile(user_id: str) -> Optional[Dict]:
-    """獲取用戶定位檔案"""
-    conn = get_conn()
-    conn.row_factory = sqlite3.Row
-    profile = conn.execute(
-        "SELECT * FROM user_profiles WHERE user_id = ?", (user_id,)
-    ).fetchone()
-    conn.close()
-    return dict(profile) if profile else None
 
-def update_user_profile(user_id: str, profile_data: Dict) -> bool:
-    """更新用戶定位檔案"""
-    conn = get_conn()
-    
-    existing = conn.execute(
-        "SELECT id FROM user_profiles WHERE user_id = ?", (user_id,)
-    ).fetchone()
-    
-    if existing:
-        update_fields = []
-        values = []
-        for key, value in profile_data.items():
-            if key != 'user_id' and value is not None:
-                update_fields.append(f"{key} = ?")
-                values.append(json.dumps(value) if isinstance(value, (list, dict)) else str(value))
-        
-        if update_fields:
-            values.append(user_id)
-            sql = f"UPDATE user_profiles SET {', '.join(update_fields)}, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?"
-            conn.execute(sql, values)
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Optional[str]:
+    """獲取當前用戶 ID"""
+    if not credentials:
+        return None
+    return verify_access_token(credentials.credentials)
+
+async def get_current_user_for_refresh(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Optional[str]:
+    """獲取當前用戶 ID（允許過期的 token，用於 refresh 場景）"""
+    if not credentials:
+        print("DEBUG: get_current_user_for_refresh - 沒有 credentials")
+        return None
+    token = credentials.credentials
+    user_id = verify_access_token(token, allow_expired=True)
+    if not user_id:
+        print(f"DEBUG: get_current_user_for_refresh - token 驗證失敗，token 前10個字符: {token[:10] if token else 'None'}")
     else:
-        profile_data['user_id'] = user_id
-        fields = list(profile_data.keys())
-        placeholders = ['?' for _ in fields]
-        values = [json.dumps(v) if isinstance(v, (list, dict)) else str(v) for v in profile_data.values()]
-        
-        sql = f"INSERT INTO user_profiles ({', '.join(fields)}) VALUES ({', '.join(placeholders)})"
-        conn.execute(sql, values)
-    
-    conn.commit()
-    conn.close()
-    return True
+        print(f"DEBUG: get_current_user_for_refresh - 成功驗證，user_id: {user_id}")
+    return user_id
 
-# 會話管理
-def create_session(user_id: str, agent_type: str) -> str:
-    """創建新會話"""
-    session_id = f"{user_id}_{agent_type}_{int(datetime.now().timestamp())}"
-    conn = get_conn()
-    
-    conn.execute(
-        "INSERT INTO sessions (session_id, user_id, agent_type) VALUES (?, ?, ?)",
-        (session_id, user_id, agent_type)
-    )
-    conn.commit()
-    conn.close()
-    
-    return session_id
 
-def add_message(session_id: str, role: str, content: str, metadata: Dict = None):
-    """添加對話記錄"""
-    conn = get_conn()
-    conn.execute(
-        "INSERT INTO messages (session_id, role, content, metadata) VALUES (?, ?, ?, ?)",
-        (session_id, role, content, json.dumps(metadata) if metadata else None)
-    )
-    conn.commit()
-    conn.close()
+def resolve_kb_path() -> Optional[str]:
+    env_path = os.getenv("KB_PATH")
+    if env_path and os.path.isfile(env_path):
+        return env_path
 
-# 記憶系統
-def add_memory(user_id: str, agent_type: str, memory_type: str, content: str, 
-               importance_score: int = 5, tags: List[str] = None) -> int:
-    """添加記憶"""
-    conn = get_conn()
-    
-    cursor = conn.execute(
-        """INSERT INTO agent_memories 
-           (user_id, agent_type, memory_type, content, importance_score, tags) 
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (user_id, agent_type, memory_type, content, importance_score, 
-         json.dumps(tags) if tags else None)
-    )
-    memory_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    
-    return memory_id
-
-def get_user_memories(user_id: str, agent_type: str = None, memory_type: str = None, 
-                     limit: int = 20) -> List[Dict]:
-    """獲取用戶記憶"""
-    conn = get_conn()
-    conn.row_factory = sqlite3.Row
-    
-    conditions = ["user_id = ?"]
-    params = [user_id]
-    
-    if agent_type:
-        conditions.append("agent_type = ?")
-        params.append(agent_type)
-    
-    if memory_type:
-        conditions.append("memory_type = ?")
-        params.append(memory_type)
-    
-    params.append(limit)
-    
-    sql = f"""SELECT * FROM agent_memories 
-              WHERE {' AND '.join(conditions)} 
-              ORDER BY importance_score DESC, last_accessed DESC 
-              LIMIT ?"""
-    
-    memories = conn.execute(sql, params).fetchall()
-    conn.close()
-    
-    return [dict(memory) for memory in memories]
-
-# 定位智能體
-def positioning_agent_analyze(user_input: str, user_profile: Dict = None, memories: List[Dict] = None) -> str:
-    """定位智能體分析 - 提供結構化定位選項"""
-    context = "你是專業的短影音定位顧問，專門服務台灣市場，幫助用戶快速建立清晰的帳號定位。\n\n"
-    
-    # 加入知識庫內容
-    kb_context = retrieve_context(user_input) or ""
-    if kb_context:
-        context += f"【知識庫參考】\n{kb_context}\n\n"
-    
-    if user_profile:
-        context += f"用戶現有檔案：{json.dumps(user_profile, ensure_ascii=False)}\n\n"
-    
-    if memories:
-        context += f"相關記憶：\n"
-        for memory in memories[:5]:
-            context += f"- {memory['content']}\n"
-        context += "\n"
-    
-    context += f"用戶輸入：{user_input}\n\n"
-    
-    # 檢查哪些欄位還需要填寫
-    missing_fields = []
-    if not user_profile or not user_profile.get('business_type'):
-        missing_fields.append("業務類型")
-    if not user_profile or not user_profile.get('target_audience'):
-        missing_fields.append("目標受眾")
-    if not user_profile or not user_profile.get('brand_voice'):
-        missing_fields.append("品牌語氣")
-    if not user_profile or not user_profile.get('primary_platform'):
-        missing_fields.append("主要平台")
-    if not user_profile or not user_profile.get('content_goals'):
-        missing_fields.append("內容目標")
-    if not user_profile or not user_profile.get('posting_frequency'):
-        missing_fields.append("發文頻率")
-    
-    context += """【重要】請基於知識庫內容，以結構化方式回應，提供具體的定位選項供用戶選擇：
-
-📋 回應格式要求：
-• 使用emoji作為分點符號，讓內容更易讀
-• 段落分明，重點突出
-• 提供具體實作方式
-• 在回覆中明確標示「業務類型：」「目標受眾：」等欄位，方便系統自動提取
-• 基於知識庫的流量/轉換邏輯、平台策略、內容結構等專業建議
-
-🎯 分析步驟：
-1️⃣ 先分析用戶的業務/產品/服務
-2️⃣ 提供 2-3 個具體的定位方向選項
-3️⃣ 每個選項包含完整6個欄位
-4️⃣ 平台推薦專注於台灣用戶常用平台：Instagram Reels、TikTok、YouTube Shorts、Facebook Reels
-5️⃣ 提供具體實作建議（基於知識庫的拍攝、剪輯、內容策略）
-6️⃣ 最後提供 1-2 個後續問題引導
-
-📝 格式範例：
-【🎯 定位選項 A】
-📊 業務類型：XXX
-👥 目標受眾：XXX  
-🎭 品牌語氣：XXX
-📱 主要平台：Instagram Reels（台灣用戶最活躍）
-🎯 內容目標：XXX
-⏰ 發文頻率：XXX
-
-💡 實作建議：
-• 具體的內容策略（基於知識庫的流量型/轉換型配比）
-• 平台操作要點（拍攝技巧、剪輯節奏、標題鉤子）
-• 預期效果
-
-【🎯 定位選項 B】
-...
-
-🤔 接下來你可以：
-1️⃣ 選擇最適合的定位方向（A/B/C），我會幫你完善細節
-2️⃣ 告訴我你的品牌想要傳達什麼形象和語氣？
-3️⃣ 你還有其他想了解的定位問題嗎？"""
-    
-    return context
-
-# 選題智能體
-def topic_selection_agent_generate(user_profile: Dict, memories: List[Dict] = None) -> str:
-    """選題智能體生成建議"""
-    context = f"你是專業的內容選題顧問，為用戶提供每日靈感建議。\n\n"
-    
-    if user_profile:
-        context += f"用戶檔案：\n"
-        context += f"- 業務類型：{user_profile.get('business_type', '未設定')}\n"
-        context += f"- 目標受眾：{user_profile.get('target_audience', '未設定')}\n"
-        context += f"- 品牌語氣：{user_profile.get('brand_voice', '未設定')}\n"
-        context += f"- 主要平台：{user_profile.get('primary_platform', '未設定')}\n\n"
-    
-    if memories:
-        context += f"相關洞察：\n"
-        for memory in memories[:3]:
-            context += f"- {memory['content']}\n"
-        context += "\n"
-    
-    context += """提供5個具體的內容選題建議，每個選題包含：
-
-📝 選題結構：
-1️⃣ 標題/主題
-2️⃣ 為什麼適合這個用戶
-3️⃣ 預期效果
-4️⃣ 創作建議
-5️⃣ 相關熱門標籤
-
-💡 實作要點：
-• 考慮當前熱點、季節性、用戶興趣和平台特性
-• 提供具體的拍攝建議
-• 包含Hook、Value、CTA結構
-• 適合台灣用戶的內容風格
-
-直接輸出選題建議，不要任何開場白或說明文字。"""
-    
-    return context
-
-def extract_key_insights(text: str, agent_type: str) -> List[str]:
-    """從AI回應中提取關鍵洞察"""
-    insights = []
-    lines = text.split('\n')
-    
-    for line in lines:
-        line = line.strip()
-        if len(line) > 20 and any(keyword in line for keyword in ['建議', '應該', '可以', '重點', '關鍵']):
-            insights.append(line)
-    
-    return insights[:3]
-
-# === NEW: 粗略從文字中擷取定位欄位 ===
-def extract_profile_fields(text: str) -> Dict[str, Any]:
-    """智能擷取定位欄位，從用戶敘述或 AI 回應中抓取定位資訊。"""
-    if not text:
-        return {}
-    t = text.strip()
-    import re
-    fields: Dict[str, Any] = {}
-
-    # 業務類型 - 更廣泛的匹配
-    business_patterns = [
-        r"(?:業務類型|行業|產業|做|經營|從事)[:：]\s*([^\n，。,；;]{2,50})",
-        r"(?:我是|我們是|公司是|帳號是|專注於|主要做)\s*([^\n，。,；;]{2,50})",
-        r"(?:AI智能體|AI自動化|短影音|電商|教育|科技|行銷|內容創作|知識分享)",
+    # Try common relative locations
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.abspath(os.path.join(here, "data", "kb.txt")),  # 當前目錄下的 data/kb.txt
+        os.path.abspath(os.path.join(here, "..", "AI短影音智能體重製版", "data", "kb.txt")),
+        os.path.abspath(os.path.join(here, "..", "data", "kb.txt")),
+        os.path.abspath(os.path.join(here, "..", "..", "AI短影音智能體重製版", "data", "kb.txt")),
+        os.path.abspath(os.path.join(here, "..", "..", "data", "kb.txt")),
     ]
-    for pattern in business_patterns:
-        m = re.search(pattern, t, re.IGNORECASE)
-        if m: 
-            fields["business_type"] = m.group(1).strip()
-            break
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
 
-    # 目標受眾 - 更智能的匹配
-    audience_patterns = [
-        r"(?:目標受眾|受眾|TA|觀眾|粉絲)[:：]\s*([^\n]{2,100})",
-        r"(?:效率控|職場打工人|科技好奇寶寶|未來生活嚮往者|年輕人|學生|上班族|新手爸媽)",
-        r"(?:年齡|性別|職業|興趣|痛點)[:：]\s*([^\n]{2,80})",
-    ]
-    for pattern in audience_patterns:
-        m = re.search(pattern, t, re.IGNORECASE)
-        if m: 
-            fields["target_audience"] = m.group(1).strip()
-            break
 
-    # 品牌語氣 - 更廣泛的匹配
-    voice_patterns = [
-        r"(?:品牌語氣|語氣|口吻|風格)[:：]\s*([^\n，。,；;]{2,50})",
-        r"(?:幽默|俏皮|專業|親切|活潑|嚴肅|輕鬆|正式|口語|白話)",
-        r"(?:像.*朋友|酷朋友|自然|有記憶點|有共鳴)",
-    ]
-    for pattern in voice_patterns:
-        m = re.search(pattern, t, re.IGNORECASE)
-        if m: 
-            fields["brand_voice"] = m.group(1).strip()
-            break
-
-    # 主要平台 - 更智能的匹配
-    platform_patterns = [
-        r"(?:主要平台|核心平台|平台|在哪裡經營)[:：]\s*([^\n，。,；;]{2,50})",
-        r"(?:抖音|小紅書|IG|Instagram|YouTube|Facebook|TikTok|微博|B站)",
-    ]
-    for pattern in platform_patterns:
-        m = re.search(pattern, t, re.IGNORECASE)
-        if m: 
-            fields["primary_platform"] = m.group(1).strip()
-            break
-
-    # 內容目標 - 更廣泛的匹配
-    goals_patterns = [
-        r"(?:內容目標|目標|目的|想要)[:：]\s*([^\n]{2,100})",
-        r"(?:轉單|曝光|名單|教育|品牌|流量|粉絲|互動|銷售|推廣)",
-    ]
-    for pattern in goals_patterns:
-        m = re.search(pattern, t, re.IGNORECASE)
-        if m: 
-            fields["content_goals"] = m.group(1).strip()
-            break
-
-    # 發文頻率 - 更智能的匹配
-    frequency_patterns = [
-        r"(?:發文頻率|頻率|多久發|更新)[:：]\s*([^\n，。,；;]{2,30})",
-        r"(?:每天|每週|每月|不定期|固定|經常|偶爾)",
-    ]
-    for pattern in frequency_patterns:
-        m = re.search(pattern, t, re.IGNORECASE)
-        if m: 
-            fields["posting_frequency"] = m.group(1).strip()
-            break
-
-    return fields
-
-# === NEW: 無模型時的自然回覆（參考資料庫） ===
-def natural_fallback_positioning(user_input: str, user_profile: Optional[Dict], memories: List[Dict]) -> str:
-    """在沒有外部模型時，根據用戶檔案與記憶，生成比較自然的建議文本。"""
-    bp = user_profile or {}
-    biz = bp.get("business_type") or "（未設定）"
-    aud = bp.get("target_audience") or "（未設定）"
-    voice = bp.get("brand_voice") or "（未設定）"
-    platform = bp.get("primary_platform") or "（未設定）"
-
-    insights_lines = []
-    for m in (memories or [])[:3]:
-        insights_lines.append(f"- {m.get('content','').strip()}")
-    insights_block = "\n".join(insights_lines) if insights_lines else "（暫無）"
-
-    return (
-        "🔍 初步分析（根據已知檔案與你的描述）\n\n"
-        f"1) 業務類型：{biz}\n"
-        f"2) 目標受眾：{aud}\n"
-        f"3) 品牌語氣建議：{voice if voice!='（未設定）' else '先以清晰、可信、口語為主，後續再微調'}\n"
-        f"4) 平台策略：優先耕耘 {platform if platform!='（未設定）' else '你最熟悉且受眾集中的平台'}，再輔以次要平台做導流。\n"
-        "5) 內容方向：以痛點切入 + 案例/示範 + 明確 CTA。每週固定欄目（例如：教學/開箱/QA/案例）。\n\n"
-        "🧠 近期洞察：\n"
-        f"{insights_block}\n\n"
-        "✅ 下一步：\n"
-        "- 告訴我你的產品/服務一句話＋主要受眾＋希望達成的目標（例如：轉單/曝光/名單）\n"
-        "- 我會據此補齊定位檔案並給你 2 版內容策略草案"
-    )
-
-# ========= 引導式問答 API =========
-@app.post("/chat_qa")
-async def chat_qa(req: Request):
-    data = await req.json()
-    session_id = (data.get("session_id") or "qa").strip() or "qa"
-    user_msg = (data.get("message") or "").strip()
-
-    # 初次進入：建立 session 並送歡迎 + Q1
-    if session_id not in QA_SESSIONS:
-        qa_reset(session_id)
-        q = qa_next_question(session_id)
-        return {
-            "session_id": session_id,
-            "assistant_message": "嗨👋 讓我們一步步生成你的短影音腳本！\n" + (q or ""),
-            "segments": [],
-            "done": False,
-            "error": None
-        }
-
-    # 正常流程：記錄上一題的回答
-    qa_record_answer(session_id, user_msg)
-    next_q = qa_next_question(session_id)
-    if next_q:
-        return {
-            "session_id": session_id,
-            "assistant_message": next_q,
-            "segments": [],
-            "done": False,
-            "error": None
-        }
-
-    # 問答完成 → 組合描述 + 取 KB context → 走原有 build_script_prompt
-    ans = QA_SESSIONS.get(session_id, {}).get("answers", {})
-    brief = compose_brief_from_answers(ans)
-    kb_ctx = retrieve_context(brief) or ""
-    # 將 QA 選到的 structure/duration 帶入
-    template_type = (ans.get("structure") or "").strip()[:1].upper() or None
+def load_kb_text() -> str:
+    kb_path = resolve_kb_path()
+    if not kb_path:
+        return ""
     try:
-        duration = int((ans.get("duration") or "").strip())
+        with open(kb_path, "r", encoding="utf-8") as f:
+            return f.read()
     except Exception:
-        duration = 30
+        return ""
 
-    user_input = f"{brief}\n\n【KB輔助摘錄】\n{kb_ctx}"
 
-    previous_segments = []
-    prompt = build_script_prompt(
-        user_input,
-        previous_segments,
-        template_type=template_type,
-        duration=duration,
-        dialogue_mode="guide",
-    )
+def save_conversation_summary(user_id: str, user_message: str, ai_response: str) -> None:
+    """保存智能對話摘要"""
     try:
-        if use_gemini():
-            out = gemini_generate_text(prompt)
-            j = _ensure_json_block(out)
-            segments = parse_segments(j)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        database_url = os.getenv("DATABASE_URL")
+        use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+
+        # 確保 user_profiles 存在該 user_id（修復外鍵約束錯誤）
+        if use_postgresql:
+            cursor.execute("SELECT user_id FROM user_profiles WHERE user_id = %s", (user_id,))
         else:
-            segments = fallback_segments(user_input, 0, duration=duration)
-    except Exception as e:
-        print("[chat_qa] error:", e)
-        segments = []
-
-    # 清除 session
-    QA_SESSIONS.pop(session_id, None)
-
-    return {
-        "session_id": session_id,
-        "assistant_message": "我已根據你的回答生成第一版腳本（可再調整）。",
-        "segments": segments,
-        "done": True,
-        "error": None
-    }
-
-# ========= /chat_generate =========
-@app.post("/chat_generate")
-async def chat_generate(req: Request):
-    """
-    body: {
-      user_id?: str,
-      session_id?: str,
-      messages: [{role, content}],
-      previous_segments?: [segment...],
-      remember?: bool,
-      mode?: "script" | "copy",          # ← 保留既有：腳本/文案
-      topic?: str,                        # ← 文案主題（可選）
-      dialogue_mode?: "guide" | "free",   # ← 新增：引導/自由 對話風格（可選）
-      template_type?: "A"|"B"|"C"|"D"|"E"|"F",  # ← 新增
-      duration?: 30|60,                   # ← 新增：腳本時長
-      knowledge_hint?: str                # ← 新增：檢索提示詞（可選）
-    }
-    """
-    try:
-        data = await req.json()
-    except Exception:
-        raise HTTPException(status_code=422, detail="invalid_json")
-
-    user_id = (data.get("user_id") or "").strip() or get_anon_user_id(req)
-    messages = data.get("messages") or []
-    previous_segments = data.get("previous_segments") or []
-    topic = (data.get("topic") or "").strip() or None
-
-    explicit_mode = (data.get("mode") or "").strip().lower() or None
-    mode = detect_mode(messages, explicit=explicit_mode)
-
-    # NEW: 讀取新參數（後端若沒收到也不影響舊行為）
-    dialogue_mode = (data.get("dialogue_mode") or "").strip().lower() or None
-    template_type = (data.get("template_type") or "").strip().upper() or None
-    try:
-        duration = int(data.get("duration")) if data.get("duration") is not None else None
-    except Exception:
-        duration = None
-    knowledge_hint = (data.get("knowledge_hint") or "").strip() or None
-
-    user_input = ""
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            user_input = (m.get("content") or "").strip()
-            break
-
-    # 若輸入過短，也直接嘗試生成（避免制式提示打斷對話）
-    hint = SHORT_HINT_COPY if mode == "copy" else SHORT_HINT_SCRIPT
-    if len(user_input) < 6:
-        user_input = f"（使用者提示較短）請主動追問必要資訊並先給出初步建議。\n提示：{user_input or '請先幫我開始'}"
-
-    try:
-        if mode == "copy":
-            prompt = build_copy_prompt(user_input, topic)
-            if use_gemini():
-                out = gemini_generate_text(prompt)
-                j = _ensure_json_block(out)
-                copy = parse_copy(j)
+            cursor.execute("SELECT user_id FROM user_profiles WHERE user_id = ?", (user_id,))
+        
+        if not cursor.fetchone():
+            # 如果不存在，自動創建
+            if use_postgresql:
+                cursor.execute("""
+                    INSERT INTO user_profiles (user_id, created_at)
+                    VALUES (%s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (user_id) DO NOTHING
+                """, (user_id,))
             else:
-                copy = fallback_copy(user_input, topic)
+                cursor.execute("""
+                    INSERT OR IGNORE INTO user_profiles (user_id, created_at)
+                    VALUES (?, CURRENT_TIMESTAMP)
+                """, (user_id,))
 
-            resp = {
-                "session_id": data.get("session_id") or "s",
-                "assistant_message": "我先給你第一版完整貼文（可再加要求，我會幫你改得更貼近風格）。",
-                "segments": [],
-                "copy": copy,
-                "error": None
-            }
+        # 智能摘要生成
+        summary = generate_smart_summary(user_message, ai_response)
+        conversation_type = classify_conversation(user_message, ai_response)
 
-        else:  # script
-            prompt = build_script_prompt(
-                user_input,
-                previous_segments,
-                template_type=template_type,
-                duration=duration,
-                dialogue_mode=dialogue_mode,
-                knowledge_hint=knowledge_hint,
-            )
-            if use_gemini():
-                out = gemini_generate_text(prompt)
-                j = _ensure_json_block(out)
-                segments = parse_segments(j)
-            else:
-                segments = fallback_segments(user_input, len(previous_segments or []), duration=duration)
+        if use_postgresql:
+            cursor.execute("""
+                INSERT INTO conversation_summaries (user_id, summary, conversation_type, created_at)
+                VALUES (%s, %s, %s, %s)
+            """, (user_id, summary, conversation_type, datetime.now()))
+        else:
+            cursor.execute("""
+                INSERT INTO conversation_summaries (user_id, summary, conversation_type, created_at)
+                VALUES (?, ?, ?, ?)
+            """, (user_id, summary, conversation_type, datetime.now()))
 
-            resp = {
-                "session_id": data.get("session_id") or "s",
-                "assistant_message": "我先給你第一版完整腳本（可再加要求，我會幫你改得更貼近風格）。",
-                "segments": segments,
-                "copy": None,
-                "error": None
-            }
+        # 追蹤用戶偏好
+        track_user_preferences(user_id, user_message, ai_response, conversation_type)
 
-        # DB 紀錄（保留原行為）
-        try:
-            conn = get_conn()
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO requests (user_id, user_input, mode, messages_json, previous_segments_json, response_json) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    user_id,
-                    user_input, mode,
-                    json.dumps(messages, ensure_ascii=False),
-                    json.dumps(previous_segments, ensure_ascii=False),
-                    json.dumps(resp, ensure_ascii=False),
-                ),
-            )
+        if not use_postgresql:
             conn.commit()
-            conn.close()
-        except Exception as e:
-            print("[DB] insert failed:", e)
-
-        return resp
+        conn.close()
 
     except Exception as e:
-        print("[chat_generate] error:", e)
-        return JSONResponse(status_code=500, content={
-            "session_id": data.get("session_id") or "s",
-            "assistant_message": "伺服器忙碌，稍後再試",
-            "segments": [],
-            "copy": None,
-            "error": "internal_server_error"
-        })
+        print(f"保存對話摘要時出錯: {e}")
 
-# ========= 舊流程：/generate_script =========
-@app.post("/generate_script")
-async def generate_script(req: Request):
+def track_user_preferences(user_id: str, user_message: str, ai_response: str, conversation_type: str) -> None:
+    """追蹤用戶偏好"""
     try:
-        data = await req.json()
-    except Exception:
-        raise HTTPException(status_code=422, detail="invalid_json")
-
-    user_input = (data.get("user_input") or "").strip()
-    previous_segments = data.get("previous_segments") or []
-
-    # 向下相容：舊端點若想支援 60s/模板，也可帶入這兩個欄位（可選）
-    template_type = (data.get("template_type") or "").strip().upper() or None
-    try:
-        duration = int(data.get("duration")) if data.get("duration") is not None else None
-    except Exception:
-        duration = None
-
-    if len(user_input) < 6:
-        return {"segments": [], "error": SHORT_HINT_SCRIPT}
-
-    try:
-        prompt = build_script_prompt(
-            user_input,
-            previous_segments,
-            template_type=template_type,
-            duration=duration
-        )
-        if use_gemini():
-            out = gemini_generate_text(prompt)
-            j = _ensure_json_block(out)
-            segments = parse_segments(j)
-        else:
-            segments = fallback_segments(user_input, len(previous_segments or []), duration=duration)
-        return {"segments": segments, "error": None}
-    except Exception as e:
-        print("[generate_script] error:", e)
-        return JSONResponse(status_code=500, content={"segments": [], "error": "internal_server_error"})
-
-# ========= 匯出：Word 暫停 / Excel 保留 =========
-@app.post("/export/docx")
-async def export_docx_disabled():
-    return JSONResponse(status_code=501, content={"error": "docx_export_disabled"})
-
-def _ensure_xlsx():
-    try:
-        import openpyxl  # noqa
-        return True
-    except Exception:
-        return False
-
-@app.post("/export/xlsx")
-async def export_xlsx(req: Request):
-    if not _ensure_xlsx():
-        return JSONResponse(status_code=501, content={"error": "xlsx_not_available"})
-    import openpyxl
-    from openpyxl.utils import get_column_letter
-    from io import BytesIO
-
-    data = await req.json()
-    segments = data.get("segments") or []
-    copy = data.get("copy") or None
-
-    wb = openpyxl.Workbook()
-    ws1 = wb.active; ws1.title = "腳本分段"
-    ws1.append(["#","type","start_sec","end_sec","camera","dialog","visual","cta"])
-    for i, s in enumerate(segments, 1):
-        ws1.append([i, s.get("type"), s.get("start_sec"), s.get("end_sec"),
-                    s.get("camera"), s.get("dialog"), s.get("visual"), s.get("cta")])
-
-    ws2 = wb.create_sheet("文案")
-    ws2.append(["主貼文"]); ws2.append([copy.get("main_copy") if copy else ""])
-    ws2.append([]); ws2.append(["備選開頭"])
-    for a in (copy.get("alternates") if copy else []) or []: ws2.append([a])
-    ws2.append([]); ws2.append(["Hashtags"])
-    ws2.append([" ".join(copy.get("hashtags") if copy else [])])
-    ws2.append([]); ws2.append(["CTA"])
-    ws2.append([copy.get("cta") if copy else ""])
-    ws2.append([]); ws2.append(["圖片建議"])
-    for idea in (copy.get("image_ideas") if copy else []) or []: ws2.append([idea])
-
-    for ws in (ws1, ws2):
-        for col in ws.columns:
-            width = max(len(str(c.value)) if c.value else 0 for c in col) + 2
-            ws.column_dimensions[get_column_letter(col[0].column)].width = min(width, 80)
-
-    bio = BytesIO(); wb.save(bio); bio.seek(0)
-    return StreamingResponse(
-        bio,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": 'attachment; filename="export.xlsx"'}
-    )
-
-# ========= CSV 下載 & Google Sheet 連動 =========
-import csv
-import json
-from fastapi.responses import FileResponse, Response
-from io import StringIO
-
-@app.get("/download/requests_export.csv")
-def download_requests_csv():
-    export_path = "/data/requests_export.csv"
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM requests ORDER BY id DESC")
-    rows = cur.fetchall()
-    headers = [desc[0] for desc in cur.description]
-    conn.close()
-
-    with open(export_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(headers)
-        writer.writerows(rows)
-
-    return FileResponse(
-        export_path,
-        media_type="text/csv",
-        filename="requests_export.csv",
-    )
-
-
-@app.get("/export/google-sheet")
-def export_for_google_sheet(limit: int = 100):
-    try:
-        limit = int(limit)
-    except Exception:
-        limit = 100
-    limit = max(1, min(limit, 2000))
-
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        f"SELECT id, created_at, user_input, mode FROM requests ORDER BY id DESC LIMIT {limit}"
-    )
-    rows = cur.fetchall()
-    conn.close()
-
-    output = StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["id", "created_at", "user_input", "mode"])
-    for row in rows:
-        writer.writerow(row)
-
-    return Response(content=output.getvalue(), media_type="text/csv")
-
-
-@app.get("/export/google-sheet-flat")
-def export_google_sheet_flat(limit: int = 200):
-    try:
-        limit = int(limit)
-    except Exception:
-        limit = 200
-    limit = max(1, min(limit, 2000))
-
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        f"""
-        SELECT id, created_at, user_input, mode, response_json
-        FROM requests
-        ORDER BY id DESC
-        LIMIT {limit}
-        """
-    )
-    rows = cur.fetchall()
-    conn.close()
-
-    out = StringIO()
-    writer = csv.writer(out)
-
-    headers = [
-        "id", "created_at", "mode", "user_input",
-        "assistant_message",
-        "copy_main_copy",
-        "copy_cta",
-        "copy_hashtags",
-        "copy_alternates_joined",
-        "segments_count",
-        "seg1_type", "seg1_start_sec", "seg1_end_sec", "seg1_dialog", "seg1_visual", "seg1_cta",
-        "seg2_type", "seg2_start_sec", "seg2_end_sec", "seg2_dialog", "seg2_visual", "seg2_cta",
-        "seg3_type", "seg3_start_sec", "seg3_end_sec", "seg3_dialog", "seg3_visual", "seg3_cta",
-    ]
-    writer.writerow(headers)
-
-    for _id, created_at, user_input, mode, resp_json in rows:
-        assistant_message = ""
-        copy_main = ""
-        copy_cta = ""
-        copy_hashtags = ""
-        copy_alternates_joined = ""
-        segments_count = 0
-
-        def empty_seg():
-            return ["", "", "", "", "", ""]
-        seg1 = empty_seg()
-        seg2 = empty_seg()
-        seg3 = empty_seg()
-
-        try:
-            data = json.loads(resp_json or "{}")
-            assistant_message = (data.get("assistant_message") or "")[:500]
-
-            c = data.get("copy") or {}
-            if isinstance(c, dict):
-                copy_main = c.get("main_copy") or ""
-                copy_cta = c.get("cta") or ""
-                tags = c.get("hashtags") or []
-                if isinstance(tags, list):
-                    copy_hashtags = " ".join(map(str, tags))
-                alts = c.get("alternates") or c.get("openers") or []
-                if isinstance(alts, list):
-                    copy_alternates_joined = " | ".join(map(str, alts))
-
-            segs = data.get("segments") or []
-            if isinstance(segs, list):
-                segments_count = len(segs)
-
-                def to_seg(s):
-                    return [
-                        s.get("type", ""),
-                        s.get("start_sec", ""),
-                        s.get("end_sec", ""),
-                        s.get("dialog", ""),
-                        s.get("visual", ""),
-                        s.get("cta", ""),
-                    ]
-
-                if len(segs) >= 1: seg1 = to_seg(segs[0])
-                if len(segs) >= 2: seg2 = to_seg(segs[1])
-                if len(segs) >= 3: seg3 = to_seg(segs[2])
-
-        except Exception as e:
-            assistant_message = f"[JSON parse error] {str(e)}"
-
-        writer.writerow([
-            _id, created_at, mode, user_input,
-            assistant_message,
-            copy_main,
-            copy_cta,
-            copy_hashtags,
-            copy_alternates_joined,
-            segments_count,
-            *seg1, *seg2, *seg3,
-        ])
-
-    return Response(
-        content=out.getvalue(),
-        media_type="text/csv",
-        headers={"Content-Disposition": "inline; filename=export_flat.csv"},
-    )
-
-# ========= Google Sheet 扁平化（v2） =========
-import csv
-import json
-from io import StringIO
-from fastapi.responses import Response
-
-@app.get("/export/google-sheet-flat-v2")
-def export_google_sheet_flat_v2(limit: int = 200):
-    """
-    扁平化 CSV（含 copy 與前 3 個 segments），禁用快取。
-    在 Google Sheets 使用：
-      =IMPORTDATA("https://aijobvideobackend.zeabur.app/export/google-sheet-flat-v2?limit=500")
-    """
-    try:
-        limit = int(limit)
-    except Exception:
-        limit = 200
-    limit = max(1, min(limit, 2000))
-
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        f"""
-        SELECT id, created_at, user_input, mode, response_json
-        FROM requests
-        ORDER BY id DESC
-        LIMIT {limit}
-        """
-    )
-    rows = cur.fetchall()
-    conn.close()
-
-    out = StringIO()
-    writer = csv.writer(out)
-
-    headers = [
-        "id", "created_at", "mode", "user_input",
-        "assistant_message",
-        "copy_main_copy", "copy_cta", "copy_hashtags", "copy_alternates_joined",
-        "segments_count",
-        "seg1_type", "seg1_start_sec", "seg1_end_sec", "seg1_dialog", "seg1_visual", "seg1_cta",
-        "seg2_type", "seg2_start_sec", "seg2_end_sec", "seg2_dialog", "seg2_visual", "seg2_cta",
-        "seg3_type", "seg3_start_sec", "seg3_end_sec", "seg3_dialog", "seg3_visual", "seg3_cta",
-    ]
-    writer.writerow(headers)
-
-    def empty_seg():
-        return ["", "", "", "", "", ""]
-
-    for _id, created_at, user_input, mode, resp_json in rows:
-        assistant_message = ""
-        copy_main = ""
-        copy_cta = ""
-        copy_hashtags = ""
-        copy_alternates = ""
-        segments_count = 0
-        seg1 = empty_seg()
-        seg2 = empty_seg()
-        seg3 = empty_seg()
-
-        try:
-            data = json.loads(resp_json or "{}")
-            assistant_message = (data.get("assistant_message") or "")[:500]
-
-            c = data.get("copy") or {}
-            if isinstance(c, dict):
-                copy_main = c.get("main_copy") or ""
-                copy_cta = c.get("cta") or ""
-                tags = c.get("hashtags") or []
-                if isinstance(tags, list):
-                    copy_hashtags = " ".join(map(str, tags))
-                alts = c.get("alternates") or c.get("openers") or []
-                if isinstance(alts, list):
-                    copy_alternates = " | ".join(map(str, alts))
-
-            segs = data.get("segments") or []
-            if isinstance(segs, list):
-                segments_count = len(segs)
-
-                def to_seg(s):
-                    return [
-                        s.get("type", ""),
-                        s.get("start_sec", ""),
-                        s.get("end_sec", ""),
-                        s.get("dialog", ""),
-                        s.get("visual", ""),
-                        s.get("cta", ""),
-                    ]
-
-                if len(segs) >= 1: seg1 = to_seg(segs[0])
-                if len(segs) >= 2: seg2 = to_seg(segs[1])
-                if len(segs) >= 3: seg3 = to_seg(segs[2])
-
-        except Exception as e:
-            assistant_message = f"[JSON parse error] {str(e)}"
-
-        writer.writerow([
-            _id, created_at, mode, user_input,
-            assistant_message,
-            copy_main, copy_cta, copy_hashtags, copy_alternates,
-            segments_count,
-            *seg1, *seg2, *seg3,
-        ])
-
-    return Response(
-        content=out.getvalue(),
-        media_type="text/csv",
-        headers={
-            "Content-Disposition": "inline; filename=export_flat_v2.csv",
-            "Cache-Control": "no-store, max-age=0, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-        },
-    )
-
-# ========= Admin APIs（簡易狀態與用戶列表） =========
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # 可選，若未設置則不驗證
-
-def _check_admin(req: Request):
-    # 先看是否有有效 admin session cookie
-    adm_cookie = req.cookies.get("admin_session")
-    if adm_cookie and verify_admin_session_cookie(adm_cookie):
-        return True
-    # 其次允許 token（自動化工具/備援）
-    tok = req.headers.get("x-admin-token") or req.query_params.get("token")
-    if ADMIN_TOKEN and tok == ADMIN_TOKEN:
-        return True
-    return False
-
-@app.get("/admin/users")
-async def admin_users(req: Request):
-    if not _check_admin(req):
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    
-    conn = get_conn()
-    conn.row_factory = sqlite3.Row
-    
-    try:
-        # 先檢查並修復資料庫結構
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id TEXT PRIMARY KEY,
-                email TEXT UNIQUE,
-                name TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                status TEXT DEFAULT 'active',
-                credits INTEGER DEFAULT 500,
-                referral_code TEXT
-            )
-        """)
+        conn = get_db_connection()
+        cursor = conn.cursor()
         
-        # 檢查並添加缺失的欄位
-        cursor = conn.execute("PRAGMA table_info(users)")
-        columns = [col[1] for col in cursor.fetchall()]
+        database_url = os.getenv("DATABASE_URL")
+        use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
         
-        if 'credits' not in columns:
-            conn.execute("ALTER TABLE users ADD COLUMN credits INTEGER DEFAULT 500")
-            print("已添加 credits 欄位")
+        # 提取偏好信息
+        preferences = extract_user_preferences(user_message, ai_response, conversation_type)
+        
+        for pref_type, pref_value in preferences.items():
+            # 檢查是否已存在
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT id, confidence_score FROM user_preferences 
+                    WHERE user_id = %s AND preference_type = %s
+                """, (user_id, pref_type))
+            else:
+                cursor.execute("""
+                    SELECT id, confidence_score FROM user_preferences 
+                    WHERE user_id = ? AND preference_type = ?
+                """, (user_id, pref_type))
             
-        if 'referral_code' not in columns:
-            conn.execute("ALTER TABLE users ADD COLUMN referral_code TEXT")
-            print("已添加 referral_code 欄位")
-        
-        # 為沒有推薦碼的用戶生成推薦碼
-        users_without_ref = conn.execute("SELECT user_id FROM users WHERE referral_code IS NULL OR referral_code = ''").fetchall()
-        for user in users_without_ref:
-            import uuid
-            ref_code = str(uuid.uuid4())[:8].upper()
-            conn.execute("UPDATE users SET referral_code = ? WHERE user_id = ?", (ref_code, user['user_id']))
-            print(f"為用戶 {user['user_id']} 生成推薦碼: {ref_code}")
-        
-        # 為沒有點數的用戶設置預設點數
-        conn.execute("UPDATE users SET credits = 500 WHERE credits IS NULL")
-        
-        conn.commit()
-        
-        # 查詢用戶資料
-        users = conn.execute("SELECT user_id, email, name, created_at, updated_at, status, credits, referral_code FROM users ORDER BY created_at DESC LIMIT 500").fetchall()
-        
-        auths = conn.execute(
-            """
-            SELECT user_id, username, email, phone, created_at,
-                   CASE WHEN password_hash IS NOT NULL AND length(password_hash)>0 THEN 1 ELSE 0 END AS has_password
-            FROM users_auth ORDER BY created_at DESC LIMIT 500
-            """
-        ).fetchall()
-        
-        conn.close()
-        
-        return {
-            "users": [dict(u) for u in users],
-            "users_auth": [dict(a) for a in auths],
-        }
-        
-    except Exception as e:
-        conn.close()
-        print(f"資料庫錯誤: {e}")
-        return JSONResponse(status_code=500, content={"error": f"資料庫錯誤: {str(e)}"})
-
-@app.get("/admin/referrals")
-async def admin_referrals(req: Request):
-    if not _check_admin(req):
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    referrals = conn.execute("""
-        SELECT r.referrer_id, r.referred_id, r.referral_code, r.created_at,
-               u1.name as referrer_name, u2.name as referred_name
-        FROM referrals r
-        LEFT JOIN users u1 ON r.referrer_id = u1.user_id
-        LEFT JOIN users u2 ON r.referred_id = u2.user_id
-        ORDER BY r.created_at DESC LIMIT 500
-    """).fetchall()
-    conn.close()
-    return {"referrals": [dict(r) for r in referrals]}
-
-@app.get("/admin/users_full")
-async def admin_users_full(req: Request, limit: int = 500):
-    if not _check_admin(req):
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    try:
-        limit = int(limit)
-    except Exception:
-        limit = 500
-    limit = max(1, min(limit, 2000))
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    users = conn.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-    auths = conn.execute(
-        """
-        SELECT user_id, username, email, phone, created_at,
-               CASE WHEN password_hash IS NOT NULL AND length(password_hash)>0 THEN 1 ELSE 0 END AS has_password
-        FROM users_auth ORDER BY created_at DESC LIMIT ?
-        """,
-        (limit,)
-    ).fetchall()
-    credits = conn.execute("SELECT * FROM user_credits").fetchall()
-    orders = conn.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-    conn.close()
-    return {
-        "users": [dict(u) for u in users],
-        "users_auth": [dict(a) for a in auths],
-        "credits": [dict(c) for c in credits],
-        "orders": [dict(o) for o in orders],
-    }
-
-@app.get("/admin/usage")
-async def admin_usage(req: Request, limit: int = 30):
-    if not _check_admin(req):
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    try:
-        limit = int(limit)
-    except Exception:
-        limit = 30
-    limit = max(1, min(limit, 500))
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    total_requests = conn.execute("SELECT COUNT(1) AS c FROM requests").fetchone()["c"]
-    latest = conn.execute(
-        f"SELECT id, created_at, user_input, mode FROM requests ORDER BY id DESC LIMIT {limit}"
-    ).fetchall()
-    conn.close()
-    return {
-        "total_requests": total_requests,
-        "latest": [dict(r) for r in latest],
-    }
-
-@app.get("/admin/users.csv")
-async def admin_users_csv(req: Request):
-    if not _check_admin(req):
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    users = conn.execute("SELECT user_id, email, name, created_at, updated_at, status FROM users ORDER BY created_at DESC").fetchall()
-    auths = conn.execute("SELECT user_id, username, email AS auth_email, phone, created_at AS auth_created FROM users_auth ORDER BY created_at DESC").fetchall()
-    conn.close()
-
-    from io import StringIO
-    s = StringIO()
-    import csv
-    w = csv.writer(s)
-    w.writerow(["user_id","email","name","created_at","updated_at","status","username","auth_email","phone","auth_created"])
-    # 以 user_id 關聯（此處簡化：逐筆合併，若無對應則留空）
-    auth_map = {a["user_id"]: a for a in auths}
-    for u in users:
-        a = auth_map.get(u["user_id"]) or {}
-        w.writerow([
-            u["user_id"], u["email"], u["name"], u["created_at"], u["updated_at"], u["status"],
-            a.get("username",""), a.get("auth_email",""), a.get("phone",""), a.get("auth_created",""),
-        ])
-    return Response(content=s.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=users.csv"})
-
-@app.get("/admin/usage.csv")
-async def admin_usage_csv(req: Request, limit: int = 1000):
-    if not _check_admin(req):
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    try:
-        limit = int(limit)
-    except Exception:
-        limit = 1000
-    limit = max(1, min(limit, 5000))
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        f"SELECT id, created_at, user_input, mode FROM requests ORDER BY id DESC LIMIT {limit}"
-    ).fetchall()
-    conn.close()
-
-    from io import StringIO
-    s = StringIO()
-    import csv
-    w = csv.writer(s)
-    w.writerow(["id","created_at","mode","user_input"])
-    for r in rows:
-        w.writerow([r["id"], r["created_at"], r["mode"], r["user_input"]])
-    return Response(content=s.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=usage.csv"})
-
-@app.get("/admin/users_auth")
-async def admin_users_auth(req: Request, limit: int = 1000):
-    if not _check_admin(req):
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    try:
-        limit = int(limit)
-    except Exception:
-        limit = 1000
-    limit = max(1, min(limit, 5000))
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        f"SELECT id, user_id, username, email, phone, created_at, updated_at FROM users_auth ORDER BY created_at DESC LIMIT {limit}"
-    ).fetchall()
-    conn.close()
-    return {"users_auth": [dict(r) for r in rows]}
-
-@app.post("/admin/user/reset_password")
-async def admin_reset_password(req: Request):
-    if not _check_admin(req):
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    data = await req.json()
-    user_id = (data.get("user_id") or "").strip()
-    identifier = (data.get("identifier") or "").strip()  # username 或 email
-    new_password = (data.get("new_password") or "").strip()
-    if not new_password or len(new_password) < 6:
-        return JSONResponse(status_code=400, content={"error": "weak_password", "message": "密碼至少 6 碼"})
-    if not user_id and not identifier:
-        return JSONResponse(status_code=400, content={"error": "missing_identifier"})
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    try:
-        if user_id:
-            row = conn.execute("SELECT id, user_id, username, email FROM users_auth WHERE user_id=?", (user_id,)).fetchone()
-        else:
-            row = conn.execute("SELECT id, user_id, username, email FROM users_auth WHERE username=? OR email=?", (identifier, identifier)).fetchone()
-        if not row:
-            conn.close()
-            return JSONResponse(status_code=404, content={"error": "user_not_found"})
-        conn.execute("UPDATE users_auth SET password_hash=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (hash_password(new_password), row["id"]))
-        # 稽核記錄
-        try:
-            _tok = req.headers.get("x-admin-token") or req.query_params.get("token") or ""
-            admin_hash = hashlib.sha256(_tok.encode("utf-8")).hexdigest() if _tok else None
-            conn.execute(
-                "INSERT INTO admin_audit_logs (action, admin_token_hash, target_user_id, details) VALUES (?, ?, ?, ?)",
-                ("reset_password", admin_hash, row["user_id"], json.dumps({"username": row["username"], "email": row["email"]}, ensure_ascii=False))
-            )
-        except Exception as _e:
-            print("[audit] write failed:", _e)
-        conn.commit(); conn.close()
-        return {"ok": True}
-    except Exception as e:
-        try: conn.close()
-        except Exception: pass
-        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
-
-@app.post("/admin/user/add_credits")
-async def admin_add_credits(req: Request):
-    """管理員為用戶充值點數"""
-    print(f"[DEBUG] admin_add_credits called")
-    
-    if not _check_admin(req):
-        print(f"[DEBUG] admin check failed")
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    
-    data = await req.json()
-    user_id = (data.get("user_id") or "").strip()
-    identifier = (data.get("identifier") or "").strip()  # username 或 email
-    credits = data.get("credits", 0)
-    reason = (data.get("reason") or "管理員充值").strip()
-    
-    print(f"[DEBUG] Received data: user_id='{user_id}', identifier='{identifier}', credits={credits}, reason='{reason}'")
-
-    # 如果前端只發送了 identifier，檢查是否為 user_id 格式
-    if not user_id and identifier:
-        # 檢查是否為 user_id 格式（以 g_ 或 u_ 開頭）
-        if identifier.startswith(('g_', 'u_', 'google_', 'web')):
-            user_id = identifier
-            identifier = ""
-    
-    if not identifier and not user_id:
-        return JSONResponse(status_code=400, content={"error": "missing_fields", "message": "請提供用戶ID或email"})
-    
-    if credits <= 0:
-        return JSONResponse(status_code=400, content={"error": "invalid_credits", "message": "充值點數必須大於0"})
-
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    try:
-        # 查找用戶 - 先查 users_auth，再查 users
-        if user_id:
-            print(f"[DEBUG] Looking up user by user_id: {user_id}")
-            # 直接使用user_id查找
-            row = conn.execute(
-                "SELECT user_id, username, email FROM users_auth WHERE user_id = ?",
-                (user_id,)
-            ).fetchone()
-            print(f"[DEBUG] Found in users_auth: {row}")
+            existing = cursor.fetchone()
             
-            # 如果在 users_auth 中找不到，嘗試在 users 表中查找
-            if not row:
-                row = conn.execute(
-                    "SELECT user_id, name as username, email FROM users WHERE user_id = ?",
-                    (user_id,)
-                ).fetchone()
-                print(f"[DEBUG] Found in users: {row}")
+            if existing:
+                # 更新現有偏好，增加信心分數
+                new_confidence = min(existing[1] + 0.1, 1.0)
+                if use_postgresql:
+                    cursor.execute("""
+                        UPDATE user_preferences 
+                        SET preference_value = %s, confidence_score = %s, updated_at = %s
+                        WHERE id = %s
+                    """, (pref_value, new_confidence, datetime.now(), existing[0]))
+                else:
+                    cursor.execute("""
+                        UPDATE user_preferences 
+                        SET preference_value = ?, confidence_score = ?, updated_at = ?
+                        WHERE id = ?
+                    """, (pref_value, new_confidence, datetime.now(), existing[0]))
+            else:
+                # 創建新偏好
+                if use_postgresql:
+                    cursor.execute("""
+                        INSERT INTO user_preferences (user_id, preference_type, preference_value, confidence_score)
+                        VALUES (%s, %s, %s, %s)
+                    """, (user_id, pref_type, pref_value, 0.5))
+                else:
+                    cursor.execute("""
+                        INSERT INTO user_preferences (user_id, preference_type, preference_value, confidence_score)
+                        VALUES (?, ?, ?, ?)
+                    """, (user_id, pref_type, pref_value, 0.5))
+        
+        # 記錄行為
+        if use_postgresql:
+            cursor.execute("""
+                INSERT INTO user_behaviors (user_id, behavior_type, behavior_data)
+                VALUES (%s, %s, %s)
+            """, (user_id, conversation_type, f"用戶輸入: {user_message[:100]}"))
         else:
-            print(f"[DEBUG] Looking up user by identifier: {identifier}")
-            # 使用identifier查找
-            row = conn.execute(
-                "SELECT user_id, username, email FROM users_auth WHERE username = ? OR email = ?",
-                (identifier, identifier)
-            ).fetchone()
-            print(f"[DEBUG] Found in users_auth: {row}")
-            
-            # 如果在 users_auth 中找不到，嘗試在 users 表中查找
-            if not row:
-                row = conn.execute(
-                    "SELECT user_id, name as username, email FROM users WHERE name = ? OR email = ?",
-                    (identifier, identifier)
-                ).fetchone()
-                print(f"[DEBUG] Found in users: {row}")
+            cursor.execute("""
+                INSERT INTO user_behaviors (user_id, behavior_type, behavior_data)
+                VALUES (?, ?, ?)
+            """, (user_id, conversation_type, f"用戶輸入: {user_message[:100]}"))
         
-        if not row:
-            print(f"[DEBUG] User not found in any table")
-            return JSONResponse(status_code=404, content={"error": "user_not_found", "message": "找不到指定的用戶"})
-
-        user_id = row["user_id"]
-        
-        # 獲取當前點數餘額
-        credit_row = conn.execute(
-            "SELECT balance FROM user_credits WHERE user_id = ?",
-            (user_id,)
-        ).fetchone()
-        
-        current_balance = credit_row["balance"] if credit_row else 0
-        new_balance = current_balance + credits
-
-        # 更新或插入點數記錄
-        conn.execute(
-            """INSERT INTO user_credits (user_id, balance, updated_at) 
-               VALUES (?, ?, CURRENT_TIMESTAMP) 
-               ON CONFLICT(user_id) DO UPDATE SET 
-               balance = ?, updated_at = CURRENT_TIMESTAMP""",
-            (user_id, new_balance, new_balance)
-        )
-
-        # 記錄訂單
-        conn.execute(
-            """INSERT INTO orders (user_id, order_type, amount, status, created_at) 
-               VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-            (user_id, "admin_credit", credits, "completed")
-        )
-
-        # 稽核記錄
-        try:
-            _tok = req.headers.get("x-admin-token") or req.query_params.get("token") or ""
-            admin_hash = hashlib.sha256(_tok.encode("utf-8")).hexdigest() if _tok else None
-            conn.execute(
-                "INSERT INTO admin_audit_logs (action, admin_token_hash, target_user_id, details) VALUES (?, ?, ?, ?)",
-                ("add_credits", admin_hash, user_id, json.dumps({
-                    "username": row["username"], 
-                    "email": row["email"],
-                    "credits_added": credits,
-                    "old_balance": current_balance,
-                    "new_balance": new_balance,
-                    "reason": reason
-                }, ensure_ascii=False))
-            )
-        except Exception as _e:
-            print("[audit] write failed:", _e)
-        
-        conn.commit(); conn.close()
-        return {
-            "ok": True, 
-            "user_id": user_id,
-            "credits_added": credits,
-            "old_balance": current_balance,
-            "new_balance": new_balance
-        }
-
-    except Exception as e:
+        if not use_postgresql:
+            conn.commit()
         conn.close()
-        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
+        
+    except Exception as e:
+        print(f"追蹤用戶偏好時出錯: {e}")
 
-@app.get("/admin/user/{user_id}/credits")
-async def admin_get_user_credits(user_id: str, req: Request):
-    """查看用戶點數餘額"""
-    if not _check_admin(req):
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
+def extract_user_preferences(user_message: str, ai_response: str, conversation_type: str) -> dict:
+    """提取用戶偏好"""
+    preferences = {}
+    text = user_message.lower()
     
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    try:
-        # 獲取用戶信息
-        user_row = conn.execute(
-            "SELECT user_id, username, email FROM users_auth WHERE user_id = ?",
-            (user_id,)
-        ).fetchone()
-        
-        if not user_row:
-            return JSONResponse(status_code=404, content={"error": "user_not_found"})
-
-        # 獲取點數餘額
-        credit_row = conn.execute(
-            "SELECT balance, updated_at FROM user_credits WHERE user_id = ?",
-            (user_id,)
-        ).fetchone()
-        
-        # 獲取訂單記錄
-        orders = conn.execute(
-            "SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 20",
-            (user_id,)
-        ).fetchall()
-        
-        conn.close()
-        
-        return {
-            "user_id": user_id,
-            "username": user_row["username"],
-            "email": user_row["email"],
-            "balance": credit_row["balance"] if credit_row else 0,
-            "updated_at": credit_row["updated_at"] if credit_row else None,
-            "orders": [dict(o) for o in orders]
-        }
-
-    except Exception as e:
-        conn.close()
-        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
-
-@app.get("/admin/user/credit_details/{user_id}")
-async def admin_get_user_credit_details(user_id: str, req: Request):
-    """獲取用戶點數詳情和交易記錄"""
-    if not _check_admin(req):
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    try:
-        # 獲取用戶信息
-        user_row = conn.execute(
-            "SELECT user_id, username, email FROM users_auth WHERE user_id = ?",
-            (user_id,)
-        ).fetchone()
-        
-        if not user_row:
-            return JSONResponse(status_code=404, content={"error": "user_not_found"})
-
-        # 獲取點數餘額
-        credit_row = conn.execute(
-            "SELECT balance, updated_at FROM user_credits WHERE user_id = ?",
-            (user_id,)
-        ).fetchone()
-        
-        balance = credit_row["balance"] if credit_row else 0
-        
-        # 獲取交易記錄
-        transactions = conn.execute("""
-            SELECT 
-                created_at,
-                type,
-                module,
-                points,
-                balance_after,
-                description,
-                reason
-            FROM credit_transactions 
-            WHERE user_id = ? 
-            ORDER BY created_at DESC 
-            LIMIT 100
-        """, (user_id,)).fetchall()
-        
-        # 計算總充值和總消費
-        stats = conn.execute("""
-            SELECT 
-                SUM(CASE WHEN type = 'charge' THEN points ELSE 0 END) as total_charged,
-                SUM(CASE WHEN type = 'consume' THEN points ELSE 0 END) as total_consumed
-            FROM credit_transactions 
-            WHERE user_id = ?
-        """, (user_id,)).fetchone()
-        
-        total_charged = stats["total_charged"] or 0
-        total_consumed = stats["total_consumed"] or 0
-        
-        conn.close()
-        
-        return {
-            "user_id": user_id,
-            "username": user_row["username"],
-            "email": user_row["email"],
-            "balance": balance,
-            "total_charged": total_charged,
-            "total_consumed": total_consumed,
-            "transactions": [dict(t) for t in transactions]
-        }
-        
-    except Exception as e:
-        conn.close()
-        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
-
-@app.get("/api/plans")
-async def get_subscription_plans():
-    """獲取訂閱方案列表"""
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    try:
-        plans = conn.execute(
-            "SELECT * FROM subscription_plans WHERE is_active = 1 ORDER BY price ASC"
-        ).fetchall()
-        conn.close()
-        return {"plans": [dict(p) for p in plans]}
-    except Exception as e:
-        conn.close()
-        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
-
-@app.post("/api/purchase")
-async def purchase_plan(req: Request):
-    """購買訂閱方案"""
-    try:
-        data = await req.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"error": "invalid_json"})
-    
-    user_id = (data.get("user_id") or "").strip()
-    plan_id = data.get("plan_id")
-    payment_method = (data.get("payment_method") or "manual").strip()
-    
-    if not user_id or not plan_id:
-        return JSONResponse(status_code=400, content={"error": "missing_fields"})
-    
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    try:
-        # 獲取方案信息
-        plan = conn.execute(
-            "SELECT * FROM subscription_plans WHERE id = ? AND is_active = 1",
-            (plan_id,)
-        ).fetchone()
-        
-        if not plan:
-            return JSONResponse(status_code=404, content={"error": "plan_not_found"})
-        
-        # 創建訂單
-        order_id = conn.execute(
-            """INSERT INTO orders (user_id, order_type, amount, plan, status, payment_method, created_at, paid_at) 
-               VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
-            (user_id, "subscription", plan["credits"], plan["name"], "paid", payment_method)
-        ).lastrowid
-        
-        # 充值點數
-        credit_row = conn.execute(
-            "SELECT balance FROM user_credits WHERE user_id = ?",
-            (user_id,)
-        ).fetchone()
-        
-        current_balance = credit_row["balance"] if credit_row else 0
-        new_balance = current_balance + plan["credits"]
-        
-        conn.execute(
-            """INSERT INTO user_credits (user_id, balance, updated_at) 
-               VALUES (?, ?, CURRENT_TIMESTAMP) 
-               ON CONFLICT(user_id) DO UPDATE SET 
-               balance = ?, updated_at = CURRENT_TIMESTAMP""",
-            (user_id, new_balance, new_balance)
-        )
-        
-        # 記錄訂閱
-        conn.execute(
-            """INSERT INTO user_subscriptions (user_id, plan_id, status, start_date, end_date) 
-               VALUES (?, ?, ?, CURRENT_TIMESTAMP, datetime('now', '+{} days'))""",
-            (user_id, plan_id, "active", plan["duration_days"])
-        )
-        
-        conn.commit(); conn.close()
-        
-        return {
-            "ok": True,
-            "order_id": order_id,
-            "plan_name": plan["name"],
-            "credits_added": plan["credits"],
-            "new_balance": new_balance
-        }
-        
-    except Exception as e:
-        conn.close()
-        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
-
-@app.get("/admin/requests_full")
-async def admin_requests_full(req: Request, limit: int = 200, user_id: str | None = None, mode: str | None = None, date_from: str | None = None, date_to: str | None = None):
-    if not _check_admin(req):
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    try:
-        limit = int(limit)
-    except Exception:
-        limit = 200
-    limit = max(1, min(limit, 2000))
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    conditions = []
-    params = []
-    if user_id:
-        conditions.append("user_id = ?"); params.append(user_id)
-    if mode:
-        conditions.append("mode = ?"); params.append(mode)
-    if date_from:
-        conditions.append("date(created_at) >= date(?)"); params.append(date_from)
-    if date_to:
-        conditions.append("date(created_at) <= date(?)"); params.append(date_to)
-    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-    rows = conn.execute(
-        f"SELECT id, created_at, user_id, mode, user_input, response_json FROM requests {where} ORDER BY id DESC LIMIT {limit}",
-        params,
-    ).fetchall()
-    conn.close()
-    return {"items": [dict(r) for r in rows]}
-
-@app.get("/admin/messages")
-async def admin_messages(req: Request, user_id: str | None = None, session_id: str | None = None, limit: int = 200):
-    if not _check_admin(req):
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    try:
-        limit = int(limit)
-    except Exception:
-        limit = 200
-    limit = max(1, min(limit, 2000))
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    try:
-        conditions = []
-        params = []
-        if user_id:
-            conditions.append("s.user_id = ?"); params.append(user_id)
-        if session_id:
-            conditions.append("m.session_id = ?"); params.append(session_id)
-        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-        rows = conn.execute(
-            f"""
-            SELECT m.id, m.session_id, s.user_id, s.agent_type, m.role, m.content, m.timestamp
-            FROM messages m
-            LEFT JOIN sessions s ON s.session_id = m.session_id
-            {where}
-            ORDER BY m.id DESC
-            LIMIT {limit}
-            """,
-            params,
-        ).fetchall()
-        conn.close()
-        return {"items": [dict(r) for r in rows]}
-    except Exception as e:
-        try: conn.close()
-        except Exception: pass
-        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
-
-@app.get("/admin/analytics")
-async def admin_analytics(req: Request):
-    if not _check_admin(req):
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    conn = get_conn(); conn.row_factory = sqlite3.Row
-    try:
-        total_users = conn.execute("SELECT COUNT(1) AS c FROM users").fetchone()["c"]
-        total_requests = conn.execute("SELECT COUNT(1) AS c FROM requests").fetchone()["c"]
-        # 今日請求
-        today = conn.execute("SELECT COUNT(1) AS c FROM requests WHERE date(created_at) = date('now','localtime')").fetchone()["c"]
-        # 近7日
-        last7 = conn.execute(
-            """
-            SELECT strftime('%Y-%m-%d', created_at) AS d, COUNT(1) AS c
-            FROM requests
-            WHERE date(created_at) >= date('now','localtime','-6 day')
-            GROUP BY d ORDER BY d ASC
-            """
-        ).fetchall()
-        last7d = [{"date": r["d"], "count": r["c"]} for r in last7]
-        # 模式分佈
-        by_mode_rows = conn.execute("SELECT COALESCE(mode,'') AS mode, COUNT(1) AS c FROM requests GROUP BY COALESCE(mode,'')").fetchall()
-        by_mode = { (r["mode"] or ""): r["c"] for r in by_mode_rows }
-        # agent 分佈（sessions）
-        by_agent_rows = conn.execute("SELECT agent_type, COUNT(1) AS c FROM sessions GROUP BY agent_type").fetchall()
-        by_agent = { r["agent_type"]: r["c"] for r in by_agent_rows }
-        # 近7日 agent 使用次數（依 sessions.created_at）
-        agent_daily_rows = conn.execute(
-            """
-            SELECT strftime('%Y-%m-%d', created_at) AS d, agent_type, COUNT(1) AS c
-            FROM sessions
-            WHERE date(created_at) >= date('now','localtime','-6 day')
-            GROUP BY d, agent_type
-            ORDER BY d ASC
-            """
-        ).fetchall()
-        agent_daily = {}
-        for r in agent_daily_rows:
-            agent_daily.setdefault(r["d"], {})[r["agent_type"]] = r["c"]
-        # 訊息總數/今日
-        total_messages = conn.execute("SELECT COUNT(1) AS c FROM messages").fetchone()["c"]
-        today_messages = conn.execute("SELECT COUNT(1) AS c FROM messages WHERE date(timestamp) = date('now','localtime')").fetchone()["c"]
-        conn.close()
-        return {
-            "total_users": total_users,
-            "total_requests": total_requests,
-            "today_requests": today,
-            "last7d": last7d,
-            "by_mode": by_mode,
-            "by_agent": by_agent,
-            "total_messages": total_messages,
-            "today_messages": today_messages,
-            "agent_daily": agent_daily,
-        }
-    except Exception as e:
-        try: conn.close()
-        except Exception: pass
-        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
-
-@app.get("/admin", response_class=HTMLResponse)
-async def admin_page(admin_session: str | None = Cookie(default=None)):
-    if not (admin_session and verify_admin_session_cookie(admin_session)):
-        # 簡易登入頁
-        return HTMLResponse(content="""
-<!DOCTYPE html>
-<html lang=\"zh-Hant\"><head><meta charset=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/><title>AIJob 管理登入</title>
-<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,'Noto Sans TC',sans-serif;margin:40px;color:#111;background:#f6f7fb}
-.card{max-width:360px;margin:0 auto;border:1px solid #e5e7eb;border-radius:12px;background:#fff;padding:16px}
-input,button{width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:8px;margin-top:10px}
-button{background:#111;color:#fff}
-.muted{color:#6b7280;font-size:12px;margin-top:8px}
-</style></head><body>
-<div class=\"card\"><h2>AIJob 管理登入</h2>
-<input id=\"u\" placeholder=\"帳號\"><input id=\"p\" placeholder=\"密碼\" type=\"password\">
-<button onclick=\"login()\">登入</button>
-<div class=\"muted\">僅限管理者使用。登入後將建立安全的管理 Session。</div></div>
-<script>
-async function login(){
-  const r = await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.getElementById('u').value,password:document.getElementById('p').value})});
-  const j = await r.json(); if(j&&j.ok){ location.href='/admin'; } else { alert(j.message||'登入失敗'); }
-}
-</script></body></html>
-""", status_code=200)
-    
-    # 讀取 admin.html 檔案
-    try:
-        # 在 Docker 容器中，admin 資料夾在 /app/admin/
-        admin_html_path = '/app/admin/admin.html'
-        with open(admin_html_path, 'r', encoding='utf-8') as f:
-            admin_html_content = f.read()
-        return HTMLResponse(content=admin_html_content)
-    except Exception as e:
-        # 如果檔案讀取失敗，返回錯誤頁面
-        return HTMLResponse(content=f"""
-<!DOCTYPE html>
-<html lang=\"zh-Hant\">
-<head><meta charset=\"utf-8\"/><title>管理後台錯誤</title></head>
-<body>
-<h1>管理後台載入錯誤</h1>
-<p>無法載入管理後台檔案: {str(e)}</p>
-<p>請檢查 admin.html 檔案是否存在於正確位置。</p>
-</body>
-</html>
-""", status_code=500)
-
-# === Admin Login/Logout ===
-@app.post("/admin/login")
-async def admin_login(req: Request):
-    try:
-        data = await req.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"error": "bad_request"})
-    username = (data.get("username") or "").strip()
-    password = (data.get("password") or "").strip()
-    if not ADMIN_USER or not ADMIN_PASSWORD:
-        return JSONResponse(status_code=500, content={"error": "admin_not_configured", "message": "尚未設定 ADMIN_USER/ADMIN_PASSWORD"})
-    if username != ADMIN_USER or password != ADMIN_PASSWORD:
-        return JSONResponse(status_code=401, content={"error": "invalid_credentials", "message": "帳號或密碼錯誤"})
-    token = create_admin_session_cookie(username)
-    resp = JSONResponse({"ok": True})
-    # Cookie 屬性：HttpOnly+Secure+SameSite=None，存活 5 小時
-    resp.set_cookie("admin_session", token, httponly=True, secure=True, samesite="none", max_age=5*3600)
-    return resp
-
-@app.post("/admin/logout")
-async def admin_logout():
-    resp = JSONResponse({"ok": True})
-    resp.delete_cookie("admin_session")
-    return resp
-
-@app.get("/admin/healthz")
-async def admin_healthz(req: Request):
-    has_session = False
-    try:
-        c = req.cookies.get("admin_session")
-        has_session = bool(c and verify_admin_session_cookie(c))
-    except Exception:
-        has_session = False
-    return {
-        "ok": True,
-        "admin_ready": bool(ADMIN_USER and ADMIN_PASSWORD),
-        "oauth_ready": bool('_OAUTH_READY' in globals() and _OAUTH_READY),
-        "has_admin_session": has_session,
-    }
-
-# ========= 三智能體 API 端點 =========
-# 統一聊天端點（自然對談 + KB + 記憶 + 人設）
-AGENT_PERSONAS = {
-    "positioning": (
-        "你是專業的短影音定位顧問。所有回覆必須優先結合已知知識庫(KB)與用戶檔案，避免空泛內容。"
-        "與用戶對談請採『少量輸出 + 反問引導』的節奏，一次只推進 1~2 個重點，"
-        "並聚焦在：業務類型定位、目標受眾、品牌形象定位、平台策略建議、內容目標設定、發文頻率。"
-        "回覆須具體、可執行、含金量高。"
-    ),
-    "topics": (
-        "你是專業的爆款短影音選題顧問。優先根據 KB 與用戶定位，提供可直接實作的選題建議，"
-        "避免大眾化冗長清單，必要時反問 1 個關鍵條件再給 3~5 條具體選題。"
-    ),
-    "script": (
-        "你是專業的短影音腳本寫手。優先根據 KB 與用戶檔案產出可拍攝的分段腳本，"
-        "不足時先以 1~2 句反問補足關鍵條件再生成，保持精煉、可落地。"
-    ),
-}
-
-def _mem_agent_key(agent_type: str) -> str:
-    if agent_type == "positioning":
-        return "positioning"
-    if agent_type == "topics":
-        return "topic_selection"
-    return "script_copy"
-
-@app.post("/chat")
-async def chat(req: Request):
-    """統一聊天：自然對談，帶入用戶檔案/記憶/知識庫。"""
-    try:
-        data = await req.json()
-    except Exception:
-        raise HTTPException(status_code=422, detail="invalid_json")
-
-    user_id = (data.get("user_id") or "").strip()
-    agent_type = (data.get("agent_type") or "script").strip()
-    messages = data.get("messages") or []
-    template_type = (data.get("template_type") or "").strip().upper() or None
-    duration = data.get("duration")
-
-    if not user_id:
-        raise HTTPException(status_code=400, detail="user_id is required")
-
-    # 確保用戶存在
-    create_or_get_user(user_id)
-
-    # 讀取檔案與記憶
-    user_profile = get_user_profile(user_id)
-    memories_all = get_user_memories(user_id, agent_type=_mem_agent_key(agent_type), limit=20)
-
-    # 建會話
-    session_id = data.get("session_id") or create_session(user_id, agent_type)
-
-    # 將最近一則 user 訊息加入訊息表
-    last_user = ""
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            last_user = (m.get("content") or "").strip()
+    # 平台偏好
+    platforms = ["抖音", "tiktok", "instagram", "youtube", "小紅書", "快手"]
+    for platform in platforms:
+        if platform in text:
+            preferences["preferred_platform"] = platform
             break
-    if last_user:
-        add_message(session_id, "user", last_user)
+    
+    # 內容類型偏好
+    content_types = ["美食", "旅遊", "時尚", "科技", "教育", "娛樂", "生活", "健身"]
+    for content_type in content_types:
+        if content_type in text:
+            preferences["preferred_content_type"] = content_type
+            break
+    
+    # 風格偏好
+    if "搞笑" in text or "幽默" in text:
+        preferences["preferred_style"] = "搞笑幽默"
+    elif "專業" in text or "教學" in text:
+        preferences["preferred_style"] = "專業教學"
+    elif "情感" in text or "溫馨" in text:
+        preferences["preferred_style"] = "情感溫馨"
+    
+    # 時長偏好
+    if "30秒" in text or "30s" in text:
+        preferences["preferred_duration"] = "30秒"
+    elif "60秒" in text or "60s" in text:
+        preferences["preferred_duration"] = "60秒"
+    elif "15秒" in text or "15s" in text:
+        preferences["preferred_duration"] = "15秒"
+    
+    return preferences
 
-    # 人設與 KB ground
-    persona = AGENT_PERSONAS.get(agent_type, AGENT_PERSONAS["script"])
-    kb_ctx = retrieve_context(last_user) if last_user else ""
-    kb_all = (EXTRA_KB or "").strip()
-
-    # 可選：把模板/時長附加到上下文
-    script_hint = ""
-    if agent_type == "script":
-        if template_type:
-            script_hint += f"\n【指定模板】{template_type}"
-        if duration:
-            try:
-                script_hint += f"\n【指定時長】{int(duration)} 秒"
-            except Exception:
-                pass
-
-    system_ctx = (
-        f"{persona}\n請以自然中文對談，不用制式清單。若能從知識庫或用戶檔案得到答案，請優先結合。\n\n"
-        f"【重要格式要求】\n"
-        f"• 使用emoji作為分點符號，讓內容更易讀；每次最多 5~8 行\n"
-        f"• 優先給出可執行建議，若條件不足先反問 1~2 個關鍵問題\n"
-        f"• 基於知識庫內容提供專業建議\n"
-        f"• 回應結構：📝 主要觀點 → 💡 具體建議 → ✨ 實作要點 → 🎯 行動指引\n\n"
-        f"【用戶檔案（若空代表未設定）】\n{json.dumps(user_profile or {}, ensure_ascii=False)}\n\n"
-        f"【相關記憶（節選）】\n" + "\n".join([f"- {m.get('content','')}" for m in memories_all[:5]]) + "\n\n"
-        f"【全域知識摘要（截斷）】\n{kb_all[:1200]}\n\n"
-        f"【KB動態擷取】\n{(kb_ctx or '')[:800]}\n" 
-        f"{script_hint}\n"
-    )
-
-    # 產生回覆
-    if use_gemini():
-        prompt = (
-            system_ctx + "\n---\n" + (last_user or "") + "\n\n請以對談形式回覆，避免重覆使用相同句型。使用emoji分段，讓內容更易讀。"
-        )
-        ai_response = gemini_generate_text(prompt)
+def generate_smart_summary(user_message: str, ai_response: str) -> str:
+    """生成智能對話摘要"""
+    # 提取關鍵信息
+    user_keywords = extract_keywords(user_message)
+    ai_keywords = extract_keywords(ai_response)
+    
+    # 判斷對話類型
+    conversation_type = classify_conversation(user_message, ai_response)
+    
+    # 生成摘要
+    if conversation_type == "account_positioning":
+        return f"帳號定位討論：{user_keywords} → {ai_keywords}"
+    elif conversation_type == "topic_selection":
+        return f"選題討論：{user_keywords} → {ai_keywords}"
+    elif conversation_type == "script_generation":
+        return f"腳本生成：{user_keywords} → {ai_keywords}"
+    elif conversation_type == "general_consultation":
+        return f"一般諮詢：{user_keywords} → {ai_keywords}"
     else:
-        # 無模型的自然回覆（較快）
-        if agent_type == "positioning":
-            ai_response = natural_fallback_positioning(last_user, user_profile, memories_all)
-        elif agent_type == "topics":
-            base = last_user or "請提供今日的選題靈感"
-            ai_response = (
-                "以下是依你的定位與近期洞察給的選題方向（可回我要哪個展開）：\n\n"
-                "1) 熱點＋你產品的關聯切入\n"
-                "2) 受眾常見痛點的快速解法\n"
-                "3) 使用前/後對比案例\n"
-                "4) 30 秒微教學 + 行動呼籲\n"
-                "5) 迷你訪談/QA 回覆留言\n\n"
-                f"你剛提到：{base[:80]}… 我建議先從 2) 或 4) 開始。"
-            )
-        else:  # script
-            ai_response = (
-                "了解，我會用自然口吻陪你討論腳本。先說明你的主題、平台與目標，我再給你第一版結構與開場。"
-            )
+        return f"對話：{user_message[:30]}... → {ai_response[:50]}..."
 
-    add_message(session_id, "assistant", ai_response)
+def extract_keywords(text: str) -> str:
+    """提取關鍵詞"""
+    # 簡單的關鍵詞提取
+    keywords = []
+    important_words = ["短影音", "腳本", "帳號", "定位", "選題", "平台", "內容", "創意", "爆款", "流量"]
+    
+    for word in important_words:
+        if word in text:
+            keywords.append(word)
+    
+    return "、".join(keywords[:3]) if keywords else "一般討論"
 
-    # 嘗試抽取並更新定位檔案（只針對定位）
-    if agent_type == "positioning":
-        try:
-            draft = {}
-            draft.update(extract_profile_fields(last_user))
-            draft.update(extract_profile_fields(ai_response))
-            draft = {k:v for k,v in draft.items() if v}
-            if draft:
-                update_user_profile(user_id, draft)
-                user_profile = get_user_profile(user_id)
-        except Exception as e:
-            print("[/chat] profile extract failed:", e)
+def classify_conversation(user_message: str, ai_response: str) -> str:
+    """分類對話類型"""
+    text = (user_message + " " + ai_response).lower()
+    
+    if any(word in text for word in ["帳號定位", "定位", "目標受眾", "受眾"]):
+        return "account_positioning"
+    elif any(word in text for word in ["選題", "主題", "熱點", "趨勢"]):
+        return "topic_selection"
+    elif any(word in text for word in ["腳本", "生成", "寫腳本", "製作腳本"]):
+        return "script_generation"
+    else:
+        return "general_consultation"
 
-    result_obj = {
-        "session_id": session_id,
-        "assistant_message": ai_response,
-        "user_profile": user_profile if agent_type == "positioning" else None,
-        "error": None
-    }
-    if agent_type == "positioning" and 'positioning_summary_text' in locals() and positioning_summary_text:
-        result_obj["positioning_summary"] = positioning_summary_text
-    return result_obj
-
-# === NEW: 流式聊天端點 ===
-from fastapi import BackgroundTasks
-
-@app.post("/chat_stream")
-async def chat_stream(req: Request):
-    try:
-        data = await req.json()
-    except Exception:
-        raise HTTPException(status_code=422, detail="invalid_json")
-
-    user_id = (data.get("user_id") or "").strip() or get_anon_user_id(req)
-    agent_type = (data.get("agent_type") or "script").strip()
-    messages = data.get("messages") or []
-    template_type = (data.get("template_type") or "").strip().upper() or None
-    duration = data.get("duration")
-
+def get_user_memory(user_id: Optional[str]) -> str:
+    """獲取用戶的增強長期記憶和個人化資訊"""
     if not user_id:
-        raise HTTPException(status_code=400, detail="user_id is required")
+        return ""
 
-    create_or_get_user(user_id)
-    user_profile = get_user_profile(user_id)
-    memories_all = get_user_memories(user_id, agent_type=_mem_agent_key(agent_type), limit=20)
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        database_url = os.getenv("DATABASE_URL")
+        use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
 
-    session_id = data.get("session_id") or create_session(user_id, agent_type)
+        # 獲取用戶基本資料
+        if use_postgresql:
+            cursor.execute("SELECT * FROM user_profiles WHERE user_id = %s", (user_id,))
+        else:
+            cursor.execute("SELECT * FROM user_profiles WHERE user_id = ?", (user_id,))
+        profile = cursor.fetchone()
 
-    last_user = ""
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            last_user = (m.get("content") or "").strip()
-            break
-    if last_user:
-        add_message(session_id, "user", last_user)
+        # 獲取用戶偏好
+        if use_postgresql:
+            cursor.execute("""
+                SELECT preference_type, preference_value, confidence_score 
+                FROM user_preferences 
+                WHERE user_id = %s AND confidence_score > 0.3
+                ORDER BY confidence_score DESC
+            """, (user_id,))
+        else:
+            cursor.execute("""
+                SELECT preference_type, preference_value, confidence_score 
+                FROM user_preferences 
+                WHERE user_id = ? AND confidence_score > 0.3
+                ORDER BY confidence_score DESC
+            """, (user_id,))
+        preferences = cursor.fetchall()
 
-    persona = AGENT_PERSONAS.get(agent_type, AGENT_PERSONAS["script"])
-    kb_ctx = retrieve_context(last_user) if last_user else ""
-    kb_all = (EXTRA_KB or "").strip()
-    script_hint = ""
-    if agent_type == "script":
-        if template_type:
-            script_hint += f"\n【指定模板】{template_type}"
-        if duration:
-            try:
-                script_hint += f"\n【指定時長】{int(duration)} 秒"
-            except Exception:
-                pass
+        # 獲取最近的對話摘要（按類型分組）
+        if use_postgresql:
+            cursor.execute("""
+                SELECT conversation_type, summary, created_at 
+                FROM conversation_summaries
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                LIMIT 10
+            """, (user_id,))
+        else:
+            cursor.execute("""
+                SELECT conversation_type, summary, created_at 
+                FROM conversation_summaries
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                LIMIT 10
+            """, (user_id,))
+        summaries = cursor.fetchall()
 
-    system_ctx = (
-        f"{persona}\n請以自然中文對談，不用制式清單。若能從知識庫或用戶檔案得到答案，請優先結合。\n" 
-        f"【用戶檔案（若空代表未設定）】\n{json.dumps(user_profile or {}, ensure_ascii=False)}\n\n"
-        f"【相關記憶（節選）】\n" + "\n".join([f"- {m.get('content','')}" for m in memories_all[:5]]) + "\n\n"
-        f"【全域知識摘要（截斷）】\n{kb_all[:1200]}\n\n"
-        f"【KB動態擷取】\n{(kb_ctx or '')[:800]}\n" 
-        f"{script_hint}\n"
+        # 獲取最近的生成記錄
+        if use_postgresql:
+            cursor.execute("""
+                SELECT platform, topic, content, created_at FROM generations
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                LIMIT 5
+            """, (user_id,))
+        else:
+            cursor.execute("""
+                SELECT platform, topic, content, created_at FROM generations
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                LIMIT 5
+            """, (user_id,))
+        generations = cursor.fetchall()
+
+        # 獲取用戶行為統計
+        if use_postgresql:
+            cursor.execute("""
+                SELECT behavior_type, COUNT(*) as count
+                FROM user_behaviors
+                WHERE user_id = %s
+                GROUP BY behavior_type
+                ORDER BY count DESC
+            """, (user_id,))
+        else:
+            cursor.execute("""
+                SELECT behavior_type, COUNT(*) as count
+                FROM user_behaviors
+                WHERE user_id = ?
+                GROUP BY behavior_type
+                ORDER BY count DESC
+            """, (user_id,))
+        behaviors = cursor.fetchall()
+
+        conn.close()
+
+        # 構建增強記憶內容
+        memory_parts = []
+
+        # 用戶基本資料
+        if profile:
+            memory_parts.append(f"用戶基本資料：{profile[2] if len(profile) > 2 else '無'}")
+
+        # 用戶偏好
+        if preferences:
+            memory_parts.append("用戶偏好分析：")
+            for pref_type, pref_value, confidence in preferences:
+                confidence_text = "高" if confidence > 0.7 else "中" if confidence > 0.4 else "低"
+                memory_parts.append(f"- {pref_type}：{pref_value} (信心度：{confidence_text})")
+
+        # 對話摘要（按類型分組）
+        if summaries:
+            memory_parts.append("最近對話記錄：")
+            current_type = None
+            for conv_type, summary, created_at in summaries:
+                if conv_type != current_type:
+                    type_name = {
+                        "account_positioning": "帳號定位討論",
+                        "topic_selection": "選題討論", 
+                        "script_generation": "腳本生成",
+                        "general_consultation": "一般諮詢"
+                    }.get(conv_type, "其他討論")
+                    memory_parts.append(f"  {type_name}：")
+                    current_type = conv_type
+                memory_parts.append(f"    - {summary}")
+
+        # 生成記錄
+        if generations:
+            memory_parts.append("最近生成內容：")
+            for gen in generations:
+                memory_parts.append(f"- 平台：{gen[0]}, 主題：{gen[1]}, 時間：{gen[3]}")
+
+        # 行為統計
+        if behaviors:
+            memory_parts.append("用戶行為統計：")
+            for behavior_type, count in behaviors:
+                type_name = {
+                    "account_positioning": "帳號定位",
+                    "topic_selection": "選題討論",
+                    "script_generation": "腳本生成",
+                    "general_consultation": "一般諮詢"
+                }.get(behavior_type, behavior_type)
+                memory_parts.append(f"- {type_name}：{count}次")
+
+        return "\n".join(memory_parts) if memory_parts else ""
+
+    except Exception as e:
+        print(f"獲取用戶記憶時出錯: {e}")
+        return ""
+
+def build_system_prompt(kb_text: str, platform: Optional[str], profile: Optional[str], topic: Optional[str], style: Optional[str], duration: Optional[str], user_id: Optional[str] = None) -> str:
+    # 檢查用戶是否真的設定了參數（不是預設值）
+    platform_line = f"平台：{platform}" if platform else "平台：未設定"
+    profile_line = f"帳號定位：{profile}" if profile else "帳號定位：未設定"
+    topic_line = f"主題：{topic}" if topic else "主題：未設定"
+    duration_line = f"腳本時長：{duration}秒" if duration else "腳本時長：未設定"
+    # 獲取用戶記憶
+    user_memory = get_user_memory(user_id)
+    memory_header = "用戶記憶與個人化資訊：\n" if user_memory else ""
+    kb_header = "短影音知識庫（節錄）：\n" if kb_text else ""
+    rules = (
+        "你是AIJob短影音顧問，專業協助用戶創作短影音內容。\n"
+        "回答要口語化、簡潔有力，避免冗長問卷。\n"
+        "優先依據知識庫回答，超出範圍可補充一般經驗並標示『[一般經驗]』。\n"
+        "\n"
+        "⚠️ 核心原則：\n"
+        "1. 檢查對話歷史：用戶已經說過什麼？已經回答過什麼問題？\n"
+        "2. 基於已有信息：如果用戶已經提供了受眾、產品、目標等信息，直接基於這些信息給建議，不要再問！\n"
+        "3. 推進對話：每次回應都要讓對話往前進展，不要原地打轉或重複問題\n"
+        "4. 記住流程位置：清楚知道現在是在帳號定位、選題還是腳本生成階段\n"
+        "5. 避免問候語重複：如果不是對話開始，不要說「哈囉！很高興為您服務」之類的開場白\n"
+        "\n"
+        "專業顧問流程：\n"
+        "1. 帳號定位階段：\n"
+        "   - 收集：受眾是誰？產品/服務是什麼？目標是什麼？\n"
+        "   - 當用戶已經說明這些，直接給出定位建議，不要再追問細節！\n"
+        "   - 定位建議應包含：目標受眾分析、內容方向、風格調性\n"
+        "\n"
+        "2. 選題策略階段：\n"
+        "   - 基於已確定的定位，推薦3-5個具體選題方向\n"
+        "   - 不要再問定位相關問題\n"
+        "\n"
+        "3. 腳本生成階段：\n"
+        "   - 只有在用戶明確要求時，才提供完整腳本\n"
+        "\n"
+        "對話記憶檢查清單：\n"
+        "✅ 用戶是否已經說明受眾？→ 如果有，不要再問！\n"
+        "✅ 用戶是否已經說明產品/目標？→ 如果有，不要再問！\n"
+        "✅ 現在是對話開始還是中間？→ 如果是中間，不要用開場問候語！\n"
+        "✅ 我已經收集到足夠信息了嗎？→ 如果有，給出具體建議，不要拖延！\n"
+        "\n"
+        "內容格式：\n"
+        "• 使用數字標示（1. 2. 3.）或列點（•）組織內容\n"
+        "• 用 emoji 分段強調（🚀 💡 ✅ 📌）\n"
+        "• 絕對禁止使用 * 或 ** 等 Markdown 格式符號\n"
+        "• 每段用換行分隔，保持清晰易讀\n"
+        "• 所有內容都必須是純文字格式，沒有任何程式碼符號\n"
+        "\n"
+        "腳本結構：盡量對齊 Hook → Value → CTA 結構；Value 不超過三點，CTA 給一個明確動作。\n"
+        "完整腳本應包含：\n"
+        "1. 主題標題\n"
+        "2. 腳本內容（只包含台詞、秒數、CTA，不包含畫面描述）\n"
+        "3. 畫面感（鏡頭、音效建議）\n"
+        "4. 發佈文案\n"
+    )
+    style_line = style or "格式要求：分段清楚，短句，每段換行，適度加入表情符號（如：✅✨🔥📌），避免口頭禪。使用數字標示（1. 2. 3.）或列點（•）來組織內容，不要使用 * 或 ** 等 Markdown 格式。"
+    return f"{platform_line}\n{profile_line}\n{topic_line}\n{duration_line}\n{style_line}\n\n{rules}\n{memory_header}{user_memory}\n{kb_header}{kb_text}"
+
+
+def create_app() -> FastAPI:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("WARNING: GEMINI_API_KEY not found in environment variables")
+        # Delay failure to request time but keep app creatable
+    else:
+        print(f"INFO: GEMINI_API_KEY found, length: {len(api_key)}")
+
+    genai.configure(api_key=api_key)
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    print(f"INFO: Using model: {model_name}")
+
+    # 初始化數據庫
+    db_path = init_database()
+    print(f"INFO: Database initialized at: {db_path}")
+
+    app = FastAPI()
+
+    # CORS for local file or dev servers
+    frontend_url = os.getenv("FRONTEND_URL")
+    cors_origins = [
+        "http://localhost:5173",   # 本地前端
+        "http://127.0.0.1:5173",  # 本地前端（備用）
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "https://aivideonew.zeabur.app",
+        "http://aivideonew.zeabur.app",
+        "https://reelmind.aijob.com.tw",
+        "http://reelmind.aijob.com.tw",
+        "https://backmanage.zeabur.app",
+        "http://backmanage.zeabur.app"
+    ]
+    
+    # 如果有設定前端 URL，加入 CORS 來源
+    if frontend_url:
+        cors_origins.append(frontend_url)
+    
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
-    # 取得最近對話以增強上下文連貫
-    def get_recent_messages(session_id: str, limit: int = 8):
+    kb_text_cache = load_kb_text()
+
+    @app.get("/")
+    async def root():
+        return {"message": "AI Video Backend is running"}
+    
+    @app.get("/api/debug/env")
+    async def debug_env():
+        """除錯環境變數"""
+        return {
+            "GOOGLE_CLIENT_ID": GOOGLE_CLIENT_ID,
+            "GOOGLE_CLIENT_SECRET": "***" if GOOGLE_CLIENT_SECRET else None,
+            "GOOGLE_REDIRECT_URI": GOOGLE_REDIRECT_URI,
+            "GEMINI_API_KEY": "***" if os.getenv("GEMINI_API_KEY") else None,
+            "GEMINI_MODEL": os.getenv("GEMINI_MODEL"),
+            "FRONTEND_URL": os.getenv("FRONTEND_URL")
+        }
+
+    @app.get("/api/health")
+    async def health() -> Dict[str, Any]:
         try:
-            conn = get_conn()
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
-                (session_id, limit),
-            ).fetchall()
-            conn.close()
-            return list(reversed([dict(r) for r in rows]))
-        except Exception:
-            return []
+            kb_status = "loaded" if kb_text_cache else "not_found"
+            gemini_configured = bool(os.getenv("GEMINI_API_KEY"))
+            
+            # 測試 Gemini API 連線（如果已配置）
+            gemini_test_result = "not_configured"
+            if gemini_configured:
+                try:
+                    model = genai.GenerativeModel(model_name)
+                    # 簡單測試呼叫
+                    response = model.generate_content("test", request_options={"timeout": 5})
+                    gemini_test_result = "working" if response else "failed"
+                except Exception as e:
+                    gemini_test_result = f"error: {str(e)}"
+            
+            return {
+                "status": "ok",
+                "kb_status": kb_status,
+                "gemini_configured": gemini_configured,
+                "gemini_test": gemini_test_result,
+                "model_name": model_name,
+                "timestamp": str(datetime.now())
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": str(e),
+                "timestamp": str(datetime.now())
+            }
 
-    recent_msgs = get_recent_messages(session_id, 8)
+    @app.post("/api/generate/positioning")
+    async def generate_positioning(body: ChatBody, request: Request):
+        """一鍵生成帳號定位"""
+        if not os.getenv("GEMINI_API_KEY"):
+            return JSONResponse({"error": "Missing GEMINI_API_KEY in .env"}, status_code=500)
 
-    async def gen():
-        # 簡易切片流：若有模型可逐段送出，否則一次送出自然回覆
-        if use_gemini():
-            convo = "\n".join([f"{m['role']}: {m['content']}" for m in recent_msgs])
-            full = gemini_generate_text(system_ctx + "\n---\n" + (convo or (last_user or "")))
+        # 專門的帳號定位提示詞
+        positioning_prompt = f"""
+你是AIJob短影音顧問，專門協助用戶進行帳號定位分析。
+
+基於以下信息進行專業的帳號定位分析：
+- 平台：{body.platform or '未設定'}
+- 主題：{body.topic or '未設定'}
+- 現有定位：{body.profile or '未設定'}
+
+請提供：
+1. 目標受眾分析
+2. 內容定位建議
+3. 風格調性建議
+4. 競爭優勢分析
+5. 具體執行建議
+
+格式要求：分段清楚，短句，每段換行，適度加入表情符號，避免口頭禪。絕對不要使用 ** 或任何 Markdown 格式符號。
+"""
+
+        try:
+            # 暫時使用原有的 stream_chat 端點
+            user_id = getattr(body, 'user_id', None)
+            system_text = build_system_prompt(kb_text_cache, body.platform, body.profile, body.topic, body.style, body.duration, user_id)
+            
+            user_history: List[Dict[str, Any]] = []
+            for m in body.history or []:
+                user_history.append({"role": m.get("role", "user"), "parts": [m.get("content", "")]})
+
+            model_obj = genai.GenerativeModel(
+                model_name=model_name,
+                system_instruction=system_text
+            )
+            chat = model_obj.start_chat(history=user_history)
+
+            async def generate():
+                try:
+                    stream_resp = chat.send_message(positioning_prompt, stream=True)
+                    for chunk in stream_resp:
+                        if chunk.text:
+                            yield f"data: {json.dumps({'type': 'token', 'content': chunk.text})}\n\n"
+                    
+                    # 保存對話摘要
+                    if user_id:
+                        save_conversation_summary(user_id, positioning_prompt, "".join([c.text for c in stream_resp]))
+                    
+                    yield f"data: {json.dumps({'type': 'end'})}\n\n"
+                except Exception as ex:
+                    yield f"data: {json.dumps({'type': 'error', 'content': str(ex)})}\n\n"
+
+            return StreamingResponse(generate(), media_type="text/plain")
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.post("/api/generate/topics")
+    async def generate_topics(body: ChatBody, request: Request):
+        """一鍵生成選題推薦"""
+        if not os.getenv("GEMINI_API_KEY"):
+            return JSONResponse({"error": "Missing GEMINI_API_KEY in .env"}, status_code=500)
+
+        # 專門的選題推薦提示詞
+        topics_prompt = f"""
+你是AIJob短影音顧問，專門協助用戶進行選題推薦。
+
+基於以下信息推薦熱門選題：
+- 平台：{body.platform or '未設定'}
+- 主題：{body.topic or '未設定'}
+- 帳號定位：{body.profile or '未設定'}
+
+請提供：
+1. 熱門選題方向（3-5個）
+2. 每個選題的具體建議
+3. 選題策略和技巧
+4. 內容規劃建議
+5. 執行時程建議
+
+格式要求：分段清楚，短句，每段換行，適度加入表情符號，避免口頭禪。絕對不要使用 ** 或任何 Markdown 格式符號。
+"""
+
+        try:
+            user_id = getattr(body, 'user_id', None)
+            system_text = build_system_prompt(kb_text_cache, body.platform, body.profile, body.topic, body.style, body.duration, user_id)
+            
+            user_history: List[Dict[str, Any]] = []
+            for m in body.history or []:
+                user_history.append({"role": m.get("role", "user"), "parts": [m.get("content", "")]})
+
+            model_obj = genai.GenerativeModel(
+                model_name=model_name,
+                system_instruction=system_text
+            )
+            chat = model_obj.start_chat(history=user_history)
+
+            async def generate():
+                try:
+                    stream_resp = chat.send_message(topics_prompt, stream=True)
+                    for chunk in stream_resp:
+                        if chunk.text:
+                            yield f"data: {json.dumps({'type': 'token', 'content': chunk.text})}\n\n"
+                    
+                    if user_id:
+                        save_conversation_summary(user_id, topics_prompt, "".join([c.text for c in stream_resp]))
+                    
+                    yield f"data: {json.dumps({'type': 'end'})}\n\n"
+                except Exception as ex:
+                    yield f"data: {json.dumps({'type': 'error', 'content': str(ex)})}\n\n"
+
+            return StreamingResponse(generate(), media_type="text/plain")
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.post("/api/generate/script")
+    async def generate_script(body: ChatBody, request: Request):
+        """一鍵生成腳本"""
+        if not os.getenv("GEMINI_API_KEY"):
+            return JSONResponse({"error": "Missing GEMINI_API_KEY in .env"}, status_code=500)
+
+        # 專門的腳本生成提示詞
+        script_prompt = f"""
+你是AIJob短影音顧問，專門協助用戶生成短影音腳本。
+
+基於以下信息生成完整腳本：
+- 平台：{body.platform or '未設定'}
+- 主題：{body.topic or '未設定'}
+- 帳號定位：{body.profile or '未設定'}
+- 時長：{body.duration or '30'}秒
+
+請生成包含以下結構的完整腳本：
+1. 主題標題
+2. Hook（開場鉤子）
+3. Value（核心價值內容）
+4. CTA（行動呼籲）
+5. 畫面感描述
+6. 發佈文案
+
+格式要求：分段清楚，短句，每段換行，適度加入表情符號，避免口頭禪。絕對不要使用 ** 或任何 Markdown 格式符號。
+"""
+
+        try:
+            user_id = getattr(body, 'user_id', None)
+            system_text = build_system_prompt(kb_text_cache, body.platform, body.profile, body.topic, body.style, body.duration, user_id)
+            
+            user_history: List[Dict[str, Any]] = []
+            for m in body.history or []:
+                user_history.append({"role": m.get("role", "user"), "parts": [m.get("content", "")]})
+
+            model_obj = genai.GenerativeModel(
+                model_name=model_name,
+                system_instruction=system_text
+            )
+            chat = model_obj.start_chat(history=user_history)
+
+            async def generate():
+                try:
+                    stream_resp = chat.send_message(script_prompt, stream=True)
+                    for chunk in stream_resp:
+                        if chunk.text:
+                            yield f"data: {json.dumps({'type': 'token', 'content': chunk.text})}\n\n"
+                    
+                    if user_id:
+                        save_conversation_summary(user_id, script_prompt, "".join([c.text for c in stream_resp]))
+                    
+                    yield f"data: {json.dumps({'type': 'end'})}\n\n"
+                except Exception as ex:
+                    yield f"data: {json.dumps({'type': 'error', 'content': str(ex)})}\n\n"
+
+            return StreamingResponse(generate(), media_type="text/plain")
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.post("/api/chat/stream")
+    async def stream_chat(body: ChatBody, request: Request):
+        if not os.getenv("GEMINI_API_KEY"):
+            return JSONResponse({"error": "Missing GEMINI_API_KEY in .env"}, status_code=500)
+
+        user_id = getattr(body, 'user_id', None)
+        
+        # === 整合記憶系統 ===
+        # 1. 載入短期記憶（STM）- 最近對話上下文
+        stm_context = ""
+        stm_history = []
+        if user_id:
+            stm_context = stm.get_context_for_prompt(user_id)
+            stm_history = stm.get_recent_turns_for_history(user_id, limit=5)
+        
+        # 2. 載入長期記憶（LTM）- 您現有的系統
+        ltm_memory = get_user_memory(user_id) if user_id else ""
+        
+        # 3. 組合增強版 prompt
+        system_text = build_enhanced_prompt(
+            kb_text=kb_text_cache,
+            stm_context=stm_context,
+            ltm_memory=ltm_memory,
+            platform=body.platform,
+            profile=body.profile,
+            topic=body.topic,
+            style=body.style,
+            duration=body.duration
+        )
+        
+        # 4. 合併前端傳來的 history 和 STM history
+        user_history: List[Dict[str, Any]] = []
+        
+        # 優先使用 STM 的歷史（更完整）
+        if stm_history:
+            user_history = stm_history
         else:
-            if agent_type == "positioning":
-                full = natural_fallback_positioning(last_user, user_profile, memories_all)
-            elif agent_type == "topics":
-                base = last_user or "請提供今日的選題靈感"
-                full = (
-                    "以下是依你的定位與近期洞察給的選題方向（可回我要哪個展開）：\n\n"
-                    "1) 熱點＋你產品的關聯切入\n"
-                    "2) 受眾常見痛點的快速解法\n"
-                    "3) 使用前/後對比案例\n"
-                    "4) 30 秒微教學 + 行動呼籲\n"
-                    "5) 迷你訪談/QA 回覆留言\n\n"
-                    f"你剛提到：{base[:80]}… 我建議先從 2) 或 4) 開始。"
+            # 如果沒有 STM，使用前端傳來的 history
+            for m in body.history or []:
+                if m.role == "user":
+                    user_history.append({"role": "user", "parts": [m.content]})
+                elif m.role in ("assistant", "model"):
+                    user_history.append({"role": "model", "parts": [m.content]})
+
+        model = genai.GenerativeModel(model_name)
+        chat = model.start_chat(history=[
+            {"role": "user", "parts": system_text},
+            *user_history,
+        ])
+
+        def sse_events() -> Iterable[str]:
+            yield f"data: {json.dumps({'type': 'start'})}\n\n"
+            ai_response = ""
+            try:
+                stream = chat.send_message(body.message, stream=True)
+                for chunk in stream:
+                    try:
+                        if chunk and getattr(chunk, "candidates", None):
+                            parts = chunk.candidates[0].content.parts
+                            if parts:
+                                token = parts[0].text
+                                if token:
+                                    ai_response += token
+                                    yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+                    except Exception:
+                        continue
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            finally:
+                # === 保存記憶 ===
+                if user_id and ai_response:
+                    # 1. 保存到短期記憶（STM）- 新增
+                    stm.add_turn(
+                        user_id=user_id,
+                        user_message=body.message,
+                        ai_response=ai_response,
+                        metadata={
+                            "platform": body.platform,
+                            "topic": body.topic,
+                            "profile": body.profile
+                        }
+                    )
+                    
+                    # 2. 保存到長期記憶（LTM）- 您原有的系統
+                    save_conversation_summary(user_id, body.message, ai_response)
+                
+                yield f"data: {json.dumps({'type': 'end'})}\n\n"
+
+        return StreamingResponse(sse_events(), media_type="text/event-stream")
+
+    # ===== 長期記憶功能 API =====
+    
+    @app.get("/api/user/memory/{user_id}")
+    async def get_user_memory_api(user_id: str):
+        """獲取用戶的長期記憶資訊"""
+        try:
+            memory = get_user_memory(user_id)
+            return {"user_id": user_id, "memory": memory}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.get("/api/user/conversations/{user_id}")
+    async def get_user_conversations(user_id: str):
+        """獲取用戶的對話記錄"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT id, conversation_type, summary, message_count, created_at FROM conversation_summaries 
+                    WHERE user_id = %s 
+                    ORDER BY created_at DESC 
+                    LIMIT 100
+                """, (user_id,))
+            else:
+                cursor.execute("""
+                    SELECT id, conversation_type, summary, message_count, created_at FROM conversation_summaries 
+                    WHERE user_id = ? 
+                    ORDER BY created_at DESC 
+                    LIMIT 100
+                """, (user_id,))
+            
+            conversations = cursor.fetchall()
+            
+            conn.close()
+            
+            result = []
+            for conv in conversations:
+                conv_type_map = {
+                    "account_positioning": "帳號定位",
+                    "topic_selection": "選題討論",
+                    "script_generation": "腳本生成",
+                    "general_consultation": "AI顧問",
+                    "ip_planning": "IP人設規劃"
+                }
+                result.append({
+                    "id": conv[0],
+                    "mode": conv_type_map.get(conv[1], conv[1]),
+                    "summary": conv[2] or "",
+                    "message_count": conv[3] or 0,
+                    "created_at": conv[4]
+                })
+            
+            return {
+                "user_id": user_id,
+                "conversations": result
+            }
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    # ===== 用戶歷史API端點 =====
+    
+    @app.get("/api/user/generations/{user_id}")
+    async def get_user_generations(user_id: str):
+        """獲取用戶的生成記錄"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT platform, topic, content, created_at FROM generations 
+                    WHERE user_id = %s 
+                    ORDER BY created_at DESC 
+                    LIMIT 10
+                """, (user_id,))
+            else:
+                cursor.execute("""
+                    SELECT platform, topic, content, created_at FROM generations 
+                    WHERE user_id = ? 
+                    ORDER BY created_at DESC 
+                    LIMIT 10
+                """, (user_id,))
+            generations = cursor.fetchall()
+            
+            conn.close()
+            
+            return {
+                "user_id": user_id,
+                "generations": [
+                    {
+                        "platform": gen[0], 
+                        "topic": gen[1], 
+                        "content": gen[2][:100] + "..." if len(gen[2]) > 100 else gen[2],
+                        "created_at": gen[3]
+                    } 
+                    for gen in generations
+                ]
+            }
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.get("/api/user/preferences/{user_id}")
+    async def get_user_preferences(user_id: str):
+        """獲取用戶的偏好設定"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT preference_type, preference_value, confidence_score, updated_at 
+                FROM user_preferences 
+                WHERE user_id = ? 
+                ORDER BY confidence_score DESC, updated_at DESC
+            """, (user_id,))
+            preferences = cursor.fetchall()
+            
+            conn.close()
+            
+            return {
+                "user_id": user_id,
+                "preferences": [
+                    {
+                        "type": pref[0],
+                        "value": pref[1],
+                        "confidence": pref[2],
+                        "updated_at": pref[3]
+                    } 
+                    for pref in preferences
+                ]
+            }
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    # ===== 短期記憶（STM）API =====
+    
+    @app.get("/api/user/stm/{user_id}")
+    async def get_user_stm(user_id: str):
+        """獲取用戶的短期記憶（當前會話記憶）"""
+        try:
+            memory = stm.load_memory(user_id)
+            return {
+                "user_id": user_id,
+                "stm": {
+                    "recent_turns": memory.get("recent_turns", []),
+                    "last_summary": memory.get("last_summary", ""),
+                    "turns_count": len(memory.get("recent_turns", [])),
+                    "updated_at": memory.get("updated_at", 0)
+                }
+            }
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.delete("/api/user/stm/{user_id}")
+    async def clear_user_stm(user_id: str):
+        """清除用戶的短期記憶"""
+        try:
+            stm.clear_memory(user_id)
+            return {"message": "短期記憶已清除", "user_id": user_id}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.get("/api/user/memory/full/{user_id}")
+    async def get_full_memory(user_id: str):
+        """獲取用戶的完整記憶（STM + LTM）"""
+        try:
+            # STM
+            stm_data = stm.load_memory(user_id)
+            
+            # LTM
+            ltm_data = get_user_memory(user_id)
+            
+            # 格式化顯示
+            memory_summary = format_memory_for_display({
+                "stm": stm_data,
+                "ltm": {"memory_text": ltm_data}
+            })
+            
+            return {
+                "user_id": user_id,
+                "stm": {
+                    "recent_turns_count": len(stm_data.get("recent_turns", [])),
+                    "has_summary": bool(stm_data.get("last_summary")),
+                    "updated_at": stm_data.get("updated_at", 0)
+                },
+                "ltm": {
+                    "memory_text": ltm_data[:200] + "..." if len(ltm_data) > 200 else ltm_data
+                },
+                "summary": memory_summary
+            }
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.post("/api/user/positioning/save")
+    async def save_positioning_record(request: Request):
+        """儲存帳號定位記錄"""
+        try:
+            data = await request.json()
+            user_id = data.get("user_id")
+            content = data.get("content")
+            
+            if not user_id or not content:
+                return JSONResponse({"error": "缺少必要參數"}, status_code=400)
+            
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            # 先檢查 user_profiles 是否存在該 user_id，若不存在則自動建立
+            if use_postgresql:
+                cursor.execute("SELECT user_id FROM user_profiles WHERE user_id = %s", (user_id,))
+            else:
+                cursor.execute("SELECT user_id FROM user_profiles WHERE user_id = ?", (user_id,))
+            profile_exists = cursor.fetchone()
+            
+            if not profile_exists:
+                # 自動建立 user_profiles 記錄
+                if use_postgresql:
+                    cursor.execute("""
+                        INSERT INTO user_profiles (user_id, created_at)
+                        VALUES (%s, CURRENT_TIMESTAMP)
+                        ON CONFLICT (user_id) DO NOTHING
+                    """, (user_id,))
+                else:
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO user_profiles (user_id, created_at)
+                        VALUES (?, CURRENT_TIMESTAMP)
+                    """, (user_id,))
+                conn.commit()
+            
+            # 獲取該用戶的記錄數量來生成編號
+            if use_postgresql:
+                cursor.execute("SELECT COUNT(*) FROM positioning_records WHERE user_id = %s", (user_id,))
+            else:
+                cursor.execute("SELECT COUNT(*) FROM positioning_records WHERE user_id = ?", (user_id,))
+            count = cursor.fetchone()[0]
+            record_number = f"{count + 1:02d}"
+            
+            # 插入記錄
+            if use_postgresql:
+                cursor.execute("""
+                    INSERT INTO positioning_records (user_id, record_number, content)
+                    VALUES (%s, %s, %s)
+                    RETURNING id
+                """, (user_id, record_number, content))
+                record_id = cursor.fetchone()[0]
+            else:
+                cursor.execute("""
+                    INSERT INTO positioning_records (user_id, record_number, content)
+                    VALUES (?, ?, ?)
+                """, (user_id, record_number, content))
+                conn.commit()
+                record_id = cursor.lastrowid
+            
+            conn.close()
+            
+            return {
+                "success": True,
+                "record_id": record_id,
+                "record_number": record_number
+            }
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.get("/api/user/positioning/{user_id}")
+    async def get_positioning_records(user_id: str):
+        """獲取用戶的所有帳號定位記錄"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT id, record_number, content, created_at
+                    FROM positioning_records
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                """, (user_id,))
+            else:
+                cursor.execute("""
+                    SELECT id, record_number, content, created_at
+                    FROM positioning_records
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC
+                """, (user_id,))
+            
+            records = []
+            for row in cursor.fetchall():
+                records.append({
+                    "id": row[0],
+                    "record_number": row[1],
+                    "content": row[2],
+                    "created_at": row[3]
+                })
+            
+            conn.close()
+            return {"records": records}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.delete("/api/user/positioning/{record_id}")
+    async def delete_positioning_record(record_id: int):
+        """刪除帳號定位記錄"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("DELETE FROM positioning_records WHERE id = %s", (record_id,))
+            else:
+                cursor.execute("DELETE FROM positioning_records WHERE id = ?", (record_id,))
+            
+            if not use_postgresql:
+                conn.commit()
+            conn.close()
+            
+            return {"success": True}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    # ===== 腳本儲存功能 API =====
+    
+    @app.post("/api/scripts/save")
+    async def save_script(request: Request):
+        """儲存腳本"""
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                data = await request.json()
+                user_id = data.get("user_id")
+                content = data.get("content")
+                script_data = data.get("script_data", {})
+                platform = data.get("platform")
+                topic = data.get("topic")
+                profile = data.get("profile")
+                
+                if not user_id or not content:
+                    return JSONResponse({"error": "缺少必要參數"}, status_code=400)
+                
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                
+                database_url = os.getenv("DATABASE_URL")
+                use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+                
+                # 提取腳本標題作為預設名稱
+                script_name = script_data.get("title", "未命名腳本")
+                
+                # 插入腳本記錄
+                if use_postgresql:
+                    cursor.execute("""
+                        INSERT INTO user_scripts (user_id, script_name, title, content, script_data, platform, topic, profile)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING id
+                    """, (
+                        user_id,
+                        script_name,
+                        script_data.get("title", ""),
+                        content,
+                        json.dumps(script_data),
+                        platform,
+                        topic,
+                        profile
+                    ))
+                    script_id = cursor.fetchone()[0]
+                else:
+                    cursor.execute("""
+                        INSERT INTO user_scripts (user_id, script_name, title, content, script_data, platform, topic, profile)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        user_id,
+                        script_name,
+                        script_data.get("title", ""),
+                        content,
+                        json.dumps(script_data),
+                        platform,
+                        topic,
+                        profile
+                    ))
+                    conn.commit()
+                    script_id = cursor.lastrowid
+                
+                conn.close()
+                
+                return {
+                    "success": True,
+                    "script_id": script_id,
+                    "message": "腳本儲存成功"
+                }
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and retry_count < max_retries - 1:
+                    retry_count += 1
+                    await asyncio.sleep(0.1 * retry_count)  # 遞增延遲
+                    continue
+                else:
+                    return JSONResponse({"error": f"資料庫錯誤: {str(e)}"}, status_code=500)
+            except Exception as e:
+                return JSONResponse({"error": f"儲存失敗: {str(e)}"}, status_code=500)
+        
+        return JSONResponse({"error": "儲存失敗，請稍後再試"}, status_code=500)
+    
+    @app.get("/api/scripts/my")
+    async def get_my_scripts(current_user_id: Optional[str] = Depends(get_current_user)):
+        """獲取用戶的腳本列表"""
+        if not current_user_id:
+            return JSONResponse({"error": "請先登入"}, status_code=401)
+        
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT id, script_name, title, content, script_data, platform, topic, profile, created_at, updated_at
+                    FROM user_scripts
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                """, (current_user_id,))
+            else:
+                cursor.execute("""
+                    SELECT id, script_name, title, content, script_data, platform, topic, profile, created_at, updated_at
+                    FROM user_scripts
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC
+                """, (current_user_id,))
+            
+            scripts = []
+            for row in cursor.fetchall():
+                script_data = json.loads(row[4]) if row[4] else {}
+                scripts.append({
+                    "id": row[0],
+                    "name": row[1],
+                    "title": row[2],
+                    "content": row[3],
+                    "script_data": script_data,
+                    "platform": row[5],
+                    "topic": row[6],
+                    "profile": row[7],
+                    "created_at": row[8],
+                    "updated_at": row[9]
+                })
+            
+            conn.close()
+            return {"scripts": scripts}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    # 長期記憶相關API
+    @app.post("/api/memory/long-term")
+    async def save_long_term_memory(
+        request_body: LongTermMemoryRequest,
+        current_user_id: Optional[str] = Depends(get_current_user)
+    ):
+        """儲存長期記憶對話"""
+        if not current_user_id:
+            return JSONResponse({"error": "請先登入"}, status_code=401)
+        
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("""
+                    INSERT INTO long_term_memory (user_id, conversation_type, session_id, message_role, message_content, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (current_user_id, request_body.conversation_type, request_body.session_id, request_body.message_role, request_body.message_content, request_body.metadata))
+            else:
+                cursor.execute("""
+                    INSERT INTO long_term_memory (user_id, conversation_type, session_id, message_role, message_content, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (current_user_id, request_body.conversation_type, request_body.session_id, request_body.message_role, request_body.message_content, request_body.metadata))
+            
+            if not use_postgresql:
+                conn.commit()
+            conn.close()
+            return {"success": True, "message": "長期記憶已儲存"}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.get("/api/memory/long-term")
+    async def get_long_term_memory(
+        conversation_type: Optional[str] = None,
+        session_id: Optional[str] = None,
+        limit: int = 50,
+        current_user_id: Optional[str] = Depends(get_current_user)
+    ):
+        """獲取長期記憶對話"""
+        if not current_user_id:
+            return JSONResponse({"error": "請先登入"}, status_code=401)
+        
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                if conversation_type and session_id:
+                    cursor.execute("""
+                        SELECT id, conversation_type, session_id, message_role, message_content, metadata, created_at
+                        FROM long_term_memory
+                        WHERE user_id = %s AND conversation_type = %s AND session_id = %s
+                        ORDER BY created_at DESC
+                        LIMIT %s
+                    """, (current_user_id, conversation_type, session_id, limit))
+                elif conversation_type:
+                    cursor.execute("""
+                        SELECT id, conversation_type, session_id, message_role, message_content, metadata, created_at
+                        FROM long_term_memory
+                        WHERE user_id = %s AND conversation_type = %s
+                        ORDER BY created_at DESC
+                        LIMIT %s
+                    """, (current_user_id, conversation_type, limit))
+                else:
+                    cursor.execute("""
+                        SELECT id, conversation_type, session_id, message_role, message_content, metadata, created_at
+                        FROM long_term_memory
+                        WHERE user_id = %s
+                        ORDER BY created_at DESC
+                        LIMIT %s
+                    """, (current_user_id, limit))
+            else:
+                if conversation_type and session_id:
+                    cursor.execute("""
+                        SELECT id, conversation_type, session_id, message_role, message_content, metadata, created_at
+                        FROM long_term_memory
+                        WHERE user_id = ? AND conversation_type = ? AND session_id = ?
+                        ORDER BY created_at DESC
+                        LIMIT ?
+                    """, (current_user_id, conversation_type, session_id, limit))
+                elif conversation_type:
+                    cursor.execute("""
+                        SELECT id, conversation_type, session_id, message_role, message_content, metadata, created_at
+                        FROM long_term_memory
+                        WHERE user_id = ? AND conversation_type = ?
+                        ORDER BY created_at DESC
+                        LIMIT ?
+                    """, (current_user_id, conversation_type, limit))
+                else:
+                    cursor.execute("""
+                        SELECT id, conversation_type, session_id, message_role, message_content, metadata, created_at
+                        FROM long_term_memory
+                        WHERE user_id = ?
+                        ORDER BY created_at DESC
+                        LIMIT ?
+                    """, (current_user_id, limit))
+            
+            memories = []
+            for row in cursor.fetchall():
+                memories.append({
+                    "id": row[0],
+                    "conversation_type": row[1],
+                    "session_id": row[2],
+                    "message_role": row[3],
+                    "message_content": row[4],
+                    "metadata": row[5],
+                    "created_at": row[6]
+                })
+            
+            conn.close()
+            return {"memories": memories}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    # 管理員長期記憶API
+    @app.get("/api/admin/long-term-memory")
+    async def get_all_long_term_memory(conversation_type: Optional[str] = None, limit: int = 100):
+        """獲取所有長期記憶記錄（管理員用）"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                if conversation_type:
+                    cursor.execute("""
+                        SELECT ltm.id, ltm.user_id, ltm.conversation_type, ltm.session_id, 
+                               ltm.message_role, ltm.message_content, ltm.metadata, ltm.created_at,
+                               ua.name, ua.email
+                        FROM long_term_memory ltm
+                        LEFT JOIN user_auth ua ON ltm.user_id = ua.user_id
+                        WHERE ltm.conversation_type = %s
+                        ORDER BY ltm.created_at DESC
+                        LIMIT %s
+                    """, (conversation_type, limit))
+                else:
+                    cursor.execute("""
+                        SELECT ltm.id, ltm.user_id, ltm.conversation_type, ltm.session_id, 
+                               ltm.message_role, ltm.message_content, ltm.metadata, ltm.created_at,
+                               ua.name, ua.email
+                        FROM long_term_memory ltm
+                        LEFT JOIN user_auth ua ON ltm.user_id = ua.user_id
+                        ORDER BY ltm.created_at DESC
+                        LIMIT %s
+                    """, (limit,))
+            else:
+                if conversation_type:
+                    cursor.execute("""
+                        SELECT ltm.id, ltm.user_id, ltm.conversation_type, ltm.session_id, 
+                               ltm.message_role, ltm.message_content, ltm.metadata, ltm.created_at,
+                               ua.name, ua.email
+                        FROM long_term_memory ltm
+                        LEFT JOIN user_auth ua ON ltm.user_id = ua.user_id
+                        WHERE ltm.conversation_type = ?
+                        ORDER BY ltm.created_at DESC
+                        LIMIT ?
+                    """, (conversation_type, limit))
+                else:
+                    cursor.execute("""
+                        SELECT ltm.id, ltm.user_id, ltm.conversation_type, ltm.session_id, 
+                               ltm.message_role, ltm.message_content, ltm.metadata, ltm.created_at,
+                               ua.name, ua.email
+                        FROM long_term_memory ltm
+                        LEFT JOIN user_auth ua ON ltm.user_id = ua.user_id
+                        ORDER BY ltm.created_at DESC
+                        LIMIT ?
+                    """, (limit,))
+            
+            memories = []
+            for row in cursor.fetchall():
+                memories.append({
+                    "id": row[0],
+                    "user_id": row[1],
+                    "conversation_type": row[2],
+                    "session_id": row[3],
+                    "message_role": row[4],
+                    "message_content": row[5],
+                    "metadata": row[6],
+                    "created_at": row[7],
+                    "user_name": row[8],
+                    "user_email": row[9]
+                })
+            
+            conn.close()
+            return {"memories": memories}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    # 取得單筆長期記憶（管理員用）
+    @app.get("/api/admin/long-term-memory/{memory_id}")
+    async def get_long_term_memory_by_id(memory_id: int):
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+
+            if use_postgresql:
+                cursor.execute(
+                    """
+                    SELECT ltm.id, ltm.user_id, ltm.conversation_type, ltm.session_id,
+                           ltm.message_role, ltm.message_content, ltm.metadata, ltm.created_at,
+                           ua.name, ua.email
+                    FROM long_term_memory ltm
+                    LEFT JOIN user_auth ua ON ltm.user_id = ua.user_id
+                    WHERE ltm.id = %s
+                    """,
+                    (memory_id,)
                 )
             else:
-                full = "了解，我會用自然口吻陪你討論腳本。先說明你的主題、平台與目標，我再給你第一版結構與開場。"
+                cursor.execute(
+                    """
+                    SELECT ltm.id, ltm.user_id, ltm.conversation_type, ltm.session_id,
+                           ltm.message_role, ltm.message_content, ltm.metadata, ltm.created_at,
+                           ua.name, ua.email
+                    FROM long_term_memory ltm
+                    LEFT JOIN user_auth ua ON ltm.user_id = ua.user_id
+                    WHERE ltm.id = ?
+                    """,
+                    (memory_id,)
+                )
 
-        # 逐段輸出
-        chunk_size = 60
-        for i in range(0, len(full), chunk_size):
-            yield full[i:i+chunk_size]
-        # 完成後寫入訊息
-        add_message(session_id, "assistant", full)
+            row = cursor.fetchone()
+            conn.close()
+            if not row:
+                return JSONResponse({"error": "記錄不存在"}, status_code=404)
 
-        # 定位：嘗試更新檔案並把回覆摘要存成筆記
-        if agent_type == "positioning":
-            try:
-                draft = {}
-                draft.update(extract_profile_fields(last_user))
-                draft.update(extract_profile_fields(full))
-                draft = {k:v for k,v in draft.items() if v}
-                if draft:
-                    update_user_profile(user_id, draft)
-                # 存成「note」型記憶，供前端右側筆記本顯示
-                note = (full or "").strip()
-                if note:
-                    add_memory(user_id, "positioning", "note", note[:800], importance_score=6)
-            except Exception:
-                pass
-        # 選題：把回覆存成筆記並保存選題建議
-        elif agent_type == "topics":
-            try:
-                note = (full or "").strip()
-                if note:
-                    add_memory(user_id, "topic_selection", "note", note[:800], importance_score=6)
-                    
-                    # 保存選題建議到資料庫
-                    from datetime import date
-                    conn = get_conn()
-                    conn.execute(
-                        """INSERT OR REPLACE INTO topic_suggestions 
-                           (user_id, suggested_date, topics, reasoning) 
-                           VALUES (?, ?, ?, ?)""",
-                        (user_id, date.today().isoformat(), json.dumps({"suggestions": note}), note)
-                    )
-                    conn.commit()
-                    conn.close()
-            except Exception as e:
-                print(f"[Topics Save Error] {e}")
-                pass
-        # 腳本：把回覆存成筆記
-        elif agent_type == "script":
-            try:
-                note = (full or "").strip()
-                if note:
-                    add_memory(user_id, "script_copy", "note", note[:800], importance_score=6)
-            except Exception:
-                pass
-
-    return StreamingResponse(gen(), media_type="text/plain")
-
-
-# 定位智能體
-@app.post("/agent/positioning/analyze")
-async def positioning_analyze(req: Request):
-    """定位智能體分析用戶定位"""
-    try:
-        data = await req.json()
-        user_id = data.get("user_id")
-        user_input = data.get("user_input", "")
-        
-        if not user_id:
-            raise HTTPException(status_code=400, detail="user_id is required")
-        
-        # 確保用戶存在
-        create_or_get_user(user_id)
-        
-        # 獲取用戶檔案和相關記憶
-        user_profile = get_user_profile(user_id)
-        memories = get_user_memories(user_id, agent_type="positioning", limit=10)
-        
-        # 創建會話
-        session_id = create_session(user_id, "positioning")
-        add_message(session_id, "user", user_input)
-        
-        # 生成分析
-        analysis_context = positioning_agent_analyze(user_input, user_profile, memories)
-        
-        # 調用 AI 生成回應（無模型時提供自然回覆）
-        if use_gemini():
-            ai_response = gemini_generate_text(analysis_context)
-        else:
-            ai_response = natural_fallback_positioning(user_input, user_profile, memories)
-        
-        add_message(session_id, "assistant", ai_response)
-        
-        # 提取關鍵洞察並保存為記憶
-        if ai_response and len(ai_response) > 50:
-            key_insights = extract_key_insights(ai_response, "positioning")
-            for insight in key_insights:
-                add_memory(user_id, "positioning", "insight", insight, importance_score=7)
-
-        # 從用戶輸入與 AI 回應中嘗試擷取定位欄位，更新檔案（草稿）
-        try:
-            draft_fields = {}
-            draft_fields.update(extract_profile_fields(user_input))
-            draft_fields.update(extract_profile_fields(ai_response))
-            # 過濾空值
-            draft_fields = {k:v for k,v in draft_fields.items() if v}
-            if draft_fields:
-                update_user_profile(user_id, draft_fields)
-                # 重新讀取最新檔案
-                user_profile = get_user_profile(user_id)
-        except Exception as _e:
-            print("[Positioning] extract_profile_fields failed:", _e)
-        
-        # 生成結構化的定位摘要（包含執行建議）
-        positioning_summary = ""
-        tone_guidelines = ""
-        execution_suggestions = ""
-        
-        if ai_response:
-            # 簡單解析AI回應，提取關鍵信息
-            lines = ai_response.split('\n')
-            in_execution_section = False
-            for line in lines:
-                line = line.strip()
-                if '業務類型：' in line or '目標受眾：' in line or '品牌語氣：' in line:
-                    positioning_summary += line + "\n"
-                elif '語氣' in line and ('專業' in line or '親切' in line or '幽默' in line or '權威' in line):
-                    tone_guidelines = line
-                elif '實作建議' in line or '執行建議' in line:
-                    in_execution_section = True
-                    execution_suggestions += line + "\n"
-                elif in_execution_section and (line.startswith('•') or line.startswith('-') or line.startswith('*') or '發文頻率' in line or '平台策略' in line or '內容策略' in line):
-                    execution_suggestions += line + "\n"
-                elif in_execution_section and not (line.startswith('•') or line.startswith('-') or line.startswith('*') or '發文頻率' in line or '平台策略' in line or '內容策略' in line):
-                    # 如果遇到非執行建議的內容，結束執行建議區塊
-                    in_execution_section = False
-        
-        # 如果沒有提取到足夠信息，使用默認值
-        if not positioning_summary:
-            positioning_summary = "基於您的描述，建議建立專業的短影音定位策略。"
-        if not tone_guidelines:
-            tone_guidelines = "使用專業術語，保持客觀理性，強調數據和事實。"
-        if not execution_suggestions:
-            execution_suggestions = "建議採用流量型與轉換型內容 7:3 配比，每週發布 3-5 次，專注於 Instagram Reels 平台。"
-        
-        return {
-            "session_id": session_id,
-            "response": ai_response,
-            "user_profile": user_profile,
-            "positioning_summary": positioning_summary,
-            "tone_guidelines": tone_guidelines,
-            "execution_suggestions": execution_suggestions,
-            "error": None
-        }
-        
-    except Exception as e:
-        print(f"[Positioning Agent Error] {e}")
-        import traceback
-        traceback.print_exc()
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": "internal_server_error", 
-                "message": "伺服器內部錯誤，請稍後再試",
-                "details": str(e) if "DEBUG" in os.environ else "Internal server error"
+            return {
+                "id": row[0],
+                "user_id": row[1],
+                "conversation_type": row[2],
+                "session_id": row[3],
+                "message_role": row[4],
+                "message_content": row[5],
+                "metadata": row[6],
+                "created_at": row[7],
+                "user_name": row[8],
+                "user_email": row[9]
             }
-        )
-
-@app.put("/agent/positioning/profile")
-async def update_positioning_profile(req: Request):
-    """更新用戶定位檔案"""
-    try:
-        data = await req.json()
-        user_id = data.get("user_id")
-        profile_data = data.get("profile_data", {})
-        
-        if not user_id:
-            raise HTTPException(status_code=400, detail="user_id is required")
-        
-        # 確保用戶存在
-        create_or_get_user(user_id)
-        
-        # 更新檔案
-        success = update_user_profile(user_id, profile_data)
-        
-        if success:
-            # 保存檔案更新為記憶
-            add_memory(user_id, "positioning", "profile_update", 
-                      f"用戶檔案已更新：{json.dumps(profile_data, ensure_ascii=False)}", 
-                      importance_score=8)
-        
-        return {
-            "success": success,
-            "message": "檔案更新成功" if success else "檔案更新失敗",
-            "error": None
-        }
-        
-    except Exception as e:
-        print(f"[Profile Update Error] {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"error": "internal_server_error", "message": str(e)}
-        )
-
-# 新增：取得用戶定位檔案與筆記（供前端右側同步顯示）
-@app.get("/agent/positioning/profile")
-async def get_positioning_profile(user_id: str, notes_limit: int = 10):
-    try:
-        profile = get_user_profile(user_id)
-        notes = get_user_memories(user_id, agent_type="positioning", memory_type="note", limit=notes_limit)
-        return {
-            "user_id": user_id,
-            "profile": profile or {},
-            "notes": notes,
-            "error": None
-        }
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
-
-# 新增：通用筆記查詢 API
-@app.get("/agent/notes")
-async def get_agent_notes(user_id: str, agent_type: str, memory_type: str = "note", limit: int = 10):
-    try:
-        notes = get_user_memories(user_id, agent_type=agent_type, memory_type=memory_type, limit=limit)
-        return {
-            "user_id": user_id,
-            "agent_type": agent_type,
-            "notes": notes,
-            "error": None
-        }
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": "internal_server_error", "message": str(e)})
-
-# 新增：一鍵生成定位功能
-@app.post("/agent/positioning/generate")
-async def generate_positioning(req: Request):
-    """一鍵生成完整定位檔案"""
-    try:
-        data = await req.json()
-        user_id = data.get("user_id")
-        theme = data.get("theme", "")  # 用戶提供的主題/產品/服務
-        
-        if not user_id:
-            raise HTTPException(status_code=400, detail="user_id is required")
-        
-        if not theme.strip():
-            raise HTTPException(status_code=400, detail="theme is required")
-        
-        # 確保用戶存在
-        create_or_get_user(user_id)
-        
-        # 獲取現有檔案和記憶
-        user_profile = get_user_profile(user_id)
-        memories = get_user_memories(user_id, agent_type="positioning", limit=5)
-        
-        # 創建會話
-        session_id = create_session(user_id, "positioning")
-        add_message(session_id, "user", f"一鍵生成定位：{theme}")
-        
-        # 構建一鍵生成提示詞
-        context = f"""你是專業的短影音定位顧問，專門服務台灣市場，請根據用戶提供的主題「{theme}」生成完整的定位檔案。
-
-請分析這個主題並提供：
-1. 業務類型：具體的行業分類
-2. 目標受眾：明確的台灣受眾畫像（年齡、職業、痛點、需求）
-3. 品牌語氣：適合台灣用戶的溝通風格
-4. 主要平台：台灣最適合的短影音平台（推薦：Instagram Reels、TikTok、YouTube Shorts、Facebook Reels）
-5. 內容目標：具體要達成的效果
-6. 發文頻率：建議的更新頻率
-
-【重要】平台推薦請專注於台灣用戶常用的平台，避免推薦B站、小紅書等大陸平台。
-
-請以結構化格式回應，每個欄位都要具體明確，便於系統自動提取。
-
-格式：
-業務類型：[具體分類]
-目標受眾：[詳細描述]
-品牌語氣：[風格特點]
-主要平台：[平台名稱]
-內容目標：[具體目標]
-發文頻率：[頻率建議]"""
-        
-        # 調用 AI 生成定位
-        if use_gemini():
-            ai_response = gemini_generate_text(context)
-        else:
-            # 無模型時的範例回覆
-            ai_response = f"""根據「{theme}」主題，我為你生成以下定位：
-
-業務類型：{theme}相關服務
-目標受眾：對{theme}有興趣的台灣潛在客戶
-品牌語氣：專業親切
-主要平台：Instagram Reels
-內容目標：建立專業形象，吸引潛在客戶
-發文頻率：每週2-3次"""
-        
-        add_message(session_id, "assistant", ai_response)
-        
-        # 提取定位欄位並更新檔案
-        extracted_fields = extract_profile_fields(ai_response)
-        if extracted_fields:
-            update_user_profile(user_id, extracted_fields)
-            # 重新讀取最新檔案
-            user_profile = get_user_profile(user_id)
-        
-        # 保存 AI 回應為筆記
-        if ai_response and len(ai_response) > 50:
-            add_memory(user_id, "positioning", "note", ai_response, importance_score=8)
-        
-        return {
-            "session_id": session_id,
-            "response": ai_response,
-            "user_profile": user_profile,
-            "extracted_fields": extracted_fields,
-            "error": None
-        }
-        
-    except Exception as e:
-        print(f"[Generate Positioning Error] {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"error": "internal_server_error", "message": str(e)}
-        )
-
-# 選題智能體
-@app.post("/agent/topics/suggest")
-async def topic_suggest(req: Request):
-    """獲取選題建議"""
-    try:
-        data = await req.json()
-        user_id = data.get("user_id")
-        target_date = data.get("target_date")  # YYYY-MM-DD 格式
-        
-        if not user_id:
-            raise HTTPException(status_code=400, detail="user_id is required")
-        
-        # 確保用戶存在
-        create_or_get_user(user_id)
-        
-        # 解析日期
-        if target_date:
-            try:
-                from datetime import datetime
-                target_date = datetime.strptime(target_date, "%Y-%m-%d").date()
-            except ValueError:
-                from datetime import date
-                target_date = date.today()
-        else:
-            from datetime import date
-            target_date = date.today()
-        
-        # 獲取用戶檔案和相關記憶
-        user_profile = get_user_profile(user_id)
-        memories = get_user_memories(user_id, agent_type="topic_selection", limit=5)
-        
-        # 生成選題建議
-        suggestion_context = topic_selection_agent_generate(user_profile, memories)
-        
-        # 調用 AI 生成選題
-        if use_gemini():
-            ai_response = gemini_generate_text(suggestion_context)
-        else:
-            ai_response = "AI服務暫時不可用，請稍後再試。"
-        
-        # 保存選題建議
-        conn = get_conn()
-        conn.execute(
-            """INSERT OR REPLACE INTO topic_suggestions 
-               (user_id, suggested_date, topics, reasoning) 
-               VALUES (?, ?, ?, ?)""",
-            (user_id, target_date.isoformat(), json.dumps({"suggestions": ai_response}), ai_response)
-        )
-        conn.commit()
-        conn.close()
-        
-        return {
-            "user_id": user_id,
-            "suggested_date": target_date.isoformat(),
-            "suggestions": ai_response,
-            "reasoning": ai_response,
-            "error": None
-        }
-        
-    except Exception as e:
-        print(f"[Topic Selection Error] {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"error": "internal_server_error", "message": str(e)}
-        )
-
-@app.get("/agent/topics/history")
-async def topic_history(user_id: str, limit: int = 10):
-    """獲取選題歷史"""
-    try:
-        conn = get_conn()
-        conn.row_factory = sqlite3.Row
-        suggestions = conn.execute(
-            "SELECT * FROM topic_suggestions WHERE user_id = ? ORDER BY suggested_date DESC LIMIT ?",
-            (user_id, limit)
-        ).fetchall()
-        conn.close()
-        
-        return {
-            "user_id": user_id,
-            "suggestions": [dict(s) for s in suggestions],
-            "error": None
-        }
-        
-    except Exception as e:
-        print(f"[Topic History Error] {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"error": "internal_server_error", "message": str(e)}
-        )
-
-# 腳本文案智能體（增強版）
-@app.post("/agent/content/generate")
-async def content_generate(req: Request):
-    """生成腳本或文案（增強版，整合記憶系統）"""
-    try:
-        data = await req.json()
-        user_id = data.get("user_id") or get_anon_user_id(req)
-        user_input = data.get("user_input", "")
-        mode = data.get("mode", "script")  # "script" 或 "copy"
-        template_type = data.get("template_type")
-        duration = data.get("duration")
-        
-        if not user_id:
-            raise HTTPException(status_code=400, detail="user_id is required")
-        
-        # 確保用戶存在
-        create_or_get_user(user_id)
-        
-        # 獲取用戶檔案和相關記憶
-        user_profile = get_user_profile(user_id)
-        memories = get_user_memories(user_id, agent_type="script_copy", limit=10)
-        
-        # 創建會話
-        session_id = create_session(user_id, "script_copy")
-        add_message(session_id, "user", user_input)
-        
-        # 構建增強的提示詞（整合用戶檔案和記憶）
-        enhanced_input = user_input
-        
-        if user_profile:
-            profile_context = f"""
-【用戶定位檔案】
-- 業務類型：{user_profile.get('business_type', '未設定')}
-- 目標受眾：{user_profile.get('target_audience', '未設定')}
-- 品牌語氣：{user_profile.get('brand_voice', '未設定')}
-- 主要平台：{user_profile.get('primary_platform', '未設定')}
-"""
-            enhanced_input = f"{profile_context}\n\n用戶需求：{user_input}"
-        
-        if memories:
-            memory_context = "\n【相關記憶】\n"
-            for memory in memories[:3]:
-                memory_context += f"- {memory['content']}\n"
-            enhanced_input = f"{enhanced_input}\n\n{memory_context}"
-        
-        # 使用現有的 chat_generate 邏輯，但傳入增強後的輸入
-        enhanced_data = {
-            "user_id": user_id,
-            "session_id": session_id,
-            "messages": [{"role": "user", "content": enhanced_input}],
-            "mode": mode,
-            "template_type": template_type,
-            "duration": duration
-        }
-        
-        # 調用現有的生成邏輯
-        result = await chat_generate_internal(enhanced_data)
-        
-        # 添加記憶
-        if result.get("assistant_message"):
-            add_memory(user_id, "script_copy", "generation", 
-                      f"生成{mode}：{user_input[:100]}...", 
-                      importance_score=6)
-        
-        return result
-        
-    except Exception as e:
-        print(f"[Content Generation Error] {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"error": "internal_server_error", "message": str(e)}
-        )
-
-# 記憶系統 API
-@app.get("/memory/user/{user_id}")
-async def get_user_memory(user_id: str, agent_type: str = None, memory_type: str = None, limit: int = 20):
-    """獲取用戶記憶"""
-    try:
-        memories = get_user_memories(user_id, agent_type, memory_type, limit)
-        
-        return {
-            "user_id": user_id,
-            "memories": memories,
-            "count": len(memories),
-            "error": None
-        }
-        
-    except Exception as e:
-        print(f"[Memory Retrieval Error] {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"error": "internal_server_error", "message": str(e)}
-        )
-
-@app.post("/memory/add")
-async def add_memory_endpoint(req: Request):
-    """添加記憶"""
-    try:
-        data = await req.json()
-        user_id = data.get("user_id")
-        agent_type = data.get("agent_type")
-        memory_type = data.get("memory_type")
-        content = data.get("content")
-        importance_score = data.get("importance_score", 5)
-        tags = data.get("tags", [])
-        
-        if not all([user_id, agent_type, memory_type, content]):
-            raise HTTPException(status_code=400, detail="Missing required fields")
-        
-        memory_id = add_memory(user_id, agent_type, memory_type, content, importance_score, tags)
-        
-        return {
-            "memory_id": memory_id,
-            "message": "記憶添加成功",
-            "error": None
-        }
-        
-    except Exception as e:
-        print(f"[Memory Addition Error] {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"error": "internal_server_error", "message": str(e)}
-        )
-
-# 新增：一鍵生成腳本功能
-@app.post("/agent/script/generate")
-async def generate_script_one_click(req: Request):
-    """一鍵生成腳本功能"""
-    try:
-        data = await req.json()
-        user_id = data.get("user_id")
-        theme = data.get("theme", "")  # 用戶提供的主題/文字
-        template_type = data.get("template_type", "A")  # 預設三段式
-        duration = data.get("duration", 30)  # 預設30秒
-        
-        if not user_id:
-            raise HTTPException(status_code=400, detail="user_id is required")
-        
-        if not theme.strip():
-            raise HTTPException(status_code=400, detail="theme is required")
-        
-        # 確保用戶存在
-        create_or_get_user(user_id)
-        
-        # 獲取用戶檔案和相關記憶
-        user_profile = get_user_profile(user_id)
-        memories = get_user_memories(user_id, agent_type="script_copy", limit=10)
-        
-        # 創建會話
-        session_id = create_session(user_id, "script_copy")
-        add_message(session_id, "user", f"一鍵生成腳本：{theme}")
-        
-        # 構建一鍵生成提示詞
-        context = f"""根據主題「{theme}」生成短影音腳本。
-
-🎯 腳本參數：
-• 模板：{template_type} - {TEMPLATE_GUIDE.get(template_type, "三段式")}
-• 時長：{duration} 秒
-• 平台：Instagram Reels、TikTok、YouTube Shorts、Facebook Reels
-
-📚 知識庫：
-{BUILTIN_KB_SCRIPT}
-
-💡 台灣市場特色：
-• 內容風格：生活化、親切、實用
-• 節奏要求：2-3秒換畫面，節奏緊湊
-• Hook原則：0-5秒直給結論，用大字卡與強情緒表情
-• 語氣：堅定、直給結論，避免口癖贅字
-
-直接輸出JSON格式，不要任何開場白或說明文字：
-
-{{
-  "segments":[
-    {{"type":"hook","start_sec":0,"end_sec":5,"camera":"CU","dialog":"...","visual":"...","cta":""}},
-    {{"type":"value","start_sec":5,"end_sec":25,"camera":"MS","dialog":"...","visual":"...","cta":""}},
-    {{"type":"cta","start_sec":25,"end_sec":30,"camera":"WS","dialog":"...","visual":"...","cta":"..."}}
-  ]
-}}"""
-        
-        # 調用 AI 生成腳本
-        if use_gemini():
-            ai_response = gemini_generate_text(context)
-        else:
-            # 無模型時的範例回覆
-            ai_response = f"""{{
-  "segments":[
-    {{"type":"hook","start_sec":0,"end_sec":5,"camera":"CU","dialog":"你知道{theme}的秘密嗎？","visual":"大字卡+驚訝表情","cta":""}},
-    {{"type":"value","start_sec":5,"end_sec":25,"camera":"MS","dialog":"今天我要分享{theme}的實用技巧，讓你輕鬆掌握！","visual":"示範畫面","cta":""}},
-    {{"type":"cta","start_sec":25,"end_sec":30,"camera":"WS","dialog":"想要更多{theme}技巧，記得關注我！","visual":"關注按鈕","cta":"點關注"}}
-  ]
-}}"""
-        
-        add_message(session_id, "assistant", ai_response)
-        
-        # 解析腳本
-        try:
-            if use_gemini():
-                segments = parse_segments(ai_response)
-            else:
-                # 解析範例回覆
-                import json
-                data = json.loads(ai_response)
-                segments = data.get("segments", [])
         except Exception as e:
-            print(f"[Script Parse Error] {e}")
-            segments = []
-        
-        # 保存腳本生成為筆記
-        if ai_response and len(ai_response) > 50:
-            add_memory(user_id, "script_copy", "note", ai_response, importance_score=8)
-        
-        return {
-            "session_id": session_id,
-            "assistant_message": "🚀 一鍵生成完成！我為你生成了完整的腳本。",
-            "segments": segments,
-            "error": None
-        }
-        
-    except Exception as e:
-        print(f"[One-Click Script Generation Error] {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"error": "internal_server_error", "message": str(e)}
-        )
+            return JSONResponse({"error": str(e)}, status_code=500)
 
-# 內部函數：chat_generate 的內部邏輯（供 content_generate 調用）
-async def chat_generate_internal(data: dict):
-    """chat_generate 的內部邏輯，供其他函數調用"""
-    user_id = (data.get("user_id") or "").strip() or "web"
-    messages = data.get("messages") or []
-    previous_segments = data.get("previous_segments") or []
-    topic = (data.get("topic") or "").strip() or None
-
-    explicit_mode = (data.get("mode") or "").strip().lower() or None
-    mode = detect_mode(messages, explicit=explicit_mode)
-
-    dialogue_mode = (data.get("dialogue_mode") or "").strip().lower() or None
-    template_type = (data.get("template_type") or "").strip().upper() or None
-    try:
-        duration = int(data.get("duration")) if data.get("duration") is not None else None
-    except Exception:
-        duration = None
-    knowledge_hint = (data.get("knowledge_hint") or "").strip() or None
-
-    user_input = ""
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            user_input = (m.get("content") or "").strip()
-            break
-
-    # 輸入過短時，仍持續對話而非回傳制式提示
-    hint = SHORT_HINT_COPY if mode == "copy" else SHORT_HINT_SCRIPT
-    if len(user_input) < 6:
-        user_input = f"（使用者提示較短）請主動追問關鍵條件並先給出方向性建議。\n提示：{user_input or '開始'}"
-
-    try:
-        if mode == "copy":
-            prompt = build_copy_prompt(user_input, topic)
-            if use_gemini():
-                out = gemini_generate_text(prompt)
-                j = _ensure_json_block(out)
-                copy = parse_copy(j)
-            else:
-                copy = fallback_copy(user_input, topic)
-
-            resp = {
-                "session_id": data.get("session_id") or "s",
-                "assistant_message": "我先給你第一版完整貼文（可再加要求，我會幫你改得更貼近風格）。",
-                "segments": [],
-                "copy": copy,
-                "error": None
-            }
-
-        else:  # script
-            prompt = build_script_prompt(
-                user_input,
-                previous_segments,
-                template_type=template_type,
-                duration=duration,
-                dialogue_mode=dialogue_mode,
-                knowledge_hint=knowledge_hint,
-            )
-            if use_gemini():
-                out = gemini_generate_text(prompt)
-                j = _ensure_json_block(out)
-                segments = parse_segments(j)
-            else:
-                segments = fallback_segments(user_input, len(previous_segments or []), duration=duration)
-
-            resp = {
-                "session_id": data.get("session_id") or "s",
-                "assistant_message": "我先給你第一版完整腳本（可再加要求，我會幫你改得更貼近風格）。",
-                "segments": segments,
-                "copy": None,
-                "error": None
-            }
-
-        return resp
-
-    except Exception as e:
-        print("[chat_generate_internal] error:", e)
-        return {
-            "session_id": data.get("session_id") or "s",
-            "assistant_message": "伺服器忙碌，稍後再試",
-            "segments": [],
-            "copy": None,
-            "error": "internal_server_error"
-        }
-
-# 匿名用戶 ID（未登入時避免跨裝置/跨 IP 互相污染記憶）
-def get_anon_user_id(req: Request) -> str:
-    try:
-        ip = (req.client.host if req and req.client else '0.0.0.0')
-        ua = (req.headers.get('user-agent') or 'ua')[:40]
-        h = hashlib.sha256(f"{ip}|{ua}".encode('utf-8')).hexdigest()[:16]
-        from datetime import date
-        d = date.today().isoformat()
-        return f"anon_{h}_{d}"
-    except Exception:
-        return "anon_web"
-
-# 依目前問題挑選最相關記憶，避免回覆偏離當下上下文
-def select_relevant_memories(query: str, memories: list[dict], k: int = 5) -> list[dict]:
-    try:
-        if not memories:
-            return []
-        q = (query or '').strip()
-        if not q:
-            return memories[:k]
-        import re
-        toks = [t for t in re.split(r"[\s，。；、,.:?!\-\/\[\]()]+", q) if len(t) >= 2]
-        toks = list(dict.fromkeys(toks))
-        scored = []
-        for m in memories:
-            txt = (m.get('content') or '').lower()
-            score = 0
-            for t in toks:
-                if t and t.lower() in txt:
-                    score += 1
-            # 額外加權：較新的/較重要的
-            score = score * 10 + int(m.get('importance_score') or 0)
-            scored.append((score, m))
-        scored.sort(key=lambda x: -x[0])
-        return [m for _, m in scored[:k]]
-    except Exception:
-        return memories[:k]
-
-# ========= 點數系統整合 =========
-try:
-    from .points_integration import integrate_points_system
-    integrate_points_system(app)
-    print("✅ AI Points System integrated successfully")
-except ImportError as e:
-    print(f"⚠️  AI Points System not available: {e}")
-except Exception as e:
-    print(f"❌ Failed to integrate AI Points System: {e}")
-
-# 新增腳本生成相關導入
-from fastapi.responses import StreamingResponse
-from memory import MemoryManager
-from rag import RAGRetriever
-from knowledge_loader import KnowledgeLoader
-from providers import LLMProvider
-import json
-import asyncio
-
-# 初始化組件
-memory_manager = MemoryManager()
-rag_retriever = RAGRetriever()
-knowledge_loader = KnowledgeLoader()
-llm_provider = LLMProvider("local")
-
-@app.post("/api/chat")
-async def chat_endpoint(request: dict):
-    """非串流聊天端點"""
-    try:
-        agent = request.get("agent", "script_generation")
-        topic = request.get("topic", "")
-        template = request.get("template", "A")
-        platform = request.get("platform", "Reels")
-        duration = request.get("duration", "30")
-        message = request.get("message", "")
-        user_id = request.get("user_id", "default")
-        
-        # 構建prompt
-        prompt = build_prompt(agent, topic, template, platform, duration, message, user_id)
-        
-        # 生成回應
-        messages = [{"role": "user", "content": prompt}]
-        response = ""
-        for chunk in llm_provider.stream_response(messages, agent=agent, topic=topic, template=template, platform=platform, duration=duration):
-            if chunk["type"] == "content":
-                response += chunk["token"]
-        
-        # 保存對話
-        memory_manager.add_message(user_id, "user", message)
-        memory_manager.add_message(user_id, "assistant", response)
-        
-        # 檢查是否需要總結
-        if memory_manager.should_summarize(user_id):
-            summary = f"用戶{user_id}的對話總結：{response[:500]}..."
-            memory_manager.update_summary(user_id, summary)
-        
-        return {"answer": response, "usage": {"tokens": len(response)}}
-    
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/api/stream")
-async def stream_endpoint(
-    agent: str = "script_generation",
-    topic: str = "",
-    template: str = "A", 
-    platform: str = "Reels",
-    duration: str = "30",
-    user_id: str = "default"
-):
-    """SSE串流端點"""
-    async def generate():
+    # 刪除單筆長期記憶（管理員用）
+    @app.delete("/api/admin/long-term-memory/{memory_id}")
+    async def delete_long_term_memory(memory_id: int):
         try:
-            # 構建prompt
-            prompt = build_prompt(agent, topic, template, platform, duration, "", user_id)
+            conn = get_db_connection()
+            cursor = conn.cursor()
+
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+
+            # 檢查存在
+            if use_postgresql:
+                cursor.execute("SELECT id FROM long_term_memory WHERE id = %s", (memory_id,))
+            else:
+                cursor.execute("SELECT id FROM long_term_memory WHERE id = ?", (memory_id,))
+            if not cursor.fetchone():
+                conn.close()
+                return JSONResponse({"error": "記錄不存在"}, status_code=404)
+
+            # 刪除
+            if use_postgresql:
+                cursor.execute("DELETE FROM long_term_memory WHERE id = %s", (memory_id,))
+            else:
+                cursor.execute("DELETE FROM long_term_memory WHERE id = ?", (memory_id,))
+                conn.commit()
+
+            conn.close()
+            return {"success": True}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.get("/api/admin/memory-stats")
+    async def get_memory_stats():
+        """獲取長期記憶統計（管理員用）"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
             
-            # 生成回應
-            messages = [{"role": "user", "content": prompt}]
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
             
-            full_response = ""
-            for chunk in llm_provider.stream_response(messages, agent=agent, topic=topic, template=template, platform=platform, duration=duration):
-                if chunk["type"] == "content":
-                    full_response += chunk["token"]
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                elif chunk["type"] == "done":
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                    break
-                elif chunk["type"] == "error":
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                    break
-            
-            # 保存對話
-            if full_response:
-                memory_manager.add_message(user_id, "user", f"生成{topic}腳本")
-                memory_manager.add_message(user_id, "assistant", full_response)
+            if use_postgresql:
+                # 總記憶數
+                cursor.execute("SELECT COUNT(*) FROM long_term_memory")
+                total_memories = cursor.fetchone()[0]
                 
-                # 檢查是否需要總結
-                if memory_manager.should_summarize(user_id):
-                    summary = f"用戶{user_id}的腳本生成總結：{full_response[:500]}..."
-                    memory_manager.update_summary(user_id, summary)
+                # 活躍用戶數
+                cursor.execute("SELECT COUNT(DISTINCT user_id) FROM long_term_memory")
+                active_users = cursor.fetchone()[0]
+                
+                # 今日新增記憶數
+                cursor.execute("""
+                    SELECT COUNT(*) FROM long_term_memory 
+                    WHERE DATE(created_at) = CURRENT_DATE
+                """)
+                today_memories = cursor.fetchone()[0]
+                
+                # 平均記憶/用戶
+                avg_memories_per_user = total_memories / active_users if active_users > 0 else 0
+                
+            else:
+                # SQLite 版本
+                cursor.execute("SELECT COUNT(*) FROM long_term_memory")
+                total_memories = cursor.fetchone()[0]
+                
+                cursor.execute("SELECT COUNT(DISTINCT user_id) FROM long_term_memory")
+                active_users = cursor.fetchone()[0]
+                
+                cursor.execute("""
+                    SELECT COUNT(*) FROM long_term_memory 
+                    WHERE DATE(created_at) = DATE('now')
+                """)
+                today_memories = cursor.fetchone()[0]
+                
+                avg_memories_per_user = total_memories / active_users if active_users > 0 else 0
+            
+            conn.close()
+            return {
+                "total_memories": total_memories,
+                "active_users": active_users,
+                "today_memories": today_memories,
+                "avg_memories_per_user": round(avg_memories_per_user, 2)
+            }
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    # 獲取用戶的長期記憶（支援會話篩選）
+    @app.get("/api/memory/long-term")
+    async def get_user_long_term_memory(
+        conversation_type: Optional[str] = None,
+        session_id: Optional[str] = None,
+        limit: int = 50,
+        current_user_id: Optional[str] = Depends(get_current_user)
+    ):
+        """獲取用戶的長期記憶記錄"""
+        if not current_user_id:
+            return JSONResponse({"error": "請先登入"}, status_code=401)
+        
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            # 構建查詢條件
+            where_conditions = ["user_id = ?" if not use_postgresql else "user_id = %s"]
+            params = [current_user_id]
+            
+            if conversation_type:
+                where_conditions.append("conversation_type = ?" if not use_postgresql else "conversation_type = %s")
+                params.append(conversation_type)
+            
+            if session_id:
+                where_conditions.append("session_id = ?" if not use_postgresql else "session_id = %s")
+                params.append(session_id)
+            
+            where_clause = " AND ".join(where_conditions)
+            
+            if use_postgresql:
+                cursor.execute(f"""
+                    SELECT id, user_id, conversation_type, session_id, 
+                           message_role, message_content, metadata, created_at
+                    FROM long_term_memory
+                    WHERE {where_clause}
+                    ORDER BY created_at ASC
+                    LIMIT %s
+                """, params + [limit])
+            else:
+                cursor.execute(f"""
+                    SELECT id, user_id, conversation_type, session_id, 
+                           message_role, message_content, metadata, created_at
+                    FROM long_term_memory
+                    WHERE {where_clause}
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                """, params + [limit])
+            
+            memories = []
+            for row in cursor.fetchall():
+                memories.append({
+                    "id": row[0],
+                    "user_id": row[1],
+                    "conversation_type": row[2],
+                    "session_id": row[3],
+                    "message_role": row[4],
+                    "message_content": row[5],
+                    "metadata": row[6],
+                    "created_at": row[7]
+                })
+            
+            conn.close()
+            return {"memories": memories}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    # 獲取用戶的會話列表
+    @app.get("/api/memory/sessions")
+    async def get_user_sessions(
+        conversation_type: Optional[str] = None,
+        limit: int = 20,
+        current_user_id: Optional[str] = Depends(get_current_user)
+    ):
+        """獲取用戶的會話列表"""
+        if not current_user_id:
+            return JSONResponse({"error": "請先登入"}, status_code=401)
+        
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            where_condition = "user_id = ?" if not use_postgresql else "user_id = %s"
+            params = [current_user_id]
+            
+            if conversation_type:
+                where_condition += " AND conversation_type = ?" if not use_postgresql else " AND conversation_type = %s"
+                params.append(conversation_type)
+            
+            if use_postgresql:
+                cursor.execute(f"""
+                    SELECT session_id, 
+                           MAX(created_at) as last_time,
+                           COUNT(*) as message_count,
+                           MAX(CASE WHEN message_role = 'user' THEN message_content END) as last_user_message,
+                           MAX(CASE WHEN message_role = 'assistant' THEN message_content END) as last_ai_message
+                    FROM long_term_memory
+                    WHERE {where_condition}
+                    GROUP BY session_id
+                    ORDER BY last_time DESC
+                    LIMIT %s
+                """, params + [limit])
+            else:
+                cursor.execute(f"""
+                    SELECT session_id, 
+                           MAX(created_at) as last_time,
+                           COUNT(*) as message_count,
+                           MAX(CASE WHEN message_role = 'user' THEN message_content END) as last_user_message,
+                           MAX(CASE WHEN message_role = 'assistant' THEN message_content END) as last_ai_message
+                    FROM long_term_memory
+                    WHERE {where_condition}
+                    GROUP BY session_id
+                    ORDER BY last_time DESC
+                    LIMIT ?
+                """, params + [limit])
+            
+            sessions = []
+            for row in cursor.fetchall():
+                sessions.append({
+                    "session_id": row[0],
+                    "last_time": row[1],
+                    "message_count": row[2],
+                    "last_user_message": row[3],
+                    "last_ai_message": row[4]
+                })
+            
+            conn.close()
+            return {"sessions": sessions}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.put("/api/scripts/{script_id}/name")
+    async def update_script_name(script_id: int, request: Request, current_user_id: Optional[str] = Depends(get_current_user)):
+        """更新腳本名稱"""
+        if not current_user_id:
+            return JSONResponse({"error": "請先登入"}, status_code=401)
+        
+        try:
+            data = await request.json()
+            new_name = data.get("name")
+            
+            if not new_name:
+                return JSONResponse({"error": "腳本名稱不能為空"}, status_code=400)
+            
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            # 檢查腳本是否屬於當前用戶
+            if use_postgresql:
+                cursor.execute("SELECT user_id FROM user_scripts WHERE id = %s", (script_id,))
+            else:
+                cursor.execute("SELECT user_id FROM user_scripts WHERE id = ?", (script_id,))
+            result = cursor.fetchone()
+            
+            if not result:
+                return JSONResponse({"error": "腳本不存在"}, status_code=404)
+            
+            if result[0] != current_user_id:
+                return JSONResponse({"error": "無權限修改此腳本"}, status_code=403)
+            
+            # 更新腳本名稱
+            if use_postgresql:
+                cursor.execute("""
+                    UPDATE user_scripts 
+                    SET script_name = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = %s
+                """, (new_name, script_id))
+            else:
+                cursor.execute("""
+                    UPDATE user_scripts 
+                    SET script_name = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (new_name, script_id))
+            
+            if not use_postgresql:
+                conn.commit()
+            conn.close()
+            
+            return {"success": True, "message": "腳本名稱更新成功"}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.delete("/api/scripts/{script_id}")
+    async def delete_script(script_id: int, current_user_id: Optional[str] = Depends(get_current_user)):
+        """刪除腳本"""
+        if not current_user_id:
+            return JSONResponse({"error": "請先登入"}, status_code=401)
+        
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            # 檢查腳本是否屬於當前用戶
+            if use_postgresql:
+                cursor.execute("SELECT user_id FROM user_scripts WHERE id = %s", (script_id,))
+            else:
+                cursor.execute("SELECT user_id FROM user_scripts WHERE id = ?", (script_id,))
+            result = cursor.fetchone()
+            
+            if not result:
+                return JSONResponse({"error": "腳本不存在"}, status_code=404)
+            
+            if result[0] != current_user_id:
+                return JSONResponse({"error": "無權限刪除此腳本"}, status_code=403)
+            
+            # 刪除腳本
+            if use_postgresql:
+                cursor.execute("DELETE FROM user_scripts WHERE id = %s", (script_id,))
+            else:
+                cursor.execute("DELETE FROM user_scripts WHERE id = ?", (script_id,))
+            
+            if not use_postgresql:
+                conn.commit()
+            conn.close()
+            
+            return {"success": True, "message": "腳本刪除成功"}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.get("/api/user/behaviors/{user_id}")
+    async def get_user_behaviors(user_id: str):
+        """獲取用戶的行為統計"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT behavior_type, COUNT(*) as count, MAX(created_at) as last_activity
+                    FROM user_behaviors 
+                    WHERE user_id = %s 
+                    GROUP BY behavior_type
+                    ORDER BY count DESC
+                """, (user_id,))
+            else:
+                cursor.execute("""
+                    SELECT behavior_type, COUNT(*) as count, MAX(created_at) as last_activity
+                    FROM user_behaviors 
+                    WHERE user_id = ? 
+                    GROUP BY behavior_type
+                    ORDER BY count DESC
+                """, (user_id,))
+            behaviors = cursor.fetchall()
+            
+            conn.close()
+            
+            return {
+                "user_id": user_id,
+                "behaviors": [
+                    {
+                        "type": behavior[0],
+                        "count": behavior[1],
+                        "last_activity": behavior[2]
+                    } 
+                    for behavior in behaviors
+                ]
+            }
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    # ===== 管理員 API（用於後台管理系統） =====
+    
+    @app.get("/api/admin/users")
+    async def get_all_users():
+        """獲取所有用戶資料（管理員用）"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # 獲取所有用戶基本資料（包含訂閱狀態和統計）
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT ua.user_id, ua.google_id, ua.email, ua.name, ua.picture, 
+                           ua.created_at, ua.is_subscribed, up.preferred_platform, up.preferred_style, up.preferred_duration
+                    FROM user_auth ua
+                    LEFT JOIN user_profiles up ON ua.user_id = up.user_id
+                    ORDER BY ua.created_at DESC
+                """)
+            else:
+                cursor.execute("""
+                    SELECT ua.user_id, ua.google_id, ua.email, ua.name, ua.picture, 
+                           ua.created_at, ua.is_subscribed, up.preferred_platform, up.preferred_style, up.preferred_duration
+                    FROM user_auth ua
+                    LEFT JOIN user_profiles up ON ua.user_id = up.user_id
+                    ORDER BY ua.created_at DESC
+                """)
+            
+            users = []
+            
+            for row in cursor.fetchall():
+                user_id = row[0]
+                
+                # 獲取對話數
+                if use_postgresql:
+                    cursor.execute("""
+                        SELECT COUNT(*) FROM conversation_summaries WHERE user_id = %s
+                    """, (user_id,))
+                else:
+                    cursor.execute("""
+                        SELECT COUNT(*) FROM conversation_summaries WHERE user_id = ?
+                    """, (user_id,))
+                conversation_count = cursor.fetchone()[0]
+                
+                # 獲取腳本數
+                if use_postgresql:
+                    cursor.execute("""
+                        SELECT COUNT(*) FROM user_scripts WHERE user_id = %s
+                    """, (user_id,))
+                else:
+                    cursor.execute("""
+                        SELECT COUNT(*) FROM user_scripts WHERE user_id = ?
+                    """, (user_id,))
+                script_count = cursor.fetchone()[0]
+                
+                # 格式化日期（台灣時區 UTC+8）
+                created_at = row[5]
+                if created_at:
+                    try:
+                        from datetime import timezone, timedelta
+                        if isinstance(created_at, datetime):
+                            dt = created_at
+                        elif isinstance(created_at, str):
+                            dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                        else:
+                            dt = None
+                        
+                        if dt:
+                            # 轉換為台灣時區 (UTC+8)
+                            taiwan_tz = timezone(timedelta(hours=8))
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            dt_taiwan = dt.astimezone(taiwan_tz)
+                            created_at = dt_taiwan.strftime('%Y/%m/%d %H:%M')
+                    except Exception as e:
+                        print(f"格式化日期時出錯: {e}")
+                        pass
+                
+                users.append({
+                    "user_id": user_id,
+                    "google_id": row[1],
+                    "email": row[2],
+                    "name": row[3],
+                    "picture": row[4],
+                    "created_at": created_at,
+                    "is_subscribed": bool(row[6]) if row[6] is not None else True,  # 預設為已訂閱
+                    "preferred_platform": row[7],
+                    "preferred_style": row[8],
+                    "preferred_duration": row[9],
+                    "conversation_count": conversation_count,
+                    "script_count": script_count
+                })
+            
+            conn.close()
+            return {"users": users}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.put("/api/admin/users/{user_id}/subscription")
+    async def update_user_subscription(user_id: str, request: Request):
+        """更新用戶訂閱狀態（管理員用）"""
+        try:
+            data = await request.json()
+            is_subscribed = data.get("is_subscribed", 0)
+            
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # 更新訂閱狀態
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("""
+                    UPDATE user_auth 
+                    SET is_subscribed = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = %s
+                """, (1 if is_subscribed else 0, user_id))
+            else:
+                cursor.execute("""
+                    UPDATE user_auth 
+                    SET is_subscribed = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                """, (1 if is_subscribed else 0, user_id))
+            
+            if not use_postgresql:
+                conn.commit()
+            conn.close()
+            
+            return {
+                "success": True,
+                "message": "訂閱狀態已更新",
+                "user_id": user_id,
+                "is_subscribed": bool(is_subscribed)
+            }
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.get("/api/admin/user/{user_id}/data")
+    async def get_user_complete_data(user_id: str):
+        """獲取指定用戶的完整資料（管理員用）"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            # 用戶基本資料
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT ua.google_id, ua.email, ua.name, ua.picture, ua.created_at,
+                           up.preferred_platform, up.preferred_style, up.preferred_duration, up.content_preferences
+                    FROM user_auth ua
+                    LEFT JOIN user_profiles up ON ua.user_id = up.user_id
+                    WHERE ua.user_id = %s
+                """, (user_id,))
+            else:
+                cursor.execute("""
+                    SELECT ua.google_id, ua.email, ua.name, ua.picture, ua.created_at,
+                           up.preferred_platform, up.preferred_style, up.preferred_duration, up.content_preferences
+                    FROM user_auth ua
+                    LEFT JOIN user_profiles up ON ua.user_id = up.user_id
+                    WHERE ua.user_id = ?
+                """, (user_id,))
+            
+            user_data = cursor.fetchone()
+            if not user_data:
+                return JSONResponse({"error": "用戶不存在"}, status_code=404)
+            
+            # 帳號定位記錄
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT id, record_number, content, created_at
+                    FROM positioning_records
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                """, (user_id,))
+            else:
+                cursor.execute("""
+                    SELECT id, record_number, content, created_at
+                    FROM positioning_records
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC
+                """, (user_id,))
+            positioning_records = cursor.fetchall()
+            
+            # 腳本記錄
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT id, script_name, title, content, script_data, platform, topic, profile, created_at
+                    FROM user_scripts
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                """, (user_id,))
+            else:
+                cursor.execute("""
+                    SELECT id, script_name, title, content, script_data, platform, topic, profile, created_at
+                    FROM user_scripts
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC
+                """, (user_id,))
+            script_records = cursor.fetchall()
+            
+            # 生成記錄
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT id, content, platform, topic, created_at
+                    FROM generations
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                """, (user_id,))
+            else:
+                cursor.execute("""
+                    SELECT id, content, platform, topic, created_at
+                    FROM generations
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC
+                """, (user_id,))
+            generation_records = cursor.fetchall()
+            
+            # 對話摘要
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT id, summary, conversation_type, created_at
+                    FROM conversation_summaries
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                """, (user_id,))
+            else:
+                cursor.execute("""
+                    SELECT id, summary, conversation_type, created_at
+                    FROM conversation_summaries
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC
+                """, (user_id,))
+            conversation_summaries = cursor.fetchall()
+            
+            # 用戶偏好
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT preference_type, preference_value, confidence_score, created_at
+                    FROM user_preferences
+                    WHERE user_id = %s
+                    ORDER BY confidence_score DESC
+                """, (user_id,))
+            else:
+                cursor.execute("""
+                    SELECT preference_type, preference_value, confidence_score, created_at
+                    FROM user_preferences
+                    WHERE user_id = ?
+                    ORDER BY confidence_score DESC
+                """, (user_id,))
+            user_preferences = cursor.fetchall()
+            
+            # 用戶行為
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT behavior_type, behavior_data, created_at
+                    FROM user_behaviors
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                """, (user_id,))
+            else:
+                cursor.execute("""
+                    SELECT behavior_type, behavior_data, created_at
+                    FROM user_behaviors
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC
+                """, (user_id,))
+            user_behaviors = cursor.fetchall()
+            
+            conn.close()
+            
+            return {
+                "user_info": {
+                    "user_id": user_id,
+                    "google_id": user_data[0],
+                    "email": user_data[1],
+                    "name": user_data[2],
+                    "picture": user_data[3],
+                    "created_at": user_data[4],
+                    "preferred_platform": user_data[5],
+                    "preferred_style": user_data[6],
+                    "preferred_duration": user_data[7],
+                    "content_preferences": json.loads(user_data[8]) if user_data[8] else None
+                },
+                "positioning_records": [
+                    {
+                        "id": record[0],
+                        "record_number": record[1],
+                        "content": record[2],
+                        "created_at": record[3]
+                    } for record in positioning_records
+                ],
+                "script_records": [
+                    {
+                        "id": record[0],
+                        "script_name": record[1],
+                        "title": record[2],
+                        "content": record[3],
+                        "script_data": json.loads(record[4]) if record[4] else {},
+                        "platform": record[5],
+                        "topic": record[6],
+                        "profile": record[7],
+                        "created_at": record[8]
+                    } for record in script_records
+                ],
+                "generation_records": [
+                    {
+                        "id": record[0],
+                        "content": record[1],
+                        "platform": record[2],
+                        "topic": record[3],
+                        "created_at": record[4]
+                    } for record in generation_records
+                ],
+                "conversation_summaries": [
+                    {
+                        "id": record[0],
+                        "summary": record[1],
+                        "conversation_type": record[2],
+                        "created_at": record[3]
+                    } for record in conversation_summaries
+                ],
+                "user_preferences": [
+                    {
+                        "preference_type": record[0],
+                        "preference_value": record[1],
+                        "confidence_score": record[2],
+                        "created_at": record[3]
+                    } for record in user_preferences
+                ],
+                "user_behaviors": [
+                    {
+                        "behavior_type": record[0],
+                        "behavior_data": record[1],
+                        "created_at": record[2]
+                    } for record in user_behaviors
+                ]
+            }
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.get("/api/admin/statistics")
+    async def get_admin_statistics():
+        """獲取系統統計資料（管理員用）"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # 判斷資料庫類型
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            # 用戶總數
+            cursor.execute("SELECT COUNT(*) FROM user_auth")
+            total_users = cursor.fetchone()[0]
+            
+            # 今日新增用戶（兼容 SQLite 和 PostgreSQL）
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT COUNT(*) FROM user_auth 
+                    WHERE created_at::date = CURRENT_DATE
+                """)
+            else:
+                cursor.execute("""
+                    SELECT COUNT(*) FROM user_auth 
+                    WHERE DATE(created_at) = DATE('now')
+                """)
+            today_users = cursor.fetchone()[0]
+            
+            # 腳本總數
+            cursor.execute("SELECT COUNT(*) FROM user_scripts")
+            total_scripts = cursor.fetchone()[0]
+            
+            # 帳號定位總數
+            cursor.execute("SELECT COUNT(*) FROM positioning_records")
+            total_positioning = cursor.fetchone()[0]
+            
+            # 生成內容總數
+            cursor.execute("SELECT COUNT(*) FROM generations")
+            total_generations = cursor.fetchone()[0]
+            
+            # 對話摘要總數
+            cursor.execute("SELECT COUNT(*) FROM conversation_summaries")
+            total_conversations = cursor.fetchone()[0]
+            
+            # 平台使用統計
+            cursor.execute("""
+                SELECT platform, COUNT(*) as count
+                FROM user_scripts
+                WHERE platform IS NOT NULL
+                GROUP BY platform
+                ORDER BY count DESC
+            """)
+            platform_stats = cursor.fetchall()
+            
+            # 最近活躍用戶（7天內）（兼容 SQLite 和 PostgreSQL）
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT COUNT(DISTINCT user_id) 
+                    FROM user_scripts 
+                    WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+                """)
+            else:
+                cursor.execute("""
+                    SELECT COUNT(DISTINCT user_id) 
+                    FROM user_scripts 
+                    WHERE created_at >= datetime('now', '-7 days')
+                """)
+            active_users_7d = cursor.fetchone()[0]
+            
+            conn.close()
+            
+            return {
+                "total_users": total_users,
+                "today_users": today_users,
+                "total_scripts": total_scripts,
+                "total_positioning": total_positioning,
+                "total_generations": total_generations,
+                "total_conversations": total_conversations,
+                "active_users_7d": active_users_7d,
+                "platform_stats": [
+                    {"platform": stat[0], "count": stat[1]} 
+                    for stat in platform_stats
+                ]
+            }
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.get("/api/admin/mode-statistics")
+    async def get_mode_statistics():
+        """獲取模式使用統計"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            # 獲取各模式的對話數
+            cursor.execute("""
+                SELECT conversation_type, COUNT(*) as count
+                FROM conversation_summaries
+                WHERE conversation_type IS NOT NULL
+                GROUP BY conversation_type
+            """)
+            conversations = cursor.fetchall()
+            
+            # 計算各模式統計
+            mode_stats = {
+                "mode1_quick_generate": {"count": 0, "success_rate": 0},
+                "mode2_ai_consultant": {"count": 0, "avg_turns": 0},
+                "mode3_ip_planning": {"count": 0, "profiles_generated": 0}
+            }
+            
+            # 根據對話類型分類
+            for conv_type, count in conversations:
+                if conv_type == "account_positioning":
+                    mode_stats["mode1_quick_generate"]["count"] = count
+                elif conv_type in ["topic_selection", "script_generation"]:
+                    mode_stats["mode2_ai_consultant"]["count"] += count
+                elif conv_type == "general_consultation":
+                    mode_stats["mode2_ai_consultant"]["count"] += count
+            
+            # 獲取時間分布
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT DATE_TRUNC('hour', created_at) as hour, COUNT(*) as count
+                    FROM conversation_summaries
+                    WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '30 days'
+                    GROUP BY hour
+                    ORDER BY hour
+                """)
+            else:
+                cursor.execute("""
+                    SELECT strftime('%H', created_at) as hour, COUNT(*) as count
+                    FROM conversation_summaries
+                    WHERE created_at >= datetime('now', '-30 days')
+                    GROUP BY hour
+                    ORDER BY hour
+                """)
+            
+            time_stats = {"00:00-06:00": 0, "06:00-12:00": 0, "12:00-18:00": 0, "18:00-24:00": 0}
+            for row in cursor.fetchall():
+                try:
+                    if use_postgresql:
+                        # PostgreSQL 返回 datetime 對象
+                        hour_str = row[0].strftime('%H')
+                    else:
+                        # SQLite 返回字符串 'HH' 格式
+                        hour_str = str(row[0])[:2]
+                    hour = int(hour_str)
+                except:
+                    hour = 0
+                
+                count = row[1]
+                if 0 <= hour < 6:
+                    time_stats["00:00-06:00"] += count
+                elif 6 <= hour < 12:
+                    time_stats["06:00-12:00"] += count
+                elif 12 <= hour < 18:
+                    time_stats["12:00-18:00"] += count
+                else:
+                    time_stats["18:00-24:00"] += count
+            
+            conn.close()
+            
+            return {
+                "mode_stats": mode_stats,
+                "time_distribution": time_stats
+            }
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.get("/api/admin/conversations")
+    async def get_all_conversations():
+        """獲取所有對話記錄（管理員用）"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT cs.id, cs.user_id, cs.conversation_type, cs.summary, cs.message_count, cs.created_at, 
+                           ua.name, ua.email
+                    FROM conversation_summaries cs
+                    LEFT JOIN user_auth ua ON cs.user_id = ua.user_id
+                    ORDER BY cs.created_at DESC
+                    LIMIT 100
+                """)
+            else:
+                cursor.execute("""
+                    SELECT cs.id, cs.user_id, cs.conversation_type, cs.summary, cs.message_count, cs.created_at, 
+                           ua.name, ua.email
+                    FROM conversation_summaries cs
+                    LEFT JOIN user_auth ua ON cs.user_id = ua.user_id
+                    ORDER BY cs.created_at DESC
+                    LIMIT 100
+                """)
+            
+            conversations = []
+            conv_type_map = {
+                "account_positioning": "帳號定位",
+                "topic_selection": "選題討論",
+                "script_generation": "腳本生成",
+                "general_consultation": "AI顧問",
+                "ip_planning": "IP人設規劃"
+            }
+            
+            for row in cursor.fetchall():
+                conversations.append({
+                    "id": row[0],
+                    "user_id": row[1],
+                    "mode": conv_type_map.get(row[2], row[2]),
+                    "conversation_type": row[2],
+                    "summary": row[3] or "",
+                    "message_count": row[4] or 0,
+                    "created_at": row[5],
+                    "user_name": row[6] or "未知用戶",
+                    "user_email": row[7] or ""
+                })
+            
+            conn.close()
+            
+            return {"conversations": conversations}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.get("/api/admin/generations")
+    async def get_all_generations():
+        """獲取所有生成記錄"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT g.id, g.user_id, g.platform, g.topic, g.content, g.created_at, 
+                           ua.name, ua.email
+                    FROM generations g
+                    LEFT JOIN user_auth ua ON g.user_id = ua.user_id
+                    ORDER BY g.created_at DESC
+                    LIMIT 100
+                """)
+            else:
+                cursor.execute("""
+                    SELECT g.id, g.user_id, g.platform, g.topic, g.content, g.created_at, 
+                           ua.name, ua.email
+                    FROM generations g
+                    LEFT JOIN user_auth ua ON g.user_id = ua.user_id
+                    ORDER BY g.created_at DESC
+                    LIMIT 100
+                """)
+            
+            generations = []
+            for row in cursor.fetchall():
+                generations.append({
+                    "id": row[0],
+                    "user_id": row[1],
+                    "user_name": row[6] or "未知用戶",
+                    "user_email": row[7] or "",
+                    "platform": row[2] or "未設定",
+                    "topic": row[3] or "未分類",
+                    "type": "生成記錄",
+                    "content": row[4][:100] if row[4] else "",
+                    "created_at": row[5]
+                })
+            
+            conn.close()
+            
+            return {"generations": generations}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.get("/api/admin/scripts")
+    async def get_all_scripts():
+        """獲取所有腳本記錄（管理員用）"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT us.id, us.user_id, us.script_name, us.title, us.platform, us.topic, 
+                           us.created_at, ua.name, ua.email
+                    FROM user_scripts us
+                    LEFT JOIN user_auth ua ON us.user_id = ua.user_id
+                    ORDER BY us.created_at DESC
+                    LIMIT 100
+                """)
+            else:
+                cursor.execute("""
+                    SELECT us.id, us.user_id, us.script_name, us.title, us.platform, us.topic, 
+                           us.created_at, ua.name, ua.email
+                    FROM user_scripts us
+                    LEFT JOIN user_auth ua ON us.user_id = ua.user_id
+                    ORDER BY us.created_at DESC
+                    LIMIT 100
+                """)
+            
+            scripts = []
+            for row in cursor.fetchall():
+                scripts.append({
+                    "id": row[0],
+                    "user_id": row[1],
+                    "name": row[2] or row[3] or "未命名腳本",
+                    "title": row[3] or row[2] or "未命名腳本",
+                    "platform": row[4] or "未設定",
+                    "category": row[5] or "未分類",
+                    "topic": row[5] or "未分類",
+                    "created_at": row[6],
+                    "user_name": row[7] or "未知用戶",
+                    "user_email": row[8] or ""
+                })
+            
+            conn.close()
+            
+            return {"scripts": scripts}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.get("/api/admin/platform-statistics")
+    async def get_platform_statistics():
+        """獲取平台使用統計"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            cursor.execute("""
+                SELECT platform, COUNT(*) as count
+                FROM user_scripts
+                WHERE platform IS NOT NULL
+                GROUP BY platform
+                ORDER BY count DESC
+            """)
+            
+            platform_stats = [{"platform": row[0], "count": row[1]} for row in cursor.fetchall()]
+            
+            conn.close()
+            
+            return {"platform_stats": platform_stats}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.get("/api/admin/user-activities")
+    async def get_user_activities():
+        """獲取最近用戶活動"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # 獲取最近10個活動
+            activities = []
+            
+            # 最近註冊的用戶
+            cursor.execute("""
+                SELECT user_id, name, created_at
+                FROM user_auth
+                ORDER BY created_at DESC
+                LIMIT 3
+            """)
+            for row in cursor.fetchall():
+                activities.append({
+                    "type": "新用戶註冊",
+                    "user_id": row[0],
+                    "name": row[1] or "未知用戶",
+                    "time": row[2],
+                    "icon": "👤"
+                })
+            
+            # 最近的腳本生成
+            cursor.execute("""
+                SELECT us.user_id, us.title, us.created_at, ua.name
+                FROM user_scripts us
+                LEFT JOIN user_auth ua ON us.user_id = ua.user_id
+                ORDER BY us.created_at DESC
+                LIMIT 3
+            """)
+            for row in cursor.fetchall():
+                activities.append({
+                    "type": "新腳本生成",
+                    "user_id": row[0],
+                    "name": row[3] or "未知用戶",
+                    "title": row[1] or "未命名腳本",
+                    "time": row[2],
+                    "icon": "📝"
+                })
+            
+            # 最近的對話
+            cursor.execute("""
+                SELECT cs.user_id, cs.conversation_type, cs.created_at, ua.name
+                FROM conversation_summaries cs
+                LEFT JOIN user_auth ua ON cs.user_id = ua.user_id
+                ORDER BY cs.created_at DESC
+                LIMIT 3
+            """)
+            for row in cursor.fetchall():
+                mode_map = {
+                    "account_positioning": "帳號定位",
+                    "topic_selection": "選題討論",
+                    "script_generation": "腳本生成",
+                    "general_consultation": "AI顧問對話"
+                }
+                activities.append({
+                    "type": f"{mode_map.get(row[1], '對話')}",
+                    "user_id": row[0],
+                    "name": row[3] or "未知用戶",
+                    "time": row[2],
+                    "icon": "💬"
+                })
+            
+            # 按時間排序
+            activities.sort(key=lambda x: x['time'], reverse=True)
+            activities = activities[:10]
+            
+            conn.close()
+            
+            return {"activities": activities}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.get("/api/admin/analytics-data")
+    async def get_analytics_data():
+        """獲取分析頁面所需的所有數據"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            # 平台使用分布
+            cursor.execute("""
+                SELECT platform, COUNT(*) as count
+                FROM user_scripts
+                WHERE platform IS NOT NULL
+                GROUP BY platform
+                ORDER BY count DESC
+            """)
+            platform_stats = cursor.fetchall()
+            platform_labels = [row[0] for row in platform_stats]
+            platform_data = [row[1] for row in platform_stats]
+            
+            # 時間段使用分析（最近30天）
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT DATE_TRUNC('day', created_at) as date, COUNT(*) as count
+                    FROM user_scripts
+                    WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '30 days'
+                    GROUP BY date
+                    ORDER BY date
+                """)
+            else:
+                cursor.execute("""
+                    SELECT DATE(created_at) as date, COUNT(*) as count
+                    FROM user_scripts
+                    WHERE created_at >= datetime('now', '-30 days')
+                    GROUP BY date
+                    ORDER BY date
+                """)
+            
+            daily_usage = {}
+            for row in cursor.fetchall():
+                try:
+                    if use_postgresql:
+                        # PostgreSQL 返回 date 對象
+                        day_name = row[0].strftime('%a')
+                    else:
+                        # SQLite 返回 'YYYY-MM-DD' 字符串
+                        from datetime import datetime
+                        date_str = str(row[0])
+                        day_obj = datetime.strptime(date_str, '%Y-%m-%d')
+                        day_name = day_obj.strftime('%a')
+                except:
+                    day_name = 'Mon'
+                
+                daily_usage[day_name] = daily_usage.get(day_name, 0) + row[1]
+            
+            # 內容類型分布（根據 topic 分類）
+            cursor.execute("""
+                SELECT topic, COUNT(*) as count
+                FROM user_scripts
+                WHERE topic IS NOT NULL AND topic != ''
+                GROUP BY topic
+                ORDER BY count DESC
+                LIMIT 5
+            """)
+            content_types = cursor.fetchall()
+            content_labels = [row[0] for row in content_types]
+            content_data = [row[1] for row in content_types]
+            
+            # 用戶活躍度（最近4週）
+            weekly_activity = []
+            for i in range(4):
+                if use_postgresql:
+                    cursor.execute(f"""
+                        SELECT COUNT(DISTINCT user_id)
+                        FROM user_scripts
+                        WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '{7 * (i + 1)} days'
+                          AND created_at < CURRENT_TIMESTAMP - INTERVAL '{7 * i} days'
+                    """)
+                else:
+                    cursor.execute(f"""
+                        SELECT COUNT(DISTINCT user_id)
+                        FROM user_scripts
+                        WHERE created_at >= datetime('now', '-{7 * (i + 1)} days')
+                          AND created_at < datetime('now', '-{7 * i} days')
+                    """)
+                count = cursor.fetchone()[0]
+                weekly_activity.append(count)
+            
+            conn.close()
+            
+            return {
+                "platform": {
+                    "labels": platform_labels,
+                    "data": platform_data
+                },
+                "time_usage": {
+                    "labels": ['週一', '週二', '週三', '週四', '週五', '週六', '週日'],
+                    "data": [
+                        daily_usage.get('Mon', 0),
+                        daily_usage.get('Tue', 0),
+                        daily_usage.get('Wed', 0),
+                        daily_usage.get('Thu', 0),
+                        daily_usage.get('Fri', 0),
+                        daily_usage.get('Sat', 0),
+                        daily_usage.get('Sun', 0)
+                    ]
+                },
+                "activity": {
+                    "labels": ['第1週', '第2週', '第3週', '第4週'],
+                    "data": weekly_activity
+                },
+                "content_type": {
+                    "labels": content_labels,
+                    "data": content_data
+                }
+            }
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @app.get("/api/admin/export/{export_type}")
+    async def export_csv(export_type: str):
+        """匯出 CSV 檔案"""
+        import csv
+        import io
+        
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # 根據匯出類型選擇不同的數據
+            if export_type == "users":
+                cursor.execute("""
+                    SELECT user_id, name, email, created_at, is_subscribed
+                    FROM user_auth
+                    ORDER BY created_at DESC
+                """)
+                
+                # 創建 CSV
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(['用戶ID', '姓名', 'Email', '註冊時間', '是否訂閱'])
+                for row in cursor.fetchall():
+                    writer.writerow(row)
+                output.seek(0)
+                
+                return Response(
+                    content=output.getvalue(),
+                    media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=users.csv"}
+                )
+            
+            elif export_type == "scripts":
+                cursor.execute("""
+                    SELECT us.id, ua.name, us.platform, us.topic, us.title, us.created_at
+                    FROM user_scripts us
+                    LEFT JOIN user_auth ua ON us.user_id = ua.user_id
+                    ORDER BY us.created_at DESC
+                """)
+                
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(['腳本ID', '用戶名稱', '平台', '主題', '標題', '創建時間'])
+                for row in cursor.fetchall():
+                    writer.writerow(row)
+                output.seek(0)
+                
+                return Response(
+                    content=output.getvalue(),
+                    media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=scripts.csv"}
+                )
+            
+            elif export_type == "conversations":
+                cursor.execute("""
+                    SELECT cs.id, ua.name, cs.conversation_type, cs.summary, cs.created_at
+                    FROM conversation_summaries cs
+                    LEFT JOIN user_auth ua ON cs.user_id = ua.user_id
+                    ORDER BY cs.created_at DESC
+                """)
+                
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(['對話ID', '用戶名稱', '對話類型', '摘要', '創建時間'])
+                for row in cursor.fetchall():
+                    writer.writerow(row)
+                output.seek(0)
+                
+                return Response(
+                    content=output.getvalue(),
+                    media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=conversations.csv"}
+                )
+            
+            elif export_type == "generations":
+                cursor.execute("""
+                    SELECT g.id, ua.name, g.platform, g.topic, g.content, g.created_at
+                    FROM generations g
+                    LEFT JOIN user_auth ua ON g.user_id = ua.user_id
+                    ORDER BY g.created_at DESC
+                """)
+                
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(['生成ID', '用戶名稱', '平台', '主題', '內容', '創建時間'])
+                for row in cursor.fetchall():
+                    writer.writerow(row)
+                output.seek(0)
+                
+                return Response(
+                    content=output.getvalue(),
+                    media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=generations.csv"}
+                )
+            
+            else:
+                return JSONResponse({"error": "無效的匯出類型"}, status_code=400)
         
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
-    
-    return StreamingResponse(generate(), media_type="text/plain")
+            return JSONResponse({"error": str(e)}, status_code=500)
 
-def build_prompt(agent: str, topic: str, template: str, platform: str, duration: str, message: str, user_id: str) -> str:
-    """構建prompt"""
-    # 載入知識庫
-    knowledge = knowledge_loader.load_knowledge(agent)
-    if not knowledge:
-        knowledge = "知識庫載入失敗"
+    # ===== OAuth 認證功能 =====
     
-    # 獲取對話歷史
-    recent_messages = memory_manager.get_recent_messages(user_id, 20)
-    
-    # 獲取總結
-    summary = memory_manager.get_summary(user_id)
-    
-    # RAG檢索
-    rag_context = rag_retriever.retrieve(agent, f"{topic} {template} {platform}")
-    
-    # 構建system prompt
-    system_prompt = f"""你是專業的{agent}助手。請嚴格依據以下知識庫回答，不要超出範圍。
+    @app.get("/api/auth/google")
+    async def google_auth(request: Request, fb: Optional[str] = None):
+        """發起 Google OAuth 認證"""
+        # 透過查詢參數 fb 覆寫回跳前端（必須在白名單內）
+        chosen_frontend = fb if fb in ALLOWED_FRONTENDS else FRONTEND_BASE_URL
+        # 以 state 帶回前端 base，callback 取回以決定最終導向
+        from urllib.parse import quote
+        state_val = quote(chosen_frontend)
+        auth_url = (
+            f"https://accounts.google.com/o/oauth2/v2/auth?"
+            f"client_id={GOOGLE_CLIENT_ID}&"
+            f"redirect_uri={GOOGLE_REDIRECT_URI}&"
+            f"response_type=code&"
+            f"scope=openid email profile&"
+            f"access_type=offline&"
+            f"prompt=select_account&"
+            f"state={state_val}"
+        )
+        
+        # 除錯資訊
+        print(f"DEBUG: Generated auth URL: {auth_url}")
+        print(f"DEBUG: GOOGLE_CLIENT_ID: {GOOGLE_CLIENT_ID}")
+        print(f"DEBUG: GOOGLE_REDIRECT_URI: {GOOGLE_REDIRECT_URI}")
+        
+        return {"auth_url": auth_url}
 
-知識庫內容：
-{knowledge}
+    @app.get("/api/auth/google/callback")
+    async def google_callback_get(code: str = None, state: Optional[str] = None):
+        """處理 Google OAuth 回調（GET 請求 - 來自 Google 重定向）"""
+        try:
+            # 除錯資訊
+            print(f"DEBUG: OAuth callback received")
+            print(f"DEBUG: Code: {code}")
+            print(f"DEBUG: GOOGLE_CLIENT_ID: {GOOGLE_CLIENT_ID}")
+            print(f"DEBUG: GOOGLE_CLIENT_SECRET: {GOOGLE_CLIENT_SECRET}")
+            print(f"DEBUG: GOOGLE_REDIRECT_URI: {GOOGLE_REDIRECT_URI}")
+            
+            # 從 URL 參數獲取授權碼
+            if not code:
+                # 如果沒有 code，重定向到前端並顯示錯誤
+                return RedirectResponse(url="https://aivideonew.zeabur.app/?error=missing_code")
+            
+            # 交換授權碼獲取訪問令牌
+            async with httpx.AsyncClient() as client:
+                token_response = await client.post(
+                    "https://oauth2.googleapis.com/token",
+                    data={
+                        "client_id": GOOGLE_CLIENT_ID,
+                        "client_secret": GOOGLE_CLIENT_SECRET,
+                        "code": code,
+                        "grant_type": "authorization_code",
+                        "redirect_uri": GOOGLE_REDIRECT_URI,
+                    }
+                )
+                
+                if token_response.status_code != 200:
+                    raise HTTPException(status_code=400, detail="Failed to get access token")
+                
+                token_data = token_response.json()
+                access_token = token_data["access_token"]
+                
+                # 獲取用戶資訊
+                google_user = await get_google_user_info(access_token)
+                if not google_user:
+                    raise HTTPException(status_code=400, detail="Failed to get user info")
+                
+                # 生成用戶 ID
+                user_id = generate_user_id(google_user.email)
+                
+                # 保存或更新用戶認證資訊
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                
+                database_url = os.getenv("DATABASE_URL")
+                use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+                
+                if use_postgresql:
+                    # PostgreSQL 語法
+                    from datetime import timedelta
+                    expires_at_value = datetime.now() + timedelta(seconds=token_data.get("expires_in", 3600))
+                    
+                    cursor.execute("""
+                        INSERT INTO user_auth 
+                        (user_id, google_id, email, name, picture, access_token, expires_at, is_subscribed, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                        ON CONFLICT (user_id) 
+                        DO UPDATE SET 
+                            google_id = EXCLUDED.google_id,
+                            email = EXCLUDED.email,
+                            name = EXCLUDED.name,
+                            picture = EXCLUDED.picture,
+                            access_token = EXCLUDED.access_token,
+                            expires_at = EXCLUDED.expires_at,
+                            updated_at = CURRENT_TIMESTAMP
+                    """, (
+                        user_id,
+                        google_user.id,
+                        google_user.email,
+                        google_user.name,
+                        google_user.picture,
+                        access_token,
+                        expires_at_value,
+                            0  # 新用戶預設為未訂閱
+                    ))
+                else:
+                    # SQLite 語法
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO user_auth 
+                        (user_id, google_id, email, name, picture, access_token, expires_at, is_subscribed, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """, (
+                        user_id,
+                        google_user.id,
+                        google_user.email,
+                        google_user.name,
+                        google_user.picture,
+                        access_token,
+                        datetime.now().timestamp() + token_data.get("expires_in", 3600),
+                            0  # 新用戶預設為未訂閱
+                    ))
+                
+                if not use_postgresql:
+                    conn.commit()
+                conn.close()
+                
+                # 生成應用程式訪問令牌
+                app_access_token = generate_access_token(user_id)
+                
+                # 使用 URL 編碼確保參數安全
+                from urllib.parse import quote, unquote
+                safe_token = quote(app_access_token)
+                safe_user_id = quote(user_id)
+                safe_email = quote(google_user.email or '')
+                safe_name = quote(google_user.name or '')
+                safe_picture = quote(google_user.picture or '')
+                # 取回 state 中的前端 base（若在白名單內）
+                frontend_base = FRONTEND_BASE_URL
+                try:
+                    if state:
+                        decoded = unquote(state)
+                        if decoded in ALLOWED_FRONTENDS:
+                            frontend_base = decoded
+                except Exception:
+                    pass
+                # Redirect 到前端的 popup-callback.html 頁面
+                # 該頁面會使用 postMessage 傳遞 token 給主視窗並自動關閉
+                callback_url = (
+                    f"{frontend_base}/auth/popup-callback.html"
+                    f"?token={safe_token}"
+                    f"&user_id={safe_user_id}"
+                    f"&email={safe_email}"
+                    f"&name={safe_name}"
+                    f"&picture={safe_picture}"
+                    f"&origin={quote(frontend_base)}"
+                )
+                
+                print(f"DEBUG: Redirecting to callback URL: {callback_url}")
+                
+                # 設置適當的 HTTP Header 以支援 popup 通信
+                response = RedirectResponse(url=callback_url)
+                response.headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups"
+                return response
+                
+        except Exception as e:
+            # 處理錯誤訊息以安全地嵌入 JavaScript（先處理再放入 f-string）
+            error_msg = str(e).replace("'", "\\'").replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r')
+            
+            # 返回錯誤頁面
+            error_html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>登入失敗</title>
+                <style>
+                    body {{
+                        font-family: Arial, sans-serif;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        height: 100vh;
+                        margin: 0;
+                        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+                    }}
+                    .container {{
+                        text-align: center;
+                        background: white;
+                        padding: 40px;
+                        border-radius: 12px;
+                        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+                    }}
+                    h2 {{ color: #e74c3c; margin: 0 0 10px 0; }}
+                    p {{ color: #7f8c8d; margin: 0; }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h2>❌ 登入失敗</h2>
+                    <p>{error_msg}</p>
+                </div>
+                <script>
+                    (function() {{
+                        try {{
+                    if (window.opener) {{
+                        window.opener.postMessage({{
+                            type: 'GOOGLE_AUTH_ERROR',
+                                    error: '{error_msg}'
+                        }}, '*');
+                                setTimeout(function() {{
+                                    try {{
+                                        window.close();
+                                    }} catch (closeErr) {{
+                                        console.log('Unable to close window:', closeErr);
+                                    }}
+                                }}, 3000);
+                            }}
+                        }} catch (postErr) {{
+                            console.error('Error sending error message:', postErr);
+                        }}
+                    }})();
+                </script>
+            </body>
+            </html>
+            """
+            
+            # 設置適當的 HTTP Header 以支援 popup 通信
+            error_response = HTMLResponse(content=error_html, status_code=500)
+            error_response.headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups"
+            error_response.headers["Access-Control-Allow-Origin"] = "https://aivideonew.zeabur.app"
+            return error_response
 
-重要規則：
-1. 只能基於上述知識庫回答，超出範圍請前綴「【超出知識庫，以下為一般經驗】」
-2. 回答要專業、實用、具體
-3. 如果是腳本生成，必須包含完整的Hook→Value→CTA結構
-4. 平台差異要明確體現（Reels/TikTok/小紅書/YouTube Shorts）
-5. 時長要控制在{duration}秒內
-"""
-    
-    # 添加總結
-    if summary:
-        system_prompt += f"\n對話總結：{summary}\n"
-    
-    # 添加RAG上下文
-    if rag_context:
-        system_prompt += f"\n相關知識片段：\n" + "\n".join(rag_context) + "\n"
-    
-    # 添加對話歷史
-    if recent_messages:
-        system_prompt += "\n最近對話：\n"
-        for msg in recent_messages[-10:]:  # 只取最近10條
-            system_prompt += f"{msg['role']}: {msg['content']}\n"
-    
-    # 添加當前請求
-    if agent == "script_generation":
-        system_prompt += f"\n請為以下參數生成腳本：\n"
-        system_prompt += f"主題：{topic}\n"
-        system_prompt += f"模板：{template}\n" 
-        system_prompt += f"平台：{platform}\n"
-        system_prompt += f"時長：{duration}秒\n"
-        if message:
-            system_prompt += f"額外要求：{message}\n"
-    else:
-        system_prompt += f"\n用戶問題：{message}\n"
-    
-    return system_prompt
+    # ===== 金流回調（準備用，未啟用驗簽） =====
+    @app.post("/api/payment/callback")
+    async def payment_callback(payload: dict):
+        """金流回調（測試/準備用）：更新用戶訂閱狀態與到期日。
+        期待參數：
+        - user_id: str
+        - plan: 'monthly' | 'yearly'
+        - transaction_id, amount, paid_at（可選，用於記錄）
+        注意：正式上線需加入簽章驗證與來源白名單。
+        """
+        try:
+            user_id = payload.get("user_id")
+            plan = payload.get("plan")
+            paid_at = payload.get("paid_at")
+            transaction_id = payload.get("transaction_id")
+            amount = payload.get("amount")
 
-# 啟動服務器
+            if not user_id or plan not in ("monthly", "yearly"):
+                raise HTTPException(status_code=400, detail="missing user_id or invalid plan")
+
+            # 計算到期日
+            days = 30 if plan == "monthly" else 365
+            expires_dt = datetime.now() + timedelta(days=days)
+
+            conn = get_db_connection()
+            cursor = conn.cursor()
+
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+
+            # 更新/建立 licenses 記錄，並設為 active
+            if use_postgresql:
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO licenses (user_id, tier, seats, expires_at, status, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                        ON CONFLICT (user_id)
+                        DO UPDATE SET
+                            tier = EXCLUDED.tier,
+                            expires_at = EXCLUDED.expires_at,
+                            status = EXCLUDED.status,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (user_id, plan, 1, expires_dt, "active")
+                    )
+                except Exception as e:
+                    # 若 licenses 不存在，忽略而不阻擋主流程
+                    print("WARN: update licenses failed:", e)
+            else:
+                try:
+                    cursor.execute(
+                        """
+                        INSERT OR REPLACE INTO licenses
+                        (user_id, tier, seats, expires_at, status, updated_at)
+                        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        """,
+                        (user_id, plan, 1, expires_dt.timestamp(), "active")
+                    )
+                except Exception as e:
+                    print("WARN: update licenses failed:", e)
+
+            # 將 user 設為已訂閱
+            if use_postgresql:
+                cursor.execute(
+                    "UPDATE user_auth SET is_subscribed = 1, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s",
+                    (user_id,)
+                )
+            else:
+                cursor.execute(
+                    "UPDATE user_auth SET is_subscribed = 1, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+                    (user_id,)
+                )
+
+            # 可選：記錄訂單（若有 orders 表）
+            try:
+                if use_postgresql:
+                    cursor.execute(
+                        """
+                        INSERT INTO orders (user_id, plan_type, amount, payment_status, paid_at, invoice_number, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                        """,
+                        (user_id, plan, amount, "paid", paid_at, transaction_id)
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        INSERT INTO orders (user_id, plan_type, amount, payment_status, paid_at, invoice_number, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        """,
+                        (user_id, plan, amount, "paid", paid_at, transaction_id)
+                    )
+            except Exception as e:
+                print("WARN: insert orders failed:", e)
+
+            if not use_postgresql:
+                conn.commit()
+            conn.close()
+
+            return {"ok": True, "user_id": user_id, "plan": plan, "expires_at": expires_dt.isoformat()}
+        except HTTPException:
+            raise
+        except Exception as e:
+            print("payment_callback error:", e)
+            raise HTTPException(status_code=500, detail="payment callback failed")
+
+    @app.post("/api/auth/google/callback")
+    async def google_callback_post(request: dict):
+        """處理 Google OAuth 回調（POST 請求 - 來自前端 JavaScript）"""
+        try:
+            # 從請求體獲取授權碼
+            code = request.get("code")
+            if not code:
+                raise HTTPException(status_code=400, detail="Missing authorization code")
+            
+            # 交換授權碼獲取訪問令牌
+            async with httpx.AsyncClient() as client:
+                token_response = await client.post(
+                    "https://oauth2.googleapis.com/token",
+                    data={
+                        "client_id": GOOGLE_CLIENT_ID,
+                        "client_secret": GOOGLE_CLIENT_SECRET,
+                        "code": code,
+                        "grant_type": "authorization_code",
+                        "redirect_uri": GOOGLE_REDIRECT_URI,
+                    }
+                )
+                
+                if token_response.status_code != 200:
+                    raise HTTPException(status_code=400, detail="Failed to get access token")
+                
+                token_data = token_response.json()
+                access_token = token_data["access_token"]
+                
+                # 獲取用戶資訊
+                google_user = await get_google_user_info(access_token)
+                if not google_user:
+                    raise HTTPException(status_code=400, detail="Failed to get user info")
+                
+                # 生成用戶 ID
+                user_id = generate_user_id(google_user.email)
+                
+                # 保存或更新用戶認證資訊
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                
+                database_url = os.getenv("DATABASE_URL")
+                use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+                
+                if use_postgresql:
+                    # PostgreSQL 語法
+                    from datetime import timedelta
+                    expires_at_value = datetime.now() + timedelta(seconds=token_data.get("expires_in", 3600))
+                    
+                    cursor.execute("""
+                        INSERT INTO user_auth 
+                        (user_id, google_id, email, name, picture, access_token, expires_at, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                        ON CONFLICT (user_id) 
+                        DO UPDATE SET 
+                            google_id = EXCLUDED.google_id,
+                            email = EXCLUDED.email,
+                            name = EXCLUDED.name,
+                            picture = EXCLUDED.picture,
+                            access_token = EXCLUDED.access_token,
+                            expires_at = EXCLUDED.expires_at,
+                            updated_at = CURRENT_TIMESTAMP
+                    """, (
+                        user_id,
+                        google_user.id,
+                        google_user.email,
+                        google_user.name,
+                        google_user.picture,
+                        access_token,
+                        expires_at_value
+                    ))
+                else:
+                    # SQLite 語法
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO user_auth 
+                        (user_id, google_id, email, name, picture, access_token, expires_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """, (
+                        user_id,
+                        google_user.id,
+                        google_user.email,
+                        google_user.name,
+                        google_user.picture,
+                        access_token,
+                        datetime.now().timestamp() + token_data.get("expires_in", 3600)
+                    ))
+                
+                if not use_postgresql:
+                    conn.commit()
+                conn.close()
+                
+                # 生成應用程式訪問令牌
+                app_access_token = generate_access_token(user_id)
+                
+                # 返回 JSON 格式（給前端 JavaScript 使用）
+                return AuthToken(
+                    access_token=app_access_token,
+                    expires_in=3600,
+                    user=google_user
+                )
+                
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/auth/refresh")
+    async def refresh_token(
+        current_user_id: Optional[str] = Depends(get_current_user_for_refresh)
+    ):
+        """刷新存取權杖（允許使用過期的 token）"""
+        print(f"DEBUG: refresh_token - current_user_id={current_user_id}")
+        if not current_user_id:
+            print("DEBUG: refresh_token - current_user_id 為 None，返回 401")
+            raise HTTPException(status_code=401, detail="未授權")
+        print(f"DEBUG: refresh_token - 開始處理 refresh，user_id={current_user_id}")
+        
+        try:
+            # 獲取資料庫連接
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            # 從資料庫獲取用戶的 refresh token（如果需要）
+            # 但實際上我們直接生成新的 access token
+            if use_postgresql:
+                cursor.execute("SELECT user_id FROM user_auth WHERE user_id = %s", (current_user_id,))
+            else:
+                cursor.execute("SELECT user_id FROM user_auth WHERE user_id = ?", (current_user_id,))
+            
+            if not cursor.fetchone():
+                conn.close()
+                raise HTTPException(status_code=404, detail="用戶不存在")
+            
+            # 生成新的 access token
+            new_access_token = generate_access_token(current_user_id)
+            new_expires_at = datetime.now() + timedelta(hours=1)
+            
+            # 更新資料庫中的 token
+            if use_postgresql:
+                cursor.execute("""
+                    UPDATE user_auth 
+                    SET access_token = %s, expires_at = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = %s
+                """, (new_access_token, new_expires_at, current_user_id))
+            else:
+                cursor.execute("""
+                    UPDATE user_auth 
+                    SET access_token = ?, expires_at = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                """, (new_access_token, new_expires_at.isoformat(), current_user_id))
+                conn.commit()
+            
+            conn.close()
+            
+            return {
+                "access_token": new_access_token,
+                "expires_at": new_expires_at.isoformat()
+            }
+                
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"刷新 token 錯誤: {e}")
+            raise HTTPException(status_code=500, detail="內部伺服器錯誤")
+
+    @app.get("/api/auth/me")
+    async def get_current_user_info(current_user_id: Optional[str] = Depends(get_current_user)):
+        """獲取當前用戶資訊"""
+        if not current_user_id:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT google_id, email, name, picture, is_subscribed, created_at 
+                    FROM user_auth 
+                    WHERE user_id = %s
+                """, (current_user_id,))
+            else:
+                cursor.execute("""
+                    SELECT google_id, email, name, picture, is_subscribed, created_at 
+                    FROM user_auth 
+                    WHERE user_id = ?
+                """, (current_user_id,))
+            
+            row = cursor.fetchone()
+            conn.close()
+            
+            if row:
+                # 格式化日期（台灣時區 UTC+8）
+                created_at = row[5]
+                if created_at:
+                    try:
+                        from datetime import timezone, timedelta
+                        if isinstance(created_at, datetime):
+                            # 如果是 datetime 對象，直接使用
+                            dt = created_at
+                        elif isinstance(created_at, str):
+                            # 如果是字符串，解析它
+                            dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                        else:
+                            dt = None
+                        
+                        if dt:
+                            # 轉換為台灣時區 (UTC+8)
+                            taiwan_tz = timezone(timedelta(hours=8))
+                            if dt.tzinfo is None:
+                                # 如果沒有時區信息，假設是 UTC
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            dt_taiwan = dt.astimezone(taiwan_tz)
+                            created_at = dt_taiwan.strftime('%Y/%m/%d %H:%M')
+                    except Exception as e:
+                        print(f"格式化日期時出錯: {e}")
+                        pass
+                
+                return {
+                    "user_id": current_user_id,
+                    "google_id": row[0],
+                    "email": row[1],
+                    "name": row[2],
+                    "picture": row[3],
+                    "is_subscribed": bool(row[4]) if row[4] is not None else True,  # 預設為已訂閱
+                    "created_at": created_at
+                }
+            else:
+                raise HTTPException(status_code=404, detail="User not found")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/auth/logout")
+    async def logout(current_user_id: Optional[str] = Depends(get_current_user)):
+        """登出用戶"""
+        if not current_user_id:
+            return {"message": "Already logged out"}
+        
+        # 這裡可以添加令牌黑名單邏輯
+        return {"message": "Logged out successfully"}
+
+    # ===== P0 功能：長期記憶＋個人化 =====
+    
+    @app.get("/api/profile/{user_id}")
+    async def get_user_profile(user_id: str):
+        """獲取用戶個人偏好"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("SELECT * FROM user_profiles WHERE user_id = %s", (user_id,))
+            else:
+                cursor.execute("SELECT * FROM user_profiles WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            conn.close()
+            
+            if row:
+                return {
+                    "user_id": row[0],
+                    "preferred_platform": row[1],
+                    "preferred_style": row[2],
+                    "preferred_duration": row[3],
+                    "content_preferences": json.loads(row[4]) if row[4] else None,
+                    "created_at": row[5],
+                    "updated_at": row[6]
+                }
+            else:
+                return {"message": "Profile not found", "user_id": user_id}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/profile")
+    async def create_or_update_profile(profile: UserProfile):
+        """創建或更新用戶個人偏好"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            # 檢查是否已存在
+            if use_postgresql:
+                cursor.execute("SELECT user_id FROM user_profiles WHERE user_id = %s", (profile.user_id,))
+            else:
+                cursor.execute("SELECT user_id FROM user_profiles WHERE user_id = ?", (profile.user_id,))
+            exists = cursor.fetchone()
+            
+            if exists:
+                # 更新現有記錄
+                if use_postgresql:
+                    cursor.execute("""
+                        UPDATE user_profiles 
+                        SET preferred_platform = %s, preferred_style = %s, preferred_duration = %s, 
+                            content_preferences = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE user_id = %s
+                    """, (
+                        profile.preferred_platform,
+                        profile.preferred_style,
+                        profile.preferred_duration,
+                        json.dumps(profile.content_preferences) if profile.content_preferences else None,
+                        profile.user_id
+                    ))
+                else:
+                    cursor.execute("""
+                        UPDATE user_profiles 
+                        SET preferred_platform = ?, preferred_style = ?, preferred_duration = ?, 
+                            content_preferences = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE user_id = ?
+                    """, (
+                        profile.preferred_platform,
+                        profile.preferred_style,
+                        profile.preferred_duration,
+                        json.dumps(profile.content_preferences) if profile.content_preferences else None,
+                        profile.user_id
+                    ))
+            else:
+                # 創建新記錄
+                if use_postgresql:
+                    cursor.execute("""
+                        INSERT INTO user_profiles 
+                        (user_id, preferred_platform, preferred_style, preferred_duration, content_preferences)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, (
+                        profile.user_id,
+                        profile.preferred_platform,
+                        profile.preferred_style,
+                        profile.preferred_duration,
+                        json.dumps(profile.content_preferences) if profile.content_preferences else None
+                    ))
+                else:
+                    cursor.execute("""
+                        INSERT INTO user_profiles 
+                        (user_id, preferred_platform, preferred_style, preferred_duration, content_preferences)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (
+                        profile.user_id,
+                        profile.preferred_platform,
+                        profile.preferred_style,
+                        profile.preferred_duration,
+                        json.dumps(profile.content_preferences) if profile.content_preferences else None
+                    ))
+            
+            if not use_postgresql:
+                conn.commit()
+            conn.close()
+            return {"message": "Profile saved successfully", "user_id": profile.user_id}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/generations")
+    async def save_generation(generation: Generation):
+        """保存生成內容並檢查去重"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # 生成去重哈希
+            dedup_hash = generate_dedup_hash(
+                generation.content, 
+                generation.platform, 
+                generation.topic
+            )
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            # 檢查是否已存在相同內容
+            if use_postgresql:
+                cursor.execute("SELECT id FROM generations WHERE dedup_hash = %s", (dedup_hash,))
+            else:
+                cursor.execute("SELECT id FROM generations WHERE dedup_hash = ?", (dedup_hash,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                return {
+                    "message": "Similar content already exists",
+                    "generation_id": existing[0],
+                    "dedup_hash": dedup_hash,
+                    "is_duplicate": True
+                }
+            
+            # 生成新的 ID
+            generation_id = hashlib.md5(f"{generation.user_id}_{datetime.now().isoformat()}".encode()).hexdigest()[:12]
+            
+            # 保存新生成內容
+            if use_postgresql:
+                cursor.execute("""
+                    INSERT INTO generations (id, user_id, content, platform, topic, dedup_hash)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (
+                    generation_id,
+                    generation.user_id,
+                    generation.content,
+                    generation.platform,
+                    generation.topic,
+                    dedup_hash
+                ))
+            else:
+                cursor.execute("""
+                    INSERT INTO generations (id, user_id, content, platform, topic, dedup_hash)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    generation_id,
+                    generation.user_id,
+                    generation.content,
+                    generation.platform,
+                    generation.topic,
+                    dedup_hash
+                ))
+            
+            if not use_postgresql:
+                conn.commit()
+            conn.close()
+            
+            return {
+                "message": "Generation saved successfully",
+                "generation_id": generation_id,
+                "dedup_hash": dedup_hash,
+                "is_duplicate": False
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/api/generations/{user_id}")
+    async def get_user_generations(user_id: str, limit: int = 10):
+        """獲取用戶的生成歷史"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT id, content, platform, topic, created_at 
+                    FROM generations 
+                    WHERE user_id = %s 
+                    ORDER BY created_at DESC 
+                    LIMIT %s
+                """, (user_id, limit))
+            else:
+                cursor.execute("""
+                    SELECT id, content, platform, topic, created_at 
+                    FROM generations 
+                    WHERE user_id = ? 
+                    ORDER BY created_at DESC 
+                    LIMIT ?
+                """, (user_id, limit))
+            
+            rows = cursor.fetchall()
+            conn.close()
+            
+            generations = []
+            for row in rows:
+                generations.append({
+                    "id": row[0],
+                    "content": row[1],
+                    "platform": row[2],
+                    "topic": row[3],
+                    "created_at": row[4]
+                })
+            
+            return {"generations": generations, "count": len(generations)}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/conversation/summary")
+    async def create_conversation_summary(user_id: str, messages: List[ChatMessage]):
+        """創建對話摘要"""
+        try:
+            if not os.getenv("GEMINI_API_KEY"):
+                return {"error": "Gemini API not configured"}
+            
+            # 準備對話內容
+            conversation_text = "\n".join([f"{msg.role}: {msg.content}" for msg in messages])
+            
+            # 使用 Gemini 生成摘要
+            model = genai.GenerativeModel(model_name)
+            prompt = f"""
+            請為以下對話生成一個簡潔的摘要（不超過100字），重點關注：
+            1. 用戶的主要需求和偏好
+            2. 討論的平台和主題
+            3. 重要的風格要求
+            
+            對話內容：
+            {conversation_text}
+            """
+            
+            response = model.generate_content(prompt)
+            summary = response.text if response else "無法生成摘要"
+            
+            # 保存到數據庫
+            conn = get_db_connection()
+            cursor = conn.cursor()
+
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+
+            message_cnt = len(messages)
+
+            if use_postgresql:
+                # PostgreSQL upsert：以 (user_id, created_at, summary) 近似去重，避免重複
+                cursor.execute("""
+                    INSERT INTO conversation_summaries (user_id, summary, conversation_type, created_at, message_count, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                """, (
+                    user_id, summary, classify_conversation(user_message=messages[-1].content if messages else "", ai_response=summary), datetime.now(), message_cnt
+                ))
+            else:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO conversation_summaries 
+                    (user_id, summary, message_count, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                """, (user_id, summary, message_cnt))
+            
+            if not use_postgresql:
+                conn.commit()
+            conn.close()
+            
+            return {
+                "message": "Conversation summary created",
+                "summary": summary,
+                "message_count": message_cnt
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/api/conversation/summary/{user_id}")
+    async def get_conversation_summary(user_id: str):
+        """獲取用戶的對話摘要"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT summary, message_count, created_at, updated_at 
+                FROM conversation_summaries 
+                WHERE user_id = ?
+            """, (user_id,))
+            
+            row = cursor.fetchone()
+            conn.close()
+            
+            if row:
+                return {
+                    "user_id": user_id,
+                    "summary": row[0],
+                    "message_count": row[1],
+                    "created_at": row[2],
+                    "updated_at": row[3]
+                }
+            else:
+                return {"message": "No conversation summary found", "user_id": user_id}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # ============ 帳單資訊相關 API ============
+
+    @app.get("/api/user/orders/{user_id}")
+    async def get_user_orders(user_id: str, current_user_id: Optional[str] = Depends(get_current_user)):
+        """獲取用戶的購買記錄"""
+        if current_user_id != user_id:
+            return JSONResponse({"error": "無權限訪問此用戶資料"}, status_code=403)
+        
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT id, order_id, plan_type, amount, currency, payment_method, 
+                           payment_status, paid_at, expires_at, invoice_number, 
+                           invoice_type, created_at
+                    FROM orders 
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                """, (user_id,))
+            else:
+                cursor.execute("""
+                    SELECT id, order_id, plan_type, amount, currency, payment_method, 
+                           payment_status, paid_at, expires_at, invoice_number, 
+                           invoice_type, created_at
+                    FROM orders 
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC
+                """, (user_id,))
+            
+            rows = cursor.fetchall()
+            conn.close()
+            
+            orders = []
+            for row in rows:
+                orders.append({
+                    "id": row[0],
+                    "order_id": row[1],
+                    "plan_type": row[2],
+                    "amount": row[3],
+                    "currency": row[4],
+                    "payment_method": row[5],
+                    "payment_status": row[6],
+                    "paid_at": row[7],
+                    "expires_at": row[8],
+                    "invoice_number": row[9],
+                    "invoice_type": row[10],
+                    "created_at": row[11]
+                })
+            
+            return {"orders": orders}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.get("/api/user/license/{user_id}")
+    async def get_user_license(user_id: str, current_user_id: Optional[str] = Depends(get_current_user)):
+        """獲取用戶的授權資訊"""
+        if current_user_id != user_id:
+            return JSONResponse({"error": "無權限訪問此用戶資料"}, status_code=403)
+        
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT tier, seats, source, start_at, expires_at, status
+                    FROM licenses 
+                    WHERE user_id = %s AND status = 'active'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (user_id,))
+            else:
+                cursor.execute("""
+                    SELECT tier, seats, source, start_at, expires_at, status
+                    FROM licenses 
+                    WHERE user_id = ? AND status = 'active'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (user_id,))
+            
+            row = cursor.fetchone()
+            conn.close()
+            
+            if row:
+                return {
+                    "user_id": user_id,
+                    "tier": row[0],
+                    "seats": row[1],
+                    "source": row[2],
+                    "start_at": str(row[3]),
+                    "expires_at": str(row[4]),
+                    "status": row[5]
+                }
+            else:
+                return {"user_id": user_id, "tier": "none", "expires_at": None}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.get("/api/admin/orders")
+    async def get_all_orders():
+        """獲取所有訂單記錄（管理員用）"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            database_url = os.getenv("DATABASE_URL")
+            use_postgresql = database_url and "postgresql://" in database_url and PSYCOPG2_AVAILABLE
+            
+            if use_postgresql:
+                cursor.execute("""
+                    SELECT o.id, o.user_id, o.order_id, o.plan_type, o.amount, 
+                           o.currency, o.payment_method, o.payment_status, 
+                           o.paid_at, o.expires_at, o.invoice_number, o.created_at,
+                           ua.name, ua.email
+                    FROM orders o
+                    LEFT JOIN user_auth ua ON o.user_id = ua.user_id
+                    ORDER BY o.created_at DESC
+                    LIMIT 100
+                """)
+            else:
+                cursor.execute("""
+                    SELECT o.id, o.user_id, o.order_id, o.plan_type, o.amount, 
+                           o.currency, o.payment_method, o.payment_status, 
+                           o.paid_at, o.expires_at, o.invoice_number, o.created_at,
+                           ua.name, ua.email
+                    FROM orders o
+                    LEFT JOIN user_auth ua ON o.user_id = ua.user_id
+                    ORDER BY o.created_at DESC
+                    LIMIT 100
+                """)
+            
+            orders = []
+            for row in cursor.fetchall():
+                orders.append({
+                    "id": row[0],
+                    "user_id": row[1],
+                    "order_id": row[2],
+                    "plan_type": row[3],
+                    "amount": row[4],
+                    "currency": row[5],
+                    "payment_method": row[6],
+                    "payment_status": row[7],
+                    "paid_at": row[8],
+                    "expires_at": row[9],
+                    "invoice_number": row[10],
+                    "created_at": row[11],
+                    "user_name": row[12] or "未知用戶",
+                    "user_email": row[13] or ""
+                })
+            
+            conn.close()
+            return {"orders": orders}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    return app
+
+app = create_app()
+
+# 注意：在 Zeabur 部署時，使用 Dockerfile 中的 uvicorn 命令啟動
+# 這個區塊主要用於本地開發
 if __name__ == "__main__":
     import uvicorn
-    print("🚀 啟動三智能體系統...")
-    print("📍 本地訪問：http://localhost:8080")
-    print("📋 API 文檔：http://localhost:8080/docs")
-    uvicorn.run(app, host="0.0.0.0", port=8080, log_level="info")
+    port = int(os.getenv("PORT", 8000))
+    print(f"INFO: Starting Uvicorn locally on host=0.0.0.0, port={port}")
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        log_level="info",
+        access_log=True,
+        workers=1
+    )
+
+
