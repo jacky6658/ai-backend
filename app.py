@@ -583,10 +583,18 @@ async def get_google_user_info(access_token: str) -> Optional[GoogleUser]:
 
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Optional[str]:
-    """獲取當前用戶 ID"""
-    if not credentials:
+    """獲取當前用戶 ID（不允許過期）"""
+    try:
+        if not credentials:
+            print("[get_current_user] no credentials")
+            return None
+        token_preview = (credentials.credentials or '')[:16]
+        user_id = verify_access_token(credentials.credentials, allow_expired=False)
+        print(f"[get_current_user] token[:16]={token_preview} user_id={user_id}")
+        return user_id
+    except Exception as e:
+        print(f"[get_current_user] error: {e}")
         return None
-    return verify_access_token(credentials.credentials)
 
 async def get_current_user_for_refresh(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Optional[str]:
     """獲取當前用戶 ID（允許過期的 token，用於 refresh 場景）"""
