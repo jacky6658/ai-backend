@@ -4001,9 +4001,14 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail="內部伺服器錯誤")
 
     @app.get("/api/auth/me")
-    async def get_current_user_info(current_user_id: Optional[str] = Depends(get_current_user)):
+    async def get_current_user_info(request: Request, current_user_id: Optional[str] = Depends(get_current_user)):
         """獲取當前用戶資訊"""
         if not current_user_id:
+            try:
+                auth_preview = (request.headers.get("authorization", "") or "")[:40]
+                print(f"[auth/me] missing user, Authorization preview='{auth_preview}'")
+            except Exception:
+                pass
             raise HTTPException(status_code=401, detail="Not authenticated")
         
         try:
