@@ -4004,12 +4004,22 @@ def create_app() -> FastAPI:
     async def get_current_user_info(request: Request, current_user_id: Optional[str] = Depends(get_current_user)):
         """獲取當前用戶資訊"""
         if not current_user_id:
+            # 兼容處理：若依賴鏈沒有取到 credentials，改從 Header 直接解析一次
             try:
-                auth_preview = (request.headers.get("authorization", "") or "")[:40]
-                print(f"[auth/me] missing user, Authorization preview='{auth_preview}'")
-            except Exception:
-                pass
-            raise HTTPException(status_code=401, detail="Not authenticated")
+                auth_header = request.headers.get("authorization", "") or ""
+                auth_preview = auth_header[:40]
+                print(f"[auth/me] missing user(dep), Authorization preview='{auth_preview}'")
+                token = None
+                if auth_header.lower().startswith("bearer "):
+                    token = auth_header.split(" ", 1)[1].strip()
+                if token:
+                    uid = verify_access_token(token, allow_expired=False)
+                    print(f"[auth/me] manual verify result user_id={uid}")
+                    current_user_id = uid
+            except Exception as _e:
+                print(f"[auth/me] manual verify error: {_e}")
+            if not current_user_id:
+                raise HTTPException(status_code=401, detail="Not authenticated")
         
         try:
             conn = get_db_connection()
